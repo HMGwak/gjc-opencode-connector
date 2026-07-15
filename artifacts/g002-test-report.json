@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "goalId": "G002",
+  "commands": [
+    {
+      "command": "bun run typecheck",
+      "exitCode": 0
+    },
+    {
+      "command": "bun test",
+      "exitCode": 0,
+      "summary": "35 pass, 0 fail, 102 expect calls across 6 files"
+    },
+    {
+      "command": "bun run --cwd apps/web build",
+      "exitCode": 0,
+      "summary": "Vite 6.4.3 production build succeeded"
+    }
+  ],
+  "browser": {
+    "url": "http://127.0.0.1:4173/",
+    "viewport": "412x915",
+    "title": "Planee Agent Hub",
+    "screenshot": "artifacts/g002-mobile.png",
+    "observedControls": ["Sessions", "Conversation", "Actions", "Settings"],
+    "status": "Live updates connected"
+  }
+}

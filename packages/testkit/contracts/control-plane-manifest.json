@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schemaVersion": 1,
+  "capturedAt": "2026-07-15",
+  "scope": "Phase 0 read-only control-plane discovery; no server, NanoClaw, or host daemon was started.",
+  "sources": {
+    "opencodeServer": "https://opencode.ai/docs/server/",
+    "gjcBotIntegration": "https://github.com/Yeachan-Heo/gajae-code/blob/main/docs/bot-integration.md",
+    "gjcExternalControlReadiness": "https://github.com/Yeachan-Heo/gajae-code/blob/main/docs/external-control-readiness.md"
+  },
+  "probes": [
+    {
+      "id": "opencode-version",
+      "command": "opencode --version",
+      "readOnly": true,
+      "result": "1.17.15",
+      "status": "verified"
+    },
+    {
+      "id": "opencode-serve-help",
+      "command": "opencode serve --help",
+      "readOnly": true,
+      "result": "hostname default 127.0.0.1; port default 0; mdns default false",
+      "status": "verified"
+    },
+    {
+      "id": "gjc-version",
+      "command": "gjc --version",
+      "readOnly": true,
+      "result": "gjc/0.10.2",
+      "status": "verified"
+    },
+    {
+      "id": "gjc-coordinator-check",
+      "command": "GJC_COORDINATOR_MCP_WORKDIR_ROOTS=\"$PWD\" gjc mcp-serve coordinator --check --json",
+      "readOnly": true,
+      "result": "ok=true; server=gjc-coordinator-mcp; protocolVersion=2024-11-05; readOnly=true",
+      "status": "verified"
+    }
+  ],
+  "opencode": {
+    "version": "1.17.15",
+    "contracts": {
+      "prompt_async": {
+        "method": "POST",
+        "path": "/session/:id/prompt_async",
+        "expectedStatus": 204,
+        "status": "verified",
+        "source": "https://opencode.ai/docs/server/#messages"
+      },
+      "session_status": {
+        "method": "GET",
+        "path": "/session/status",
+        "expectedResponse": "SessionStatus map keyed by session ID",
+        "status": "verified",
+        "source": "https://opencode.ai/docs/server/#sessions"
+      },
+      "event": {
+        "method": "GET",
+        "path": "/event",
+        "transport": "SSE",
+        "firstEvent": "server.connected",
+        "status": "verified",
+        "source": "https://opencode.ai/docs/server/#events"
+      },
+      "cursorReplay": {
+        "status": "unavailable",
+        "expectation": "Do not assume cursor, Last-Event-ID, stable event ID, or replay. Reconcile from session/message snapshots."
+      },
+      "permission": {
+        "method": "POST",
+        "path": "/session/:id/permissions/:permissionID",
+        "body": ["response", "remember?"],
+        "expectedResponse": "boolean",
+        "status": "verified",
+        "source": "https://opencode.ai/docs/server/#sessions"
+      },
+      "restartRecovery": {
+        "status": "unavailable",
+        "expectation": "No public persistence, in-flight prompt recovery, or event replay guarantee; treat restart as snapshot reconciliation and ambiguous mutation isolation."
+      }
+    },
+    "deferredRuntimeTests": ["OpenAPI fixture capture", "prompt_async HTTP response", "SSE reconnect/cursor behavior", "permission duplicate/expiry", "restart during prompt"]
+  },
+  "gjcCoordinator": {
+    "version": "gjc/0.10.2",
+    "server": {"name": "gjc-coordinator-mcp", "protocolVersion": "2024-11-05"},
+    "discoveredTools": ["gjc_coordinator_watch_events", "gjc_coordinator_read_turn", "gjc_coordinator_list_questions", "gjc_coordinator_stop_session"],
+    "contracts": {
+      "watch_events": {"status": "verified-discovery", "expectation": "Use as acceleration only; replay/cursor/order require runtime fixture."},
+      "read_turn": {"status": "verified", "expectation": "Polling and completed-turn read fallback."},
+      "list_questions": {"status": "verified", "expectation": "Read pending structured questions before responding."},
+      "stop_session": {"status": "verified", "expectation": "Mutation-gated, owner-proof shutdown; active turn requires explicit force."},
+      "remoteIdempotency": {"status": "unavailable", "expectation": "No caller idempotency-key contract found; do not auto-retry ambiguous mutations; mark unknown."},
+      "correlation": {"status": "partial", "expectation": "Use returned session_id and turn_id. No external caller-correlation echo contract found."}
+    },
+    "deferredRuntimeTests": ["tool schema fixture", "watch reconnect/replay/order", "mutation gate failures", "active-turn stop behavior", "idempotency and caller-correlation fields"],
+    "adapterPolicy": {
+      "transport": "injected Coordinator MCP client only",
+      "bridgeHttps": "forbidden",
+      "watchEvents": "hint-only; reconnect must poll read_turn and list_questions as authority",
+      "workdirRoots": "required allowlist",
+      "mutations": "startup and per-call opt-in; owner proof required for stop_session; ambiguous result is unknown and no-retry"
+    }
+  },
+  "gates": {"spikeA": "conditional-pass", "spikeB": "conditional-pass"}
+}

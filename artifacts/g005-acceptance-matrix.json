@@ -1,0 +1,48 @@
+{
+  "goal": "G005 second adapter and operational completion",
+  "source": "Approved plan §12 acceptance criteria and protocol criteria",
+  "generatedAt": "2026-07-15",
+  "statusDefinitions": {
+    "automated": "Repository test or static evidence exists; execution result must be attached by the release owner.",
+    "manual": "Requires an operator, real runtime, device, or external service evidence.",
+    "deferred": "No qualifying evidence exists; this is not a pass.",
+    "outOfScope": "Explicitly excluded from this G005 task and not a pass."
+  },
+  "gates": {
+    "status": "outOfScope",
+    "reason": "Per assignment, Phase 0 gates are skipped; docs/runbooks/phase0-gates.md remains the gate authority."
+  },
+  "criteria": [
+    { "id": "product-access", "criterion": "Android Chrome access through Cloudflare Access login", "evidenceType": "manual", "status": "manual", "evidence": "docs/runbooks/cloudflare-access.md access-policy and verification procedure" },
+    { "id": "product-status-order", "criterion": "Unified session list uses status-priority ordering", "evidenceType": "automated", "status": "deferred", "evidence": "No G005 execution artifact supplied." },
+    { "id": "product-prompt-realtime", "criterion": "Prompt and real-time response work", "evidenceType": "automated+manual", "status": "deferred", "evidence": "Run focused adapter/hub integration test and Android browser session." },
+    { "id": "product-pending-action", "criterion": "Pending action can be answered", "evidenceType": "automated", "status": "automated", "evidence": "apps/hub/src/server.test.ts pending-action API cases; packages/core/src/actions.test.ts" },
+    { "id": "product-tunnel-catchup", "criterion": "Tunnel interruption and recovery catch up", "evidenceType": "manual", "status": "manual", "evidence": "docs/runbooks/operations.md incident recovery; external Tunnel exercise required" },
+    { "id": "durability-restart-crash", "criterion": "State survives restart and crash-consistency four-point matrix", "evidenceType": "automated+manual", "status": "deferred", "evidence": "No four-point execution artifact supplied." },
+    { "id": "durability-local-idempotency", "criterion": "Local idempotency", "evidenceType": "automated", "status": "automated", "evidence": "packages/core/src/database.test.ts and apps/hub/src/server.test.ts command duplicate coverage" },
+    { "id": "durability-remote-idempotency", "criterion": "Remote idempotency or unknown isolation per ADR-013", "evidenceType": "automated+manual", "status": "deferred", "evidence": "Runtime capability evidence for both adapters is required." },
+    { "id": "durability-pending-terminal", "criterion": "Pending actions return stale/idempotent terminal responses", "evidenceType": "automated", "status": "automated", "evidence": "packages/core/src/actions.test.ts; apps/hub/src/server.test.ts" },
+    { "id": "security-private-ports", "criterion": "Agent ports are private", "evidenceType": "manual", "status": "manual", "evidence": "docs/runbooks/operations.md and cloudflare-access.md read-only listener checks" },
+    { "id": "security-origin-jwt", "criterion": "Origin rejects three loopback invalid-JWT cases with 401/403", "evidenceType": "automated", "status": "automated", "evidence": "apps/hub/src/server.test.ts authentication coverage" },
+    { "id": "security-csrf", "criterion": "CSRF defense", "evidenceType": "automated", "status": "deferred", "evidence": "No dedicated CSRF execution evidence supplied." },
+    { "id": "security-credentials", "criterion": "Credentials are not exposed", "evidenceType": "manual", "status": "manual", "evidence": "Runbook secret-handling requirements and release secret scan" },
+    { "id": "security-audit-secret-free", "criterion": "Audit logs are secret-free", "evidenceType": "manual", "status": "manual", "evidence": "docs/runbooks/operations.md audit secret scan procedure" },
+    { "id": "security-artifact-traversal", "criterion": "Artifact path traversal is rejected", "evidenceType": "automated", "status": "automated", "evidence": "apps/hub/src/server.test.ts artifact error cases" },
+    { "id": "performance-list-summary", "criterion": "100-session list does not load messages", "evidenceType": "automated", "status": "deferred", "evidence": "No 100-session performance artifact supplied." },
+    { "id": "performance-artifacts", "criterion": "Large tool output is separated as an artifact", "evidenceType": "automated", "status": "deferred", "evidence": "No qualifying size/output test artifact supplied." },
+    { "id": "recovery-boot", "criterion": "ADR-014 selected boot model has reboot proof", "evidenceType": "manual", "status": "deferred", "evidence": "docs/spikes/spike-d-macos-runtime.md deferred physical test" },
+    { "id": "recovery-uptime", "criterion": "External uptime detects failure within five minutes", "evidenceType": "manual", "status": "manual", "evidence": "docs/runbooks/operations.md external monitor procedure" },
+    { "id": "recovery-degrade", "criterion": "Degrade mode displays stale/unknown and rejects mutation", "evidenceType": "automated", "status": "automated", "evidence": "apps/hub/src/server.test.ts unreconciled/unknown mutation rejection; docs/runbooks/operations.md" },
+    { "id": "recovery-online-backup", "criterion": "SQLite online backup and isolated restore", "evidenceType": "manual", "status": "manual", "evidence": "docs/runbooks/backup-restore.md online backup and drill procedure" },
+    { "id": "protocol-no-gap", "criterion": "No registration-to-publish gap", "evidenceType": "automated", "status": "deferred", "evidence": "Requires race-harness evidence." },
+    { "id": "protocol-one-sender", "criterion": "Exactly one senderTask per connection, static and runtime proof", "evidenceType": "automated+manual", "status": "deferred", "evidence": "Active-sender alert documented; runtime proof required." },
+    { "id": "protocol-monotonic-gate", "criterion": "Gate transitions CLOSED to OPEN exactly once with no reversal", "evidenceType": "automated", "status": "deferred", "evidence": "Requires repeated gate test evidence." },
+    { "id": "protocol-closed-enqueue", "criterion": "CLOSED-period publish is sent after OPEN", "evidenceType": "automated", "status": "deferred", "evidence": "Requires repeated replay/live boundary test evidence." },
+    { "id": "protocol-wire-order", "criterion": "Replay/live wire order is ascending sequence", "evidenceType": "automated", "status": "deferred", "evidence": "Requires race-harness evidence." },
+    { "id": "protocol-disconnect", "criterion": "Disconnect wins in either gate state and sender is never recreated", "evidenceType": "automated", "status": "deferred", "evidence": "Requires disconnect race evidence." },
+    { "id": "protocol-single-flight", "criterion": "Single-flight sends, immediate failed-send cleanup, no retry, overflow converges", "evidenceType": "automated", "status": "deferred", "evidence": "Requires slow/failing-send and overflow evidence." },
+    { "id": "protocol-lock-boundary", "criterion": "publishMutex has no network I/O", "evidenceType": "automated", "status": "deferred", "evidence": "Requires static lock-boundary check and metrics evidence." },
+    { "id": "protocol-cursor-heartbeat-bridge", "criterion": "Expired cursor returns 410/reset, heartbeat is liveness-only, Bridge HTTPS unused", "evidenceType": "automated+manual", "status": "automated", "evidence": "apps/hub/src/server.test.ts cursor behavior; docs/runbooks/operations.md and cloudflare-access.md operational policy" },
+    { "id": "protocol-unknown-mutation", "criterion": "Unsupported remote idempotency or ambiguous timeout becomes unknown without retry", "evidenceType": "automated", "status": "automated", "evidence": "apps/hub/src/server.test.ts unknown command behavior; ADR-013" }
+  ]
+}

@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "kind": "adr-011-protocol-proof",
+  "goalId": "G006",
+  "scope": "packages/core/src/subscriptions.ts",
+  "invariants": [
+    {
+      "id": "registration-publish-linearization",
+      "proof": "subscriptions.test.ts: proves 2,000 registration/publish schedules have no replay-to-live gap",
+      "evidence": "2,000 deterministic blocked-replay schedules delivered [1, 2] in order"
+    },
+    {
+      "id": "single-sender-and-monotonic-gate",
+      "proof": "subscriptions.test.ts: records exactly one sender, monotonic gate opening, and disconnect priority; subscriptions.static.test.ts: sender construction and gate transition each have one production site",
+      "evidence": "one construction site, one CLOSED->OPEN assignment, and disconnect prevents opening"
+    },
+    {
+      "id": "concurrent-publisher-fifo",
+      "proof": "subscriptions.test.ts: serializes 2,000 concurrent publishers through one FIFO sender",
+      "evidence": "2,000 concurrent publish promises delivered sequence 1..2000"
+    },
+    {
+      "id": "no-lost-wake",
+      "proof": "subscriptions.test.ts: does not lose a wake between empty-queue inspection and publish",
+      "evidence": "1,000 wake/drain cycles delivered in order"
+    },
+    {
+      "id": "no-network-io-under-lock",
+      "proof": "subscriptions.static.test.ts: SubscriptionHub keeps network-facing operations outside mutex callbacks; runtime mutex hook assertion",
+      "evidence": "static mutex callback scan plus sender callback observes mutex depth zero"
+    },
+    {
+      "id": "disconnect-priority-and-backpressure",
+      "proof": "subscriptions.test.ts: disconnect wins over queued backpressure without reopening the gate; overflows to a snapshot reset and stops the connection",
+      "evidence": "overflow closes once with snapshot reset and never transitions to OPEN"
+    }
+  ],
+  "commands": [
+    {
+      "command": "bun test packages/core/src/subscriptions.test.ts packages/core/src/subscriptions.static.test.ts",
+      "exitCode": 0,
+      "summary": "13 pass, 0 fail, 2029 expect calls"
+    },
+    {
+      "command": "bun run typecheck",
+      "exitCode": 0,
+      "summary": "Current repository typecheck passed after G006 integration."
+    }
+  ]
+}

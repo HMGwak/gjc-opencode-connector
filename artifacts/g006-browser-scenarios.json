@@ -1,0 +1,40 @@
+{
+  "contract": "g006-browser-multitab-v1",
+  "evidence": {
+    "status": "verified-by-executable-unit-tests",
+    "command": "bun test apps/web/src/multitab.test.ts apps/web/src/app.test.ts",
+    "result": "25 pass, 0 fail, 86 assertions",
+    "coverage": [
+      "Web Locks elects one poller and hands leadership over after close",
+      "fallback startup grace elects exactly one poller and TTL failover preserves requested sessions",
+      "late join replays local requests so the leader reconstructs their union",
+      "stop publishes unsubscribe for every local request",
+      "stale leadership messages cannot demote a current leader",
+      "without a channel Web Locks cannot start a background poller",
+      "without BroadcastChannel or Web Locks no tab polls",
+      "app network guard prevents event fetches when coordination has no polling capability"
+    ]
+  },
+  "scenarios": [
+    {
+      "name": "late-join-request-replay",
+      "expected": "The elected leader polls the union of existing and joining tabs' requested sessions.",
+      "evidence": "late join replays local requests so the leader reconstructs their union"
+    },
+    {
+      "name": "tab-stop-cleanup",
+      "expected": "Stopping a tab removes every one of its requested sessions from peers.",
+      "evidence": "stop publishes unsubscribe for every local request"
+    },
+    {
+      "name": "leadership-freshness",
+      "expected": "Expired or older-epoch leader messages cannot demote the current leader.",
+      "evidence": "stale leadership messages cannot demote a current leader"
+    },
+    {
+      "name": "unsupported-capability-policy",
+      "expected": "Without BroadcastChannel, coordinated background catch-up is disabled even when Web Locks exists; the app exposes degraded manual-refresh status. With neither capability no tab polls.",
+      "evidence": "without a channel Web Locks cannot start a background poller; without BroadcastChannel or Web Locks no tab polls; app network guard prevents event fetches when coordination has no polling capability"
+    }
+  ]
+}

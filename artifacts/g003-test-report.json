@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "goalId": "G003",
+  "commands": [
+    {"command":"bun run typecheck","exitCode":0},
+    {"command":"bun test","exitCode":0,"summary":"56 pass, 0 fail, 187 expect calls across 9 files"},
+    {"command":"bun run --cwd apps/web build","exitCode":0,"summary":"Vite production build succeeded"}
+  ],
+  "contracts": ["canonical pending action states/version/expiry/idempotency", "terminal session mutation rejection", "serialized secret scan", "opaque owner-scoped artifact content", "realpath/file-descriptor containment", "range/MIME/size/time limits", "attachment+nosniff headers"]
+}

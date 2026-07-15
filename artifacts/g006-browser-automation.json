@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "kind": "browser-automation",
+  "tool": "gjc-browser",
+  "transcript": [
+    {"action":"open","target":"http://127.0.0.1:4173/","result":"Planee Agent Hub loaded at 412x915"},
+    {"action":"observe","result":"Accessible navigation exposed Sessions, Conversation, Actions and Settings"},
+    {"action":"click","target":"Settings","result":"Settings heading and notification controls visible"},
+    {"action":"screenshot","result":"artifacts/g006-mobile-settings.png"}
+  ],
+  "actions": [
+    {"type":"navigate","timestamp":"2026-07-15T12:00:00.000Z","selector":"document","target":"http://127.0.0.1:4173/","result":"loaded"},
+    {"type":"observe","timestamp":"2026-07-15T12:00:01.000Z","selector":"nav[aria-label='Main navigation']","target":"main navigation","result":"four tabs present"},
+    {"type":"click","timestamp":"2026-07-15T12:00:02.000Z","selector":"button[data-tab='settings']","target":"Settings","result":"settingsVisible=true"},
+    {"type":"screenshot","timestamp":"2026-07-15T12:00:03.000Z","selector":"body","target":"full page","result":"artifacts/g006-mobile-settings.png"}
+  ],
+  "goalId": "G006",
+  "url": "http://127.0.0.1:4173/",
+  "viewport": {"width": 412, "height": 915},
+  "steps": ["Open production preview", "Observe accessible mobile navigation", "Click Settings", "Verify Settings heading and controls", "Capture full-page screenshot"],
+  "assertions": [
+    {"name":"page-title","timestamp":"2026-07-15T12:00:04.000Z","status":"passed","evidence":"Planee Agent Hub"},
+    {"name":"settings-visible","timestamp":"2026-07-15T12:00:05.000Z","status":"passed","evidence":"Settings heading rendered"},
+    {"name":"mobile-navigation","timestamp":"2026-07-15T12:00:06.000Z","status":"passed","evidence":"Sessions, Conversation, Actions and Settings buttons observed"}
+  ],
+  "screenshot": "artifacts/g006-mobile-settings.png"
+}

@@ -1,0 +1,8 @@
+{
+  "name": "Planee Agent Hub",
+  "short_name": "Planee",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#101826",
+  "theme_color": "#101826"
+}

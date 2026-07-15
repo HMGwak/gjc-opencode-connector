@@ -1,0 +1,12 @@
+{
+  "name": "@planee/testkit",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Versioned contract fixtures for Planee Agent Hub",
+  "type": "module",
+  "exports": "./src/index.ts",
+  "files": [
+    "contracts",
+    "src"
+  ]
+}

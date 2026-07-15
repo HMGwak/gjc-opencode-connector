@@ -1,0 +1,19 @@
+{
+  "name": "planee-agent-hub",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "bun@1.2.20",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "bun run --cwd apps/web build",
+    "typecheck": "bunx tsc --noEmit --project tsconfig.json",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "1.2.20",
+    "typescript": "5.8.3"
+  }
+}

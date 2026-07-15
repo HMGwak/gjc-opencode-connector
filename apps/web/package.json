@@ -1,0 +1,15 @@
+{
+  "name": "@planee/web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bunx vite --host 127.0.0.1",
+    "build": "bunx vite build",
+    "preview": "bunx vite preview --host 127.0.0.1",
+    "test": "bun test src/app.test.ts"
+  },
+  "devDependencies": {
+    "vite": "^6.1.0"
+  }
+}

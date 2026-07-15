@@ -1,0 +1,128 @@
+{
+  "schemaVersion": 1,
+  "kind": "web-push-manual-qa-checklist",
+  "goalId": "G004",
+  "generatedAt": "2026-07-15",
+  "authority": {
+    "primary": "SQLite session/event journal and authenticated session API",
+    "push": "optional best-effort hint only",
+    "prohibitedPayloadFields": [
+      "prompt",
+      "transcript",
+      "toolOutput",
+      "credential",
+      "vapidPrivateKey",
+      "hostPath",
+      "webhookOrChannelId"
+    ]
+  },
+  "executionPolicy": {
+    "physicalDeviceRequired": true,
+    "automationDoesNotSatisfyPhysicalDeviceRows": true,
+    "unexecutedStatus": "PENDING",
+    "doNotFabricateResults": true,
+    "releaseGatePassCondition": "Every required physical-device row has PASS evidence; PENDING, FAIL, or missing evidence blocks Android Web Push release."
+  },
+  "gates": [
+    {
+      "id": "G004-ANDROID-PHYSICAL-DEVICE",
+      "status": "PENDING",
+      "required": true,
+      "reason": "No Android Chrome physical-device execution evidence has been recorded.",
+      "result": null
+    },
+    {
+      "id": "G004-BROWSER-AUTOMATION",
+      "status": "SKIPPED",
+      "required": false,
+      "reason": "This documentation-only change does not execute browser automation; automation cannot satisfy Android physical-device delivery/lifecycle scenarios.",
+      "result": null
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "android-chrome-install",
+      "title": "Install PWA in Android Chrome",
+      "required": true,
+      "status": "PENDING",
+      "environment": "Android physical device, Chrome, HTTPS same-origin deployment",
+      "preconditions": ["Authenticated test owner", "Clean or documented prior installation state"],
+      "steps": ["Open the HTTPS origin in Android Chrome.", "Install the PWA using Chrome's install flow.", "Launch the installed app and navigate to notifications settings."],
+      "expected": ["No session content is shown before normal authentication.", "Push opt-in is shown only when secure-context, service-worker, API-support, and owner checks pass.", "Installation is not treated as notification permission or subscription consent."],
+      "evidenceRequired": ["Device model", "Android version", "Chrome version", "Installation state", "Observed result without endpoint/key/payload values"],
+      "result": null
+    },
+    {
+      "id": "android-chrome-permission",
+      "title": "Allow and deny notification permission",
+      "required": true,
+      "status": "PENDING",
+      "environment": "Android physical device, Chrome, installed PWA",
+      "preconditions": ["Notification permission is undecided or reset", "Authenticated test owner"],
+      "steps": ["Choose Allow in the notification opt-in flow and observe registration.", "Reset permission or use a fresh profile, choose Don't allow, and observe the UI and server behavior."],
+      "expected": ["Allow attempts an owner-scoped subscription registration.", "Deny creates or reuses no subscription and does not claim delivery success.", "Session state remains available through the authoritative API/SSE path."],
+      "evidenceRequired": ["Permission choice", "Owner-scoped registration outcome without subscription material", "Observed denied-state UI"],
+      "result": null
+    },
+    {
+      "id": "android-chrome-force-stop",
+      "title": "Force-stop behavior",
+      "required": true,
+      "status": "PENDING",
+      "environment": "Android physical device, Chrome or installed PWA",
+      "preconditions": ["Owner-scoped subscription was previously registered"],
+      "steps": ["Force-stop Chrome/PWA from Android Settings.", "Cause a permitted notification event.", "Reopen the app and inspect the authoritative session state."],
+      "expected": ["Delivery timing or absence is not used as correctness evidence.", "On reopen, normal authentication and SQLite/API/SSE recovery converge on authoritative state.", "Any notification tap re-enters normal authentication/authorization."],
+      "evidenceRequired": ["Force-stop confirmation", "Event time", "Reopen result", "Authoritative-state recovery observation"],
+      "result": null
+    },
+    {
+      "id": "android-chrome-doze",
+      "title": "Doze delivery and recovery",
+      "required": true,
+      "status": "PENDING",
+      "environment": "Android physical device capable of Doze",
+      "preconditions": ["Owner-scoped subscription was previously registered", "Device has entered documented Doze state"],
+      "steps": ["Leave the device in Doze state.", "Cause a permitted notification event.", "Wake the device and reopen the app."],
+      "expected": ["Delayed or absent push is not marked as a session failure or delivery success.", "After resume, authoritative API/SSE state converges without relying on push order or presence."],
+      "evidenceRequired": ["Doze-state method", "Event and wake times", "Observed delivery behavior", "Post-resume authoritative-state observation"],
+      "result": null
+    },
+    {
+      "id": "android-chrome-token-replacement",
+      "title": "Subscription/token replacement",
+      "required": true,
+      "status": "PENDING",
+      "environment": "Android physical device, Chrome",
+      "preconditions": ["Initial owner-scoped subscription exists", "A documented Chrome/site-data action can cause re-registration"],
+      "steps": ["Cause normal subscription replacement through Chrome/site-data lifecycle.", "Re-enable or re-register notifications as required.", "Attempt owner-isolation checks using a different authenticated owner."],
+      "expected": ["Replacement is stored only for the authenticated owner.", "Previous record is revoked/disabled and is not selected for new sends.", "A different owner cannot read, replace, revoke, or use either record."],
+      "evidenceRequired": ["Replacement action", "Owner-scoped server outcome without subscription values", "Prior-record disposition", "Cross-owner denial result"],
+      "result": null
+    },
+    {
+      "id": "android-chrome-revocation",
+      "title": "User and browser permission revocation",
+      "required": true,
+      "status": "PENDING",
+      "environment": "Android physical device, Chrome, installed PWA",
+      "preconditions": ["Active owner-scoped subscription"],
+      "steps": ["Disable notifications through app UI and observe server-side revoke outcome.", "Re-register, then revoke Chrome/Android site notification permission.", "Cause a permitted notification event and inspect sender outcome without payload capture."],
+      "expected": ["Revoked records are excluded from sends.", "Re-enable requires explicit opt-in and fresh registration.", "Permanent provider failure (404/410) causes immediate invalidation rather than retry or false success."],
+      "evidenceRequired": ["Revocation path", "Record invalidation outcome", "Re-registration consent observation", "Provider-failure handling observation when available"],
+      "result": null
+    },
+    {
+      "id": "android-chrome-tap-reauth",
+      "title": "Notification tap deep-link reauthentication",
+      "required": true,
+      "status": "PENDING",
+      "environment": "Android physical device, Chrome, notification available",
+      "preconditions": ["A permitted notification contains an opaque session reference and same-origin allowlisted relative deep link"],
+      "steps": ["Tap while logged in as the subscription owner.", "Repeat after logout or session expiry.", "Repeat while logged in as a different owner.", "Attempt a non-allowlisted or cross-origin deep-link input through the applicable test surface."],
+      "expected": ["Only same-origin allowlisted route opens.", "Logout/expiry requires normal login before protected content.", "Different owner receives server-side authorization denial and no session content.", "Invalid or cross-origin target is rejected/falls back safely without external navigation."],
+      "evidenceRequired": ["Auth state per attempt", "Opened route", "Authorization result", "No secret or session-content capture"],
+      "result": null
+    }
+  ]
+}

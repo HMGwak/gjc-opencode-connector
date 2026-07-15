@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "kind": "g007-final-review-test-matrix",
+  "goalId": "G007",
+  "focusedRun": {
+    "command": "bun test packages/core/src/artifacts.test.ts packages/core/src/actions.test.ts apps/hub/src/server.test.ts",
+    "exitCode": 0,
+    "tests": 34,
+    "expectCalls": 154
+  },
+  "typecheck": {
+    "command": "bun run typecheck",
+    "exitCode": 0
+  },
+  "contracts": [
+    {
+      "name": "artifact token expiry boundary",
+      "proof": "Artifact token reads succeed before expiry and reject at and after expiry."
+    },
+    {
+      "name": "artifact range edge cases",
+      "proof": "Suffix and open-ended ranges resolve correctly; zero-byte and invalid ranges reject."
+    },
+    {
+      "name": "artifact content response headers",
+      "proof": "206 content asserts content type, disposition, nosniff, cache control, accept-ranges, content-range, and content-length."
+    },
+    {
+      "name": "concurrent duplicate action response",
+      "proof": "Two simultaneously entered responders sharing one idempotency key produce exactly one effect and 202/200 responses."
+    },
+    {
+      "name": "malformed route IDs",
+      "proof": "Malformed percent escapes in action, artifact, and session IDs map to the stable bad_request 400 response."
+    },
+    {
+      "name": "pending action expiry boundary",
+      "proof": "Pending action response succeeds before expiry and durably expires at and after the boundary."
+    }
+  ]
+}
