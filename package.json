@@ -8,12 +8,20 @@
     "packages/*"
   ],
   "scripts": {
+    "android:add": "bunx cap add android",
+    "android:sync": "bun run build && bunx cap sync android",
     "build": "bun run --cwd apps/web build",
+    "build:android": "bun run android:sync && cd android && ./gradlew assembleDebug",
     "typecheck": "bunx tsc --noEmit --project tsconfig.json",
     "test": "bun test"
   },
   "devDependencies": {
+    "@capacitor/android": "^8.4.2",
+    "@capacitor/cli": "^8.4.2",
     "@types/bun": "1.2.20",
     "typescript": "5.8.3"
+  },
+  "dependencies": {
+    "@capacitor/core": "^8.4.2"
   }
 }
