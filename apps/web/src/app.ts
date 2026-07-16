@@ -46,12 +46,22 @@ function requiredElement(selector: string): HTMLElement {
 
 const app = requiredElement("#app");
 const DEFAULT_TAB_KEY = "planee-agent-hub:default-tab";
-const tabs = ["inbox", "work", "sessions", "history"] as const;
+const tabOptions = [
+  { id: "inbox", label: "Inbox" },
+  { id: "work", label: "Work" },
+  { id: "sessions", label: "Sessions" },
+  { id: "history", label: "History" },
+] as const;
+type TabId = typeof tabOptions[number]["id"];
+type SessionOrigin = "sessions" | "history";
 let sessions: Session[] = [];
 let workItems: WorkItem[] = [];
 let hitlActions: HitlAction[] = [];
 let selectedSessionId: string | null = null;
-let activeTab: "inbox" | "work" | "sessions" | "history" = readDefaultTab();
+let selectedSession: Session | null = null;
+let selectedSessionOrigin: SessionOrigin | null = null;
+let defaultTab: TabId = readDefaultTab();
+let activeTab: TabId = defaultTab;
 let reconnectTimer: number | undefined;
 let online = navigator.onLine;
 let streamConnected = false;
@@ -59,11 +69,11 @@ let loadingSessions = false;
 let fetchError: string | null = null;
 let projectionErrors: Partial<Record<"inbox" | "work" | "history", string>> = {};
 
-function isTab(value: string | null): value is typeof tabs[number] {
-  return value !== null && (tabs as readonly string[]).includes(value);
+function isTab(value: string | null): value is TabId {
+  return value !== null && tabOptions.some((option) => option.id === value);
 }
 
-function readDefaultTab(): typeof tabs[number] {
+function readDefaultTab(): TabId {
   let configured: string | null;
   try {
     configured = localStorage.getItem(DEFAULT_TAB_KEY);
@@ -73,8 +83,8 @@ function readDefaultTab(): typeof tabs[number] {
   return isTab(configured) ? configured : "inbox";
 }
 
-function selectDefaultTab(tab: typeof tabs[number]): void {
-  activeTab = tab;
+function selectDefaultTab(tab: TabId): void {
+  defaultTab = tab;
   try { localStorage.setItem(DEFAULT_TAB_KEY, tab); } catch { /* Local settings are optional. */ }
 }
 
@@ -220,20 +230,26 @@ function render(): void {
   const panel = element("section");
   panel.className = "panel";
   panel.setAttribute("aria-label", `${activeTab} panel`);
-  if (activeTab === "inbox") renderInbox(panel);
-  if (activeTab === "work") renderWork(panel);
-  if (activeTab === "sessions") renderSessions(panel);
-  if (activeTab === "history") renderHistory(panel);
+  if (selectedSessionId) renderSelectedSession(panel);
+  else if (activeTab === "inbox") renderInbox(panel);
+  else if (activeTab === "work") renderWork(panel);
+  else if (activeTab === "sessions") renderSessions(panel);
+  else if (activeTab === "history") renderHistory(panel);
 
   const navigation = element("nav");
   navigation.className = "tabs";
   navigation.setAttribute("aria-label", "Main navigation");
-  for (const [id, label] of [["inbox", "Inbox"], ["work", "Work"], ["sessions", "Sessions"], ["history", "History"]] as const) {
+  for (const { id, label } of tabOptions) {
     const button = element("button", label);
     button.type = "button";
     button.dataset.tab = id;
     button.setAttribute("aria-current", id === activeTab ? "page" : "false");
-    button.addEventListener("click", () => { selectDefaultTab(id); render(); });
+    button.addEventListener("click", () => {
+      clearSelectedSession();
+      activeTab = id;
+      selectDefaultTab(id);
+      render();
+    });
     navigation.append(button);
   }
   app.append(header, panel, navigation);
@@ -336,6 +352,7 @@ async function submitPairing(event: SubmitEvent, codeInput: HTMLInputElement, na
 
 async function requirePairing(): Promise<void> {
   if (pairingRequired) return;
+  clearSelectedSession();
   credential = null;
   pairingRequired = true;
   pairingStatus = "This device is no longer authorized. Create a new pairing code to reconnect.";
@@ -349,14 +366,25 @@ function isArchived(session: Session): boolean {
   return Boolean(session.archivedAt) || session.status === "terminal";
 }
 
-function selectSession(session: Session): void {
+function selectSession(session: Session, origin: SessionOrigin = "sessions"): void {
   if (selectedSessionId && selectedSessionId !== session.id) multiTab.releaseSession(selectedSessionId);
   selectedSessionId = session.id;
+  selectedSession = session;
+  selectedSessionOrigin = origin;
+  activeTab = origin;
   multiTab.requestSession(session.id);
   render();
 }
 
-function renderSessionList(panel: HTMLElement, items: Session[], empty: string): void {
+function clearSelectedSession(): void {
+  if (selectedSessionId) multiTab.releaseSession(selectedSessionId);
+  selectedSessionId = null;
+  selectedSession = null;
+  selectedSessionOrigin = null;
+  pendingPrompt = null;
+}
+
+function renderSessionList(panel: HTMLElement, items: Session[], empty: string, origin: SessionOrigin = "sessions"): void {
   if (loadingSessions) {
     panel.append(element("p", "Loading sessions…"));
     return;
@@ -378,7 +406,7 @@ function renderSessionList(panel: HTMLElement, items: Session[], empty: string):
     button.append(element("strong", title), element("span", stale), element("small", `Updated ${new Date(session.updatedAt).toLocaleString()}`));
     if (session.hitlCount) button.append(element("span", `${session.hitlCount} needs input`));
     if (session.failureCount) button.append(element("span", `${session.failureCount} failed`));
-    button.addEventListener("click", () => selectSession(session));
+    button.addEventListener("click", () => selectSession(session, origin));
     item.append(button);
     list.append(item);
   }
@@ -386,15 +414,15 @@ function renderSessionList(panel: HTMLElement, items: Session[], empty: string):
 }
 
 function renderInbox(panel: HTMLElement): void {
-  panel.append(element("h2", "Inbox"));
+  const pendingActions = hitlActions.filter((action) => action.status === "pending" || action.status === "dispatching" || action.status === "unknown");
+  panel.append(element("h2", `Inbox (${pendingActions.length})`));
   renderProjectionError(panel, "inbox");
   if (loadingSessions) panel.append(element("p", "Loading inbox…"));
-  else if (hitlActions.length === 0) panel.append(element("p", "No open approvals or failures."));
+  else if (pendingActions.length === 0) panel.append(element("p", "No open approvals or failures."));
   else {
     const list = element("ul");
     list.className = "session-list";
-    for (const action of hitlActions) {
-      if (action.status !== "pending" && action.status !== "dispatching" && action.status !== "unknown") continue;
+    for (const action of pendingActions) {
       const item = element("li");
       item.className = "inbox-action";
       const card = renderAction(action, api);
@@ -410,7 +438,6 @@ function renderInbox(panel: HTMLElement): void {
     }
     panel.append(list);
   }
-  renderSelectedSession(panel);
 }
 
 const WORK_STATE_GROUPS = {
@@ -446,53 +473,56 @@ function renderProjectionError(panel: HTMLElement, tier: "inbox" | "work" | "his
 }
 
 function renderWork(panel: HTMLElement): void {
-  panel.append(element("h2", "Work"));
+  panel.append(element("h2", `Work (${workItems.length})`));
   renderProjectionError(panel, "work");
   if (loadingSessions) panel.append(element("p", "Loading work…"));
   else if (workItems.length === 0) panel.append(element("p", "No work items."));
-  else for (const heading of ["Todo", "In progress", "Results", "Failed", "Unknown"] as const) {
-    panel.append(element("h3", heading));
-    const items = workItems.filter((work) => workGroup(work.state) === heading);
-    if (items.length === 0) {
-      panel.append(element("p", `No ${heading.toLowerCase()} items.`));
-      continue;
+  else {
+    let renderedGroups = 0;
+    for (const heading of ["Todo", "In progress", "Results", "Failed", "Unknown"] as const) {
+      const items = workItems.filter((work) => workGroup(work.state) === heading);
+      if (items.length === 0) continue;
+      renderedGroups++;
+      panel.append(element("h3", `${heading} (${items.length})`));
+      const list = element("ul");
+      list.className = "session-list";
+      for (const work of items) {
+        const item = element("li");
+        const button = element("button");
+        button.type = "button";
+        button.className = "session";
+        button.append(element("strong", workTitle(work)), element("span", work.state), element("small", `Updated ${new Date(work.updatedAt).toLocaleString()}`));
+        const session = sessions.find((candidate) => candidate.id === work.sessionId);
+        if (session) button.addEventListener("click", () => selectSession(session));
+        else button.disabled = true;
+        item.append(button);
+        list.append(item);
+      }
+      panel.append(list);
     }
-    const list = element("ul");
-    list.className = "session-list";
-    for (const work of items) {
-      const item = element("li");
-      const button = element("button");
-      button.type = "button";
-      button.className = "session";
-      button.append(element("strong", workTitle(work)), element("span", work.state), element("small", `Updated ${new Date(work.updatedAt).toLocaleString()}`));
-      const session = sessions.find((candidate) => candidate.id === work.sessionId);
-      if (session) button.addEventListener("click", () => selectSession(session));
-      else button.disabled = true;
-      item.append(button);
-      list.append(item);
-    }
-    panel.append(list);
+    if (renderedGroups === 0) panel.append(element("p", "No work items."));
   }
-  renderSelectedSession(panel);
 }
 
 function renderSessions(panel: HTMLElement): void {
-  panel.append(element("h2", "Sessions"));
-  renderSessionList(panel, sessions.filter((session) => !isArchived(session)), "No active runtime sessions.");
-  renderSelectedSession(panel);
+  const activeSessions = sessions.filter((session) => !isArchived(session));
+  panel.append(element("h2", `Sessions (${activeSessions.length})`));
+  renderSessionList(panel, activeSessions, "No active runtime sessions.");
   const settings = element("details");
   settings.append(element("summary", "Settings"));
   const defaultViewLabel = element("label", "Default view");
   defaultViewLabel.htmlFor = "default-view";
   const defaultView = element("select") as HTMLSelectElement;
   defaultView.id = "default-view";
-  for (const [id, label] of [["inbox", "Inbox"], ["work", "Work"], ["sessions", "Sessions"], ["history", "History"]] as const) {
+  for (const { id, label } of tabOptions) {
     const option = element("option", label) as HTMLOptionElement;
     option.value = id;
-    option.selected = activeTab === id;
+    option.selected = defaultTab === id;
     defaultView.append(option);
   }
-  defaultView.addEventListener("change", () => selectDefaultTab(defaultView.value as typeof tabs[number]));
+  defaultView.addEventListener("change", () => {
+    if (isTab(defaultView.value)) selectDefaultTab(defaultView.value);
+  });
   const reconnect = element("button", "Reconnect updates");
   reconnect.type = "button";
   reconnect.addEventListener("click", reconnectUpdates);
@@ -504,15 +534,29 @@ function renderSessions(panel: HTMLElement): void {
 }
 
 function renderHistory(panel: HTMLElement): void {
-  panel.append(element("h2", "History"));
+  const archivedSessions = sessions.filter(isArchived);
+  panel.append(element("h2", `History (${archivedSessions.length})`));
   renderProjectionError(panel, "history");
-  renderSessionList(panel, sessions.filter(isArchived), "No completed or archived sessions.");
-  renderSelectedSession(panel);
+  renderSessionList(panel, archivedSessions, "No completed or archived sessions.", "history");
 }
 
 function renderSelectedSession(panel: HTMLElement): void {
-  const session = sessions.find((item) => item.id === selectedSessionId);
-  if (!session) return;
+  const session = selectedSession;
+  const heading = element("h2", "Session details");
+  const origin = selectedSessionOrigin ?? "sessions";
+  const back = element("button", origin === "history" ? "Back to history" : "Back to sessions");
+  back.type = "button";
+  back.className = "back-to-sessions";
+  back.addEventListener("click", () => {
+    clearSelectedSession();
+    activeTab = origin;
+    render();
+  });
+  panel.append(back, heading);
+  if (!session) {
+    panel.append(element("p", "Loading selected session…"));
+    return;
+  }
   const detail = element("section");
   detail.className = "session-detail";
   detail.setAttribute("aria-label", `${session.title || session.adapter} details`);
@@ -541,7 +585,6 @@ function renderSelectedSession(panel: HTMLElement): void {
     }
   }
   panel.append(detail);
-  multiTab.requestSession(session.id);
 }
 
 function renderPromptForm(panel: HTMLElement, sessionId: string): void {
@@ -599,8 +642,9 @@ async function archiveSession(sessionId: string, button: HTMLButtonElement): Pro
     if (typeof body !== "object" || body === null || !isSession((body as { session?: unknown }).session)) throw new Error("invalid archive response");
     const archived = (body as { session: Session }).session;
     sessions = sessions.map((session) => session.id === sessionId ? archived : session);
-    activeTab = "history";
+    clearSelectedSession();
     fetchError = null;
+    activeTab = "history";
   } catch (error) {
     fetchError = fetchFailure("Unable to archive session", error);
   } finally {
@@ -680,6 +724,7 @@ async function loadSessions(): Promise<void> {
       if (typeof body !== "object" || body === null || !Array.isArray((body as { sessions?: unknown }).sessions)) fetchError = "Unable to load sessions: invalid response.";
       else {
         sessions = (body as { sessions: unknown[] }).sessions.filter(isSession);
+        if (selectedSessionId) selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? selectedSession;
         fetchError = null;
       }
     } else fetchError = fetchFailure("Unable to load sessions", sessionResult.reason);
@@ -704,13 +749,9 @@ async function loadSessions(): Promise<void> {
       if (typeof body === "object" && body !== null && Array.isArray((body as { sessions?: unknown }).sessions)) {
         const history = (body as { sessions: unknown[] }).sessions.filter(isSession);
         sessions = [...new Map([...sessions, ...history].map((session) => [session.id, session])).values()];
+        if (selectedSessionId) selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? selectedSession;
       } else projectionErrors.history = "Unable to load history: invalid response.";
     } else projectionErrors.history = fetchFailure("Unable to load history", historyResult.reason);
-    if (selectedSessionId && !sessions.some((session) => session.id === selectedSessionId)) {
-      selectedSessionId = null;
-      activeTab = "inbox";
-      fetchError = "The requested session is unavailable to this device.";
-    }
   } catch (error) {
     fetchError = fetchFailure("Unable to load sessions", error);
   } finally {
@@ -826,6 +867,7 @@ async function start(): Promise<void> {
   render();
   if (pairingRequired) return;
   multiTab.start();
+  if (selectedSessionId) multiTab.requestSession(selectedSessionId);
   reconnectUpdates();
 }
 

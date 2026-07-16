@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 
 const source = await Bun.file(new URL("./app.ts", import.meta.url)).text();
+const styles = await Bun.file(new URL("./styles.css", import.meta.url)).text();
 
 test("restores a persisted default tab at startup and falls back to Inbox for invalid or unavailable storage", async () => {
   class Node {
@@ -136,12 +137,38 @@ test("persists bottom-tab selections across reloads and continues navigating whe
   tab(unavailableApp, "work").click();
   expect(tab(unavailableApp, "work").attributes["aria-current"]).toBe("page");
 });
+test("changes the Settings default without changing the current navigation state", () => {
+  const settings = source.slice(source.indexOf("function renderSessions"), source.indexOf("function renderHistory"));
+  expect(source).toContain("let defaultTab: TabId = readDefaultTab();");
+  expect(settings).toContain("option.selected = defaultTab === id;");
+  expect(settings).toContain('if (isTab(defaultView.value)) selectDefaultTab(defaultView.value);');
+  expect(settings).not.toContain("activeTab =");
+  expect(settings).not.toContain("render();");
+  expect(source).toContain("const tabOptions = [");
+  expect(source).toContain("for (const { id, label } of tabOptions)");
+});
 
-test("renders the four mobile workflow navigation surfaces", () => {
-  expect(source).toContain('[["inbox", "Inbox"], ["work", "Work"], ["sessions", "Sessions"], ["history", "History"]]');
-  expect(source).toContain('if (activeTab === "inbox") renderInbox(panel);');
-  expect(source).toContain('if (activeTab === "work") renderWork(panel);');
-  expect(source).toContain('if (activeTab === "history") renderHistory(panel);');
+test("keeps History detail navigation, label, and return destination aligned", () => {
+  expect(source).toContain('renderSessionList(panel, archivedSessions, "No completed or archived sessions.", "history");');
+  expect(source).toContain('function renderSessionList(panel: HTMLElement, items: Session[], empty: string, origin: SessionOrigin = "sessions"): void');
+  expect(source).toContain("button.addEventListener(\"click\", () => selectSession(session, origin));");
+  expect(source).toContain('const back = element("button", origin === "history" ? "Back to history" : "Back to sessions");');
+  expect(source).toContain("selectedSessionOrigin = null;");
+  expect(styles).toContain("select:focus-visible");
+  expect(styles).toContain("--color-live: #087a4b;");
+});
+
+test("renders the four mobile workflow navigation surfaces with persistent navigation", () => {
+  expect(source).toContain('const tabOptions = [');
+  expect(source).toContain('if (selectedSessionId) renderSelectedSession(panel);');
+  expect(source).toContain('else if (activeTab === "inbox") renderInbox(panel);');
+  expect(source).toContain('else if (activeTab === "history") renderHistory(panel);');
+  expect(source).toContain('app.append(header, panel, navigation);');
+  expect(styles).toContain('#app { height: 100dvh; min-height: 0;');
+  expect(styles).toContain('.panel { min-height: 0;');
+  expect(styles).toContain('grid-template-rows: auto minmax(0, 1fr) auto;');
+  expect(styles).toContain('env(safe-area-inset-bottom)');
+  expect(styles).toContain('.tabs button { min-width: 0; min-height: 44px;');
 });
 
 test("shows loading and empty states for each session surface", () => {
@@ -166,7 +193,7 @@ test("makes archived sessions read-only and archives active sessions through the
   expect(source).toContain('`/sessions/${encodeURIComponent(sessionId)}/archive`');
   expect(source).toContain('{ method: "POST" }');
 });
-test("loads Hub workflow projections and renders each represented HITL action once", () => {
+test("loads Hub workflow projections, preserves HITL priority, and suppresses empty work groups", () => {
   expect(source).toContain('load("/sessions")');
   expect(source).toContain('load("/work")');
   expect(source).toContain('load("/hitl")');
@@ -174,11 +201,13 @@ test("loads Hub workflow projections and renders each represented HITL action on
   expect(source).toContain("Promise.allSettled");
   expect(source).toContain("function isWorkItem(value: unknown): value is WorkItem");
   expect(source).toContain("type HitlAction = PendingAction;");
-  expect(source).toContain("for (const action of hitlActions)");
-  expect(source).toContain('if (action.status !== "pending" && action.status !== "dispatching" && action.status !== "unknown") continue;');
+  expect(source).toContain('const pendingActions = hitlActions.filter');
+  expect(source).toContain("for (const action of pendingActions)");
   expect(source).toContain("const card = renderAction(action, api);");
   expect(source).toContain("function workGroup(state: string)");
-  expect(source).toContain("for (const work of items)");
+  expect(source).toContain('if (items.length === 0) continue;');
+  expect(source).toContain('panel.append(element("h3", `${heading} (${items.length})`));');
+  expect(source).not.toContain('`No ${heading.toLowerCase()} items.`');
   expect(source).toContain('"No open approvals or failures."');
   expect(source).toContain('"No work items."');
   expect(source).not.toContain('sessions.filter((session) => !isArchived(session) && (Boolean(session.hitlCount)');
@@ -208,6 +237,22 @@ test("keeps view-only and archived session controls read-only", () => {
   expect(source).toContain('if (session.controlMode === "view-only") detail.append(element("p", "This session is view-only. Prompts and session actions are unavailable."));');
   expect(source).toContain("else {\n      renderPromptForm(detail, session.id);\n      renderSessionActions(detail, session.id, api);");
   expect(source).toContain('if (isArchived(session)) {\n    detail.append(element("p", "Archived sessions are read-only."));');
+});
+test("keeps session detail stable across renders and releases it only on selection lifecycle actions", () => {
+  expect(source).toContain("let selectedSession: Session | null = null;");
+  expect(source).toContain("let selectedSessionOrigin: SessionOrigin | null = null;");
+  expect(source).toContain("selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? selectedSession;");
+  expect(source).not.toContain('activeTab = "inbox";\n      fetchError = "The requested session is unavailable to this device."');
+  expect(source).toContain('function selectSession(session: Session, origin: SessionOrigin = "sessions"): void');
+  expect(source).toContain("selectedSessionOrigin = origin;\n  activeTab = origin;");
+  expect(source).toContain('const back = element("button", origin === "history" ? "Back to history" : "Back to sessions");');
+  expect(source).toContain('clearSelectedSession();\n    activeTab = origin;');
+  expect(source).toContain('clearSelectedSession();\n    fetchError = null;\n    activeTab = "history";');
+  const detail = source.slice(source.indexOf("function renderSelectedSession"), source.indexOf("function renderPromptForm"));
+  expect(detail).not.toContain("multiTab.requestSession");
+  expect(source).toContain("function clearSelectedSession(): void");
+  expect(source).toContain("selectedSessionOrigin = null;");
+  expect(source).toContain("multiTab.releaseSession(selectedSessionId);");
 });
 
 test("isolates cursors, selected-session updates, serialized catch-up, and typed prompt retries", () => {
