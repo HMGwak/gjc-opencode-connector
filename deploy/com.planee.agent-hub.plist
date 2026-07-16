@@ -11,11 +11,11 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>HUB_DATABASE_PATH</key>
-    <string>/var/db/planee-agent-hub/hub.sqlite</string>
+    <string>/private/var/db/planee-agent-hub/hub.sqlite</string>
     <key>HUB_OWNER_ID</key>
     <string>planee</string>
     <key>HUB_PAIRING_ROOT_SECRET_FILE</key>
-    <string>/var/db/planee-agent-hub/pairing-root-secret</string>
+    <string>/private/var/db/planee-agent-hub/pairing-root-secret</string>
     <key>HUB_PUBLIC_ORIGIN</key>
     <string>https://agents.myplanee.com</string>
     <key>GJC_CODING_AGENT_DIR</key>
