@@ -24,10 +24,8 @@
     <string>https://agents.myplanee.com</string>
     <key>HUB_WEB_ROOT</key>
     <string>/Users/planee/Automation/codeconnector/apps/web/dist</string>
-    <key>HUB_GJC_EXECUTABLE</key>
-    <string>/Users/planee/.bun/bin/gjc</string>
-    <key>HUB_GJC_WORKDIR_ROOTS</key>
-    <string>/Users/planee/Automation</string>
+    <key>GJC_CODING_AGENT_DIR</key>
+    <string>/Users/planee/.gjc/agent</string>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/bin:/bin</string>
   </dict>
