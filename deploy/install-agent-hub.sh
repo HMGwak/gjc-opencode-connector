@@ -96,6 +96,7 @@ install -d "$snapshot_stage/apps" "$snapshot_stage/packages" "$snapshot_stage/bi
 install -m 644 "$repo_root/package.json" "$snapshot_stage/package.json"
 install -m 644 "$repo_root/bun.lock" "$snapshot_stage/bun.lock"
 cp -R "$hub_dir" "$snapshot_stage/apps/hub"
+rm -rf "$snapshot_stage/apps/hub/node_modules"
 cp -R "$core_dir" "$snapshot_stage/packages/core"
 cp -R "$core_dir" "$snapshot_stage/node_modules/@planee/core"
 install -d "$snapshot_stage/apps/web"
