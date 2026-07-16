@@ -1,5 +1,5 @@
 import { CorruptPersistentDataError, DurableCommandDispatcher, type AgentAdapter, type CoreDatabase, type Session } from "@planee/core";
-import { AccessJwtVerifier, type AccessClaims } from "./auth";
+import { DeviceCredentialError, DeviceCredentialVerifier, type DeviceClaims } from "./auth";
 import { ActionApiError, type ArtifactMetadata, type ArtifactService, type HubPendingActionService, type PendingAction } from "./actions";
 import { prometheusMetrics, type HubMetricsOptions } from "./metrics";
 import { readiness, type RecoveryState } from "./readiness";
@@ -11,7 +11,7 @@ export const DEFAULT_PORT = 8787;
 
 export interface HubServerOptions {
   readonly database: CoreDatabase;
-  readonly auth: AccessJwtVerifier;
+  readonly auth: DeviceCredentialVerifier;
   readonly publicOrigin?: string;
   readonly bodyLimitBytes?: number;
   readonly commandId?: () => string;
@@ -68,6 +68,16 @@ async function parsePrompt(request: Request, limit: number): Promise<{ prompt: s
     return { prompt: value.prompt };
   } catch { return error(400, "bad_request", "Invalid JSON"); }
 }
+async function parsePairingRedemption(request: Request, limit: number): Promise<{ code: string; deviceName: string } | Response> {
+  const lengthError = contentLengthError(request, limit); if (lengthError) return lengthError;
+  const bytes = new Uint8Array(await request.arrayBuffer());
+  if (bytes.byteLength > limit) return error(413, "payload_too_large", "Request body too large");
+  try {
+    const value = JSON.parse(new TextDecoder().decode(bytes)) as { code?: unknown; deviceName?: unknown };
+    if (typeof value.code !== "string" || typeof value.deviceName !== "string") return error(400, "pairing_invalid", "Pairing code and device name are required");
+    return { code: value.code, deviceName: value.deviceName };
+  } catch { return error(400, "pairing_invalid", "Invalid JSON"); }
+}
 const actionWire = (action: PendingAction) => ({ id: action.id, sessionId: action.sessionId, version: action.version, expiresAt: action.expiresAt, status: action.status, type: action.type, payload: action.payload, artifactIds: action.artifactIds });
 const artifactWire = (artifact: ArtifactMetadata) => ({ id: artifact.id, name: artifact.name, contentType: artifact.contentType, size: artifact.size, createdAt: artifact.createdAt });
 
@@ -77,7 +87,7 @@ async function parseActionResponse(request: Request, limit: number): Promise<{ v
   if (bytes.byteLength > limit) return error(413, "payload_too_large", "Request body too large");
   try {
     const value = JSON.parse(new TextDecoder().decode(bytes)) as { version?: unknown; response?: unknown };
-    if (!Number.isSafeInteger(value.version) || (value.version as number) < 0 || !Object.hasOwn(value, "response")) return error(400, "action_invalid", "version and response are required");
+    if (!Number.isSafeInteger(value.version) || (value.version as number) < 0 || !Object.prototype.hasOwnProperty.call(value, "response")) return error(400, "action_invalid", "version and response are required");
     return { version: value.version as number, response: value.response };
   } catch { return error(400, "action_invalid", "Invalid JSON"); }
 }
@@ -137,8 +147,8 @@ export function createHubServer(options: HubServerOptions): { fetch(request: Req
     const session = options.database.getSessionForOwner(sessionId, ownerId);
     return session !== null && (options.authorizeSession?.(sessionId, ownerId) ?? true);
   };
-  const authenticate = async (request: Request): Promise<AccessClaims | Response> => {
-    const token = request.headers.get("cf-access-jwt-assertion") ?? request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
+  const authenticate = async (request: Request): Promise<DeviceClaims | Response> => {
+    const token = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
     if (!token) return error(401, "unauthorized", "Authentication required");
     try { return await options.auth.verify(token); } catch { return error(401, "unauthorized", "Authentication required"); }
   };
@@ -182,15 +192,25 @@ export function createHubServer(options: HubServerOptions): { fetch(request: Req
   });
   return { async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    if (request.method === "GET" && url.pathname === "/api/v1/health") {
-      const status = await readiness({ database: options.database, adapters: options.adapters, adapterHealth: options.adapterHealth }, recoveryState);
-      return json({ ok: status.ok, readiness: status }, status.ok ? 200 : 503);
-    }
     if (!url.pathname.startsWith("/api/v1/")) return error(404, "not_found", "Not found");
+    if (request.method === "POST" && url.pathname === "/api/v1/pairings/redeem") {
+      const body = await parsePairingRedemption(request, limit); if (body instanceof Response) return body;
+      try {
+        const registration = await options.auth.redeemPairing(body);
+        return json(registration, 201);
+      } catch (cause) {
+        if (cause instanceof DeviceCredentialError) return error(401, "pairing_rejected", "Pairing code rejected");
+        return error(500, "internal_error", "Internal server error");
+      }
+    }
     const claims = await authenticate(request);
     if (claims instanceof Response) return claims;
     const limited = rateLimit(claims.sub);
     if (limited) return limited;
+    if (request.method === "GET" && url.pathname === "/api/v1/health") {
+      const status = await readiness({ database: options.database, adapters: options.adapters, adapterHealth: options.adapterHealth }, recoveryState);
+      return json({ ok: status.ok, readiness: status }, status.ok ? 200 : 503);
+    }
     if (request.method !== "GET" && request.method !== "HEAD") {
       await recovery;
       if (recoveryState !== "ready") return error(503, "recovery_unready", "Command recovery is not ready");

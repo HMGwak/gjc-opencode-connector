@@ -4,7 +4,7 @@
 **작성일:** 2026-07-15  
 **제품 형태:** Mac mini 단일 노드 기반 모바일 Agent 관리 허브  
 **대상 Agent:** OpenCode, Gajae-Code(GJC)  
-**외부 접속:** `agents.myplanee.com` + Cloudflare Access/Tunnel  
+**외부 접속:** `agents.myplanee.com` + Cloudflare Tunnel + 기기별 pairing credential
 **모바일:** Android PWA 우선, 필요 시 Capacitor 앱 확장  
 **저장 방식:** 로컬 우선(Local-first), 실시간 우선, 연결 복구형 동기화  
 
@@ -42,7 +42,7 @@ Android PWA
     ▼
 agents.myplanee.com
     │
-Cloudflare Access + Tunnel
+Cloudflare Tunnel + Hub device authentication
     │
     ▼
 Mac mini
@@ -266,7 +266,7 @@ Unified Hub Domain Model
 
 ### Security
 
-- Cloudflare Access
+- device pairing credential
 - Cloudflare Tunnel
 - Agent 포트 외부 비공개
 - localhost bind
@@ -358,7 +358,7 @@ Mac mini에서 계속 실행되는 경량 daemon.
 ```text
 agents.myplanee.com
     ↓
-Cloudflare Access
+Hub device authentication
     ↓
 Cloudflare Tunnel
     ↓
@@ -935,7 +935,7 @@ POST /api/v1/push/subscriptions
 
 ---
 
-# 16. Cloudflare Security
+# 16. Tunnel and Device Security
 
 ## 16.1 External Access
 
@@ -945,10 +945,9 @@ agents.myplanee.com
 
 필수:
 
-- Cloudflare Access default deny
-- 본인 계정만 allow
 - Tunnel
-- origin Access JWT 검증
+- Hub device credential 검증
+- 1회 pairing code와 Android Keystore 저장
 - HSTS
 - rate limit
 - no port forwarding
@@ -967,9 +966,8 @@ GJC notification: 127.0.0.1
 
 ## 16.3 Secret Storage
 
-- macOS Keychain 우선
-- 설정 파일은 `0600`
-- browser에 Agent credential 전달 금지
+- pairing root secret은 root-owned `0600` 파일
+- Android Keystore 외의 browser storage에 device credential 저장 금지
 - Cloudflare token 로그 금지
 - provider key DB 저장 금지
 
@@ -1324,7 +1322,7 @@ planee-agent-hub/
 - ADR-004: SQLite MVP
 - ADR-005: OpenCode Adapter control surface
 - ADR-006: GJC Coordinator/Notifications authority
-- ADR-007: Cloudflare Access boundary
+- ADR-018: Personal device pairing authentication
 - ADR-008: PWA first
 - ADR-009: No terminal scraping
 - ADR-010: Single process first, split later
@@ -1340,7 +1338,7 @@ ADR은 spike 결과에 따라 변경 가능하다.
 ```text
 Mac mini에서 planee serve 실행
 → SQLite 생성
-→ Cloudflare Access로 PWA 접속
+→ Android device pairing 후 PWA 접속
 → 한 Backend의 session 목록
 → session 상세
 → prompt 전송
@@ -1368,7 +1366,7 @@ Mac mini에서 planee serve 실행
 ```text
 Android PWA
     ↓
-Cloudflare Access + Tunnel
+Cloudflare Tunnel + Hub device authentication
     ↓
 Mac mini의 planee serve
     ├─ API/PWA
@@ -1416,7 +1414,7 @@ Mac mini의 planee serve
 - GJC external control readiness
 - GJC Notifications SDK
 - GJC RPC mode
-- Cloudflare Access
+- device pairing credential
 - Cloudflare Tunnel
 - macOS launchd
 - PWA Service Worker

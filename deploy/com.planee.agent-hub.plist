@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.planee.agent-hub</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/planee/.bun/bin/bun</string>
+    <string>run</string>
+    <string>src/index.ts</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/planee/Automation/codeconnector/apps/hub</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HUB_DATABASE_PATH</key>
+    <string>/var/db/planee-agent-hub/hub.sqlite</string>
+    <key>HUB_OWNER_ID</key>
+    <string>planee</string>
+    <key>HUB_PAIRING_ROOT_SECRET_FILE</key>
+    <string>/var/db/planee-agent-hub/pairing-root-secret</string>
+    <key>HUB_PUBLIC_ORIGIN</key>
+    <string>https://agents.myplanee.com</string>
+    <key>HUB_WEB_ROOT</key>
+    <string>/Users/planee/Automation/codeconnector/apps/web/dist</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/var/log/planee-agent-hub.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/planee-agent-hub.err.log</string>
+</dict>
+</plist>

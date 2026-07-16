@@ -1,81 +1,102 @@
-export interface AccessClaims {
+import type { CoreDatabase, DeviceCredential } from "@planee/core";
+
+export type DeviceClaims = {
   readonly sub: string;
-  readonly email?: string;
-  readonly [claim: string]: unknown;
-}
-
-export interface JwksResolver {
-  resolve(options?: { readonly bypassCache?: boolean }): Promise<JsonWebKeySet>;
-}
-
-export interface AccessJwtOptions {
-  readonly issuer: string;
-  readonly audience: string;
-  readonly jwks: JwksResolver;
-  readonly clockSkewSeconds?: number;
-  readonly now?: () => number;
-  readonly cacheTtlMs?: number;
-}
-
-export interface AccessJsonWebKey extends JsonWebKey {
-  readonly kid?: string;
-}
-
-export interface JsonWebKeySet {
-  readonly keys: readonly AccessJsonWebKey[];
-}
-
-interface JwtHeader { alg: string; kid?: string; }
-interface JwtPayload { iss?: string; aud?: string | string[]; exp?: number; nbf?: number; sub?: string; email?: string; [claim: string]: unknown; }
-
-const decode = <T>(part: string): T => JSON.parse(new TextDecoder().decode(fromBase64Url(part))) as T;
-const fromBase64Url = (value: string): Uint8Array => {
-  if (!/^[A-Za-z0-9_-]+$/.test(value)) throw new Error("Invalid base64url");
-  const padded = value.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - value.length % 4) % 4);
-  return Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
+  readonly deviceId: string;
 };
 
-export class AccessJwtVerifier {
-  private cached: JsonWebKeySet | undefined;
-  private cacheExpiresAt = 0;
-  private refresh: Promise<JsonWebKeySet> | undefined;
+export type PairingCode = {
+  readonly id: string;
+  readonly code: string;
+  readonly expiresAt: string;
+};
 
-  constructor(private readonly options: AccessJwtOptions) {}
+export type DeviceRegistration = {
+  readonly deviceId: string;
+  readonly credential: string;
+};
 
-  async verify(token: string): Promise<AccessClaims> {
-    try {
-      const [encodedHeader, encodedPayload, encodedSignature, ...extra] = token.split(".");
-      if (!encodedHeader || !encodedPayload || !encodedSignature || extra.length !== 0) throw new Error("Malformed JWT");
-      const header = decode<JwtHeader>(encodedHeader);
-      const payload = decode<JwtPayload>(encodedPayload);
-      if (header.alg !== "RS256" || !header.kid) throw new Error("Unsupported JWT");
-      const keySet = await this.keys();
-      let key = keySet.keys.find((candidate) => candidate.kid === header.kid && candidate.kty === "RSA");
-      if (!key) key = (await this.keys(true)).keys.find((candidate) => candidate.kid === header.kid && candidate.kty === "RSA");
-      if (!key) throw new Error("Unknown signing key");
-      const cryptoKey = await crypto.subtle.importKey("jwk", key, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
-      const valid = await crypto.subtle.verify("RSASSA-PKCS1-v1_5", cryptoKey, fromBase64Url(encodedSignature), new TextEncoder().encode(`${encodedHeader}.${encodedPayload}`));
-      if (!valid) throw new Error("Invalid signature");
-      const now = (this.options.now ?? Date.now)() / 1000;
-      const skew = this.options.clockSkewSeconds ?? 60;
-      const audience = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
-      if (payload.iss !== this.options.issuer || !audience.includes(this.options.audience) || typeof payload.exp !== "number" || payload.exp <= now - skew || (typeof payload.nbf === "number" && payload.nbf > now + skew) || typeof payload.sub !== "string") throw new Error("Invalid claims");
-      return payload as AccessClaims;
-    } catch {
-      throw new Error("Access JWT rejected");
+export class DeviceCredentialError extends Error {
+  readonly name = "DeviceCredentialError";
+
+  constructor(message = "Device credential rejected") {
+    super(message);
+  }
+}
+
+const encoder = new TextEncoder();
+const hex = (bytes: Uint8Array): string => Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+const base64url = (bytes: Uint8Array): string => btoa(String.fromCharCode(...bytes)).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+const randomId = (): string => crypto.randomUUID();
+const randomValue = (): string => base64url(crypto.getRandomValues(new Uint8Array(32)));
+const pairingCodeLength = 6;
+const pairingDigits = 10;
+const randomDigitLimit = Math.floor(256 / pairingDigits) * pairingDigits;
+const randomPairingCode = (): string => {
+  const digits: string[] = [];
+  while (digits.length < pairingCodeLength) {
+    for (const value of crypto.getRandomValues(new Uint8Array(pairingCodeLength))) {
+      if (value >= randomDigitLimit) continue;
+      digits.push(String(value % pairingDigits));
+      if (digits.length === pairingCodeLength) break;
     }
   }
+  return digits.join("");
+};
 
-  private async keys(bypassCache = false): Promise<JsonWebKeySet> {
-    const now = (this.options.now ?? Date.now)();
-    if (!bypassCache && this.cached && now < this.cacheExpiresAt) return this.cached;
-    if (this.refresh) return this.refresh;
-    this.refresh = this.options.jwks.resolve({ bypassCache }).then((resolved) => {
-      if (!Array.isArray(resolved.keys) || resolved.keys.length === 0) throw new Error("JWKS unavailable");
-      this.cached = resolved;
-      this.cacheExpiresAt = (this.options.now ?? Date.now)() + (this.options.cacheTtlMs ?? 300_000);
-      return resolved;
-    }).finally(() => { this.refresh = undefined; });
-    return this.refresh;
+async function sha256(value: string): Promise<string> {
+  return hex(new Uint8Array(await crypto.subtle.digest("SHA-256", encoder.encode(value))));
+}
+
+async function pairingHash(secret: Uint8Array, code: string): Promise<string> {
+  const key = await crypto.subtle.importKey("raw", secret, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return hex(new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(code))));
+}
+
+export class DeviceCredentialVerifier {
+  private readonly now: () => number;
+
+  constructor(private readonly options: { readonly database: CoreDatabase; readonly ownerId: string; readonly pairingSecret: Uint8Array; readonly now?: () => number }) {
+    if (!options.ownerId || options.pairingSecret.byteLength < 32) throw new TypeError("Device credential verifier requires an owner and a 32-byte pairing secret");
+    this.now = options.now ?? Date.now;
+  }
+
+  async createPairing(input: { readonly expiresInMs: number; readonly maxAttempts?: number } = { expiresInMs: 300_000 }): Promise<PairingCode> {
+    if (!Number.isSafeInteger(input.expiresInMs) || input.expiresInMs < 1 || input.expiresInMs > 900_000) throw new TypeError("Pairing lifetime must be between 1 millisecond and 15 minutes");
+    const maxAttempts = input.maxAttempts ?? 5;
+    if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10) throw new TypeError("Pairing attempt limit must be between 1 and 10");
+    const id = randomId();
+    const code = randomPairingCode();
+    const expiresAt = new Date(this.now() + input.expiresInMs).toISOString();
+    this.options.database.createDevicePairing({ id, ownerId: this.options.ownerId, codeHash: await pairingHash(this.options.pairingSecret, code), expiresAt, maxAttempts });
+    this.options.database.writeAudit({ action: "device.pairing.created", payload: { pairingId: id, result: "issued" } });
+    return { id, code, expiresAt };
+  }
+
+  async redeemPairing(input: { readonly code: string; readonly deviceName: string }): Promise<DeviceRegistration> {
+    if (!/^\d{6}$/.test(input.code) || input.deviceName.trim().length === 0 || input.deviceName.length > 80) throw new DeviceCredentialError("Pairing code rejected");
+    const pairing = this.options.database.redeemDevicePairing({ codeHash: await pairingHash(this.options.pairingSecret, input.code), at: new Date(this.now()).toISOString() });
+    if (!pairing || pairing.ownerId !== this.options.ownerId) throw new DeviceCredentialError("Pairing code rejected");
+    const credential = randomValue();
+    const device = this.options.database.createDeviceCredential({ id: randomId(), ownerId: pairing.ownerId, deviceName: input.deviceName.trim(), credentialHash: await sha256(credential) });
+    this.options.database.writeAudit({ action: "device.pairing.redeemed", payload: { deviceId: device.id, result: "registered" } });
+    return { deviceId: device.id, credential };
+  }
+
+  async verify(credential: string): Promise<DeviceClaims> {
+    if (!/^[A-Za-z0-9_-]{43}$/.test(credential)) throw new DeviceCredentialError();
+    const device = this.options.database.authenticateDeviceCredential(await sha256(credential), new Date(this.now()).toISOString());
+    if (!device) throw new DeviceCredentialError();
+    return { sub: device.ownerId, deviceId: device.id };
+  }
+
+  listDevices(): readonly DeviceCredential[] {
+    return this.options.database.listDeviceCredentials(this.options.ownerId);
+  }
+
+  revokeDevice(deviceId: string): boolean {
+    const revoked = this.options.database.revokeDeviceCredential(deviceId, new Date(this.now()).toISOString());
+    if (revoked) this.options.database.writeAudit({ action: "device.revoked", payload: { deviceId, result: "revoked" } });
+    return revoked;
   }
 }

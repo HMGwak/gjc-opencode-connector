@@ -1,14 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { openCoreDatabase, type AgentAdapter } from "@planee/core";
-import { AccessJwtVerifier } from "./auth";
+import { DeviceCredentialVerifier } from "./auth";
 import { prometheusMetrics, readiness } from "./metrics";
 import { createHubServer } from "./server";
 
-const b64 = (value: Uint8Array) => btoa(String.fromCharCode(...value)).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
-async function token(key: CryptoKey, claims: Record<string, unknown>): Promise<string> {
-  const encoder = new TextEncoder(); const header = b64(encoder.encode(JSON.stringify({ alg: "RS256", kid: "key" }))); const payload = b64(encoder.encode(JSON.stringify(claims)));
-  return `${header}.${payload}.${b64(new Uint8Array(await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, encoder.encode(`${header}.${payload}`))))}`;
-}
+const randomSecret = (): Uint8Array => crypto.getRandomValues(new Uint8Array(32));
 
 describe("operational metrics", () => {
   test("reports WAL checkpoint and subscription metrics", async () => {
@@ -24,12 +20,15 @@ describe("operational metrics", () => {
   });
 
   test("metrics requires the configured owner", async () => {
-    const pair = await crypto.subtle.generateKey({ name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" }, true, ["sign", "verify"]);
-    const now = Date.now(); const jwk = { ...await crypto.subtle.exportKey("jwk", pair.publicKey), kid: "key" };
-    const auth = new AccessJwtVerifier({ issuer: "issuer", audience: "hub", jwks: { resolve: async () => ({ keys: [jwk] }) } }); const database = openCoreDatabase();
-    const server = createHubServer({ database, auth, metricsOwnerId: "owner" }); const claims = { iss: "issuer", aud: "hub", sub: "other", exp: now / 1000 + 60 };
-    expect((await server.fetch(new Request("http://loopback/api/v1/metrics", { headers: { authorization: `Bearer ${await token(pair.privateKey, claims)}` } }))).status).toBe(403);
-    claims.sub = "owner";
-    expect((await server.fetch(new Request("http://loopback/api/v1/metrics", { headers: { authorization: `Bearer ${await token(pair.privateKey, claims)}` } }))).status).toBe(200); database.close();
+    const database = openCoreDatabase();
+    const ownerAuth = new DeviceCredentialVerifier({ database, ownerId: "owner", pairingSecret: randomSecret() });
+    const otherAuth = new DeviceCredentialVerifier({ database, ownerId: "other", pairingSecret: randomSecret() });
+    const server = createHubServer({ database, auth: ownerAuth, metricsOwnerId: "owner" });
+    const otherPairing = await otherAuth.createPairing({ expiresInMs: 60_000 });
+    const other = await otherAuth.redeemPairing({ code: otherPairing.code, deviceName: "Other" });
+    expect((await server.fetch(new Request("http://loopback/api/v1/metrics", { headers: { authorization: `Bearer ${other.credential}` } }))).status).toBe(403);
+    const ownerPairing = await ownerAuth.createPairing({ expiresInMs: 60_000 });
+    const owner = await ownerAuth.redeemPairing({ code: ownerPairing.code, deviceName: "Owner" });
+    expect((await server.fetch(new Request("http://loopback/api/v1/metrics", { headers: { authorization: `Bearer ${owner.credential}` } }))).status).toBe(200); database.close();
   });
 });

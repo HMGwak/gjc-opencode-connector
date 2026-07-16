@@ -7,6 +7,12 @@ test("consumes the hub sessions envelope", () => {
   expect(source).not.toContain("Array.isArray(body) ? body.filter(isSession)");
 });
 
+test("uses a six-digit numeric pairing input", () => {
+  expect(source).toContain('code.inputMode = "numeric";');
+  expect(source).toContain('code.maxLength = 6;');
+  expect(source).toContain('/^\\d{6}$/.test(code)');
+});
+
 test("reuses an idempotency key when retrying the same prompt", () => {
   expect(source).toContain("let pendingPrompt: { sessionId: string; prompt: string; key: string } | null = null;");
   expect(source).toContain("pendingPrompt?.sessionId === sessionId && pendingPrompt.prompt === prompt");
@@ -103,7 +109,10 @@ test("app network guard prevents event fetches when coordination has no polling 
   Object.assign(globalThis, {
     document: { cookie: "", querySelector: (selector: string) => selector === "#app" ? app : null, createElement: () => new Node() },
     navigator: { onLine: true },
-    window: { addEventListener: () => {}, clearTimeout: () => {}, setTimeout },
+    window: {
+      addEventListener: () => {}, clearTimeout: () => {}, setTimeout,
+      Capacitor: { Plugins: { SecureCredential: { get: async () => ({ credential: "x".repeat(43) }), set: async () => {}, clear: async () => {} } } },
+    },
     BroadcastChannel: undefined,
     indexedDB: { open: () => ({ result: {}, onupgradeneeded: null, onsuccess: null, onerror: null }) },
     fetch: async (input: string) => {

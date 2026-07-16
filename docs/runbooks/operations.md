@@ -5,7 +5,7 @@
 | Component | Runtime | Listener / transport | Required boundary |
 |---|---|---|---|
 | Planee hub (`planee serve`) | host | `127.0.0.1:8787` | Cloudflare Tunnel is the only external ingress; no public bind or port forwarding. |
-| cloudflared | separately managed host unit | outbound-only Tunnel connection | It forwards only to the loopback hub origin after Access policy enforcement. |
+| cloudflared | separately managed host unit | outbound-only Tunnel connection | It forwards only to the loopback hub origin; the Hub enforces device credentials. |
 | OpenCode | host | loopback-only server port selected by the operator | Run as `opencode serve --hostname 127.0.0.1`; never public-bind it. |
 | GJC Coordinator | host | MCP stdio/local coordinator transport | Require `GJC_COORDINATOR_MCP_WORKDIR_ROOTS` allowlist; use Coordinator MCP, not Bridge HTTPS. |
 | NanoClaw | Docker only | explicitly approved Docker publish rules only | Never host-start it, create a launchd unit for it, or share hub image/volume/environment/unit. |
@@ -21,19 +21,19 @@ Fail closed when the hub listener is not `127.0.0.1:8787`, port `8787` is Docker
 
 ## Health, metrics, and alert response
 
-The unauthenticated loopback health probe is intentionally minimal:
+The authenticated loopback health probe is intentionally minimal:
 
 ```sh
-curl --fail --silent --show-error http://127.0.0.1:8787/api/v1/health
+curl --fail --silent --show-error -H "Authorization: Bearer <device-credential>" http://127.0.0.1:8787/api/v1/health
 ```
 
-Probe the externally protected hostname with the external monitor, not with a credential-bearing shell command. Configure that monitor to alert when it cannot observe the expected health response within **5 minutes**. Record monitor incident timestamps; the monitor is an independent signal, not authority for data correctness.
+Probe the externally reachable hostname only with an enrolled test device or a credential-aware monitor; never log its credential. Configure that monitor to alert when it cannot observe the expected health response within **5 minutes**. Record monitor incident timestamps; the monitor is an independent signal, not authority for data correctness.
 
 Alert and investigate at least these signals:
 
 | Signal | Alert condition | Immediate safe response |
 |---|---|---|
-| Hub / adapter health | probe failure, adapter unhealthy, or stale health beyond the observed budget | Preserve logs/metrics; verify loopback health and adapter reconciliation; do not bypass Access. |
+| Hub / adapter health | probe failure, adapter unhealthy, or stale health beyond the observed budget | Preserve logs/metrics; verify loopback health and adapter reconciliation; do not bypass device authentication. |
 | Tunnel | disconnected or unable to reach loopback origin | Check cloudflared unit status and origin listener; retain outbound-only Tunnel and loopback origin. |
 | Heartbeat | expected heartbeat missing beyond the measured reconnect budget | Treat as liveness loss only; reconnect/reconcile from the SQLite journal rather than assuming event correctness. |
 | SQLite / WAL | sustained WAL growth, checkpoint remains busy, or low disk space | Follow `backup-restore.md`; do not remove WAL files. |
@@ -56,4 +56,4 @@ Metrics and audit records must contain identifiers and classifications, not requ
 
 ## Degraded operation
 
-Degraded mode is read-only: show `stale`/`unknown`, refuse mutations, and retain local journal evidence. Do not downgrade authentication, Cloudflare Access, origin JWT validation, CSRF checks, workdir allowlists, or Docker-only NanoClaw isolation to regain availability. If evidence is insufficient to determine state, remain `unknown` and escalate.
+Degraded mode is read-only: show `stale`/`unknown`, refuse mutations, and retain local journal evidence. Do not downgrade device authentication, CSRF checks, workdir allowlists, or Docker-only NanoClaw isolation to regain availability. If evidence is insufficient to determine state, remain `unknown` and escalate.

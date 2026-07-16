@@ -126,6 +126,27 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
   updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS push_subscriptions_owner_expires_idx ON push_subscriptions(owner_id, expires_at);
+CREATE TABLE IF NOT EXISTS device_pairings (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  code_hash TEXT NOT NULL UNIQUE CHECK (length(code_hash) = 64),
+  expires_at TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  max_attempts INTEGER NOT NULL CHECK (max_attempts > 0),
+  consumed_at TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS device_pairings_expires_idx ON device_pairings(expires_at);
+CREATE TABLE IF NOT EXISTS device_credentials (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  device_name TEXT NOT NULL,
+  credential_hash TEXT NOT NULL UNIQUE CHECK (length(credential_hash) = 64),
+  created_at TEXT NOT NULL,
+  last_used_at TEXT,
+  revoked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS device_credentials_owner_created_idx ON device_credentials(owner_id, created_at DESC);
 `;
 
 interface SessionRow {
@@ -138,6 +159,17 @@ interface CommandRow { id: string; session_id: string; idempotency_key: string; 
 interface AuditRow { id: number; action: string; session_id: string | null; command_id: string | null; payload_json: string; created_at: string; }
 interface PendingActionRow { id: string; version: number; state: PendingActionState; payload_json: string; answer_json: string | null; expires_at: string; created_at: string; updated_at: string; }
 interface PushSubscriptionRow { endpoint_hash: string; owner_id: string; encrypted_material: string; expires_at: string | null; created_at: string; updated_at: string; }
+interface DevicePairingRow { id: string; owner_id: string; code_hash: string; expires_at: string; attempts: number; max_attempts: number; consumed_at: string | null; created_at: string; }
+interface DeviceCredentialRow { id: string; owner_id: string; device_name: string; credential_hash: string; created_at: string; last_used_at: string | null; revoked_at: string | null; }
+
+export type DeviceCredential = {
+  readonly id: string;
+  readonly ownerId: string;
+  readonly deviceName: string;
+  readonly createdAt: string;
+  readonly lastUsedAt: string | null;
+  readonly revokedAt: string | null;
+};
 
 const now = (): string => new Date().toISOString();
 const json = (value: unknown): string => {
@@ -161,6 +193,7 @@ const asEvent = <T>(row: EventRow): SessionEvent<T> => ({ sessionId: row.session
 const asCommand = <T>(row: CommandRow): Command<T> => ({ id: row.id, sessionId: row.session_id, idempotencyKey: row.idempotency_key, state: row.state, correlationId: row.correlation_id, attempt: row.attempt, leaseExpiresAt: row.lease_expires_at, payload: decodeJson<T>(row.payload_json, `command ${row.id}`), createdAt: row.created_at, updatedAt: row.updated_at });
 const asAudit = <T>(row: AuditRow): AuditEntry<T> => ({ id: row.id, action: row.action, sessionId: row.session_id, commandId: row.command_id, payload: decodeJson<T>(row.payload_json, `audit ${row.id}`), createdAt: row.created_at });
 const asPushSubscription = (row: PushSubscriptionRow): StoredPushSubscription => ({ ownerId: row.owner_id, endpointHash: row.endpoint_hash, encryptedMaterial: row.encrypted_material, expiresAt: row.expires_at, createdAt: row.created_at, updatedAt: row.updated_at });
+const asDeviceCredential = (row: DeviceCredentialRow): DeviceCredential => ({ id: row.id, ownerId: row.owner_id, deviceName: row.device_name, createdAt: row.created_at, lastUsedAt: row.last_used_at, revokedAt: row.revoked_at });
 
 export class CoreDatabase {
   readonly sqlite: Database;
@@ -418,6 +451,47 @@ export class CoreDatabase {
 
   deleteExpiredPushSubscriptions(at = now()): number {
     return this.sqlite.query("DELETE FROM push_subscriptions WHERE expires_at IS NOT NULL AND expires_at <= ?").run(at).changes;
+  }
+
+  createDevicePairing(input: { id: string; ownerId: string; codeHash: string; expiresAt: string; maxAttempts: number }): void {
+    if (!input.ownerId || !/^[a-f0-9]{64}$/.test(input.codeHash) || !Number.isSafeInteger(input.maxAttempts) || input.maxAttempts < 1) throw new TypeError("Invalid device pairing");
+    this.sqlite.query("INSERT INTO device_pairings (id, owner_id, code_hash, expires_at, max_attempts, created_at) VALUES (?, ?, ?, ?, ?, ?)").run(input.id, input.ownerId, input.codeHash, input.expiresAt, input.maxAttempts, now());
+  }
+
+  redeemDevicePairing(input: { codeHash: string; at: string }): { readonly ownerId: string } | null {
+    if (!/^[a-f0-9]{64}$/.test(input.codeHash)) return null;
+    return this.transaction(() => {
+      const row = this.sqlite.query("SELECT * FROM device_pairings WHERE code_hash = ?").get(input.codeHash) as DevicePairingRow | null;
+      if (!row || row.consumed_at !== null || row.expires_at <= input.at || row.attempts >= row.max_attempts) return null;
+      const updated = this.sqlite.query("UPDATE device_pairings SET consumed_at = ?, attempts = attempts + 1 WHERE id = ? AND consumed_at IS NULL").run(input.at, row.id);
+      return updated.changes === 1 ? { ownerId: row.owner_id } : null;
+    });
+  }
+
+  createDeviceCredential(input: { id: string; ownerId: string; deviceName: string; credentialHash: string }): DeviceCredential {
+    if (!input.ownerId || !input.deviceName || !/^[a-f0-9]{64}$/.test(input.credentialHash)) throw new TypeError("Invalid device credential");
+    const timestamp = now();
+    this.sqlite.query("INSERT INTO device_credentials (id, owner_id, device_name, credential_hash, created_at) VALUES (?, ?, ?, ?, ?)").run(input.id, input.ownerId, input.deviceName, input.credentialHash, timestamp);
+    const row = this.sqlite.query("SELECT * FROM device_credentials WHERE id = ?").get(input.id) as DeviceCredentialRow | null;
+    if (!row) throw new Error("Device credential was not stored");
+    return asDeviceCredential(row);
+  }
+
+  authenticateDeviceCredential(credentialHash: string, at = now()): DeviceCredential | null {
+    if (!/^[a-f0-9]{64}$/.test(credentialHash)) return null;
+    const row = this.sqlite.query("SELECT * FROM device_credentials WHERE credential_hash = ? AND revoked_at IS NULL").get(credentialHash) as DeviceCredentialRow | null;
+    if (!row) return null;
+    this.sqlite.query("UPDATE device_credentials SET last_used_at = ? WHERE id = ?").run(at, row.id);
+    return { ...asDeviceCredential(row), lastUsedAt: at };
+  }
+
+  listDeviceCredentials(ownerId: string): DeviceCredential[] {
+    const rows = this.sqlite.query("SELECT * FROM device_credentials WHERE owner_id = ? ORDER BY created_at DESC").all(ownerId) as DeviceCredentialRow[];
+    return rows.map(asDeviceCredential);
+  }
+
+  revokeDeviceCredential(id: string, at = now()): boolean {
+    return this.sqlite.query("UPDATE device_credentials SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL").run(at, id).changes === 1;
   }
   listPendingActions<T, A = unknown>(): PendingAction<T, A>[] {
     const rows = this.sqlite.query("SELECT * FROM pending_actions ORDER BY created_at ASC").all() as PendingActionRow[];

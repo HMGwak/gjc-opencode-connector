@@ -14,7 +14,7 @@ export interface HubReadiness {
 }
 
 const metricName = (value: string): string => value.replace(/[^A-Za-z0-9_]/g, "_");
-const label = (value: string): string => value.replaceAll("\\", "\\\\").replaceAll('"', '\\"').replaceAll("\n", "\\n");
+const label = (value: string): string => value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
 
 export async function readiness(options: HubMetricsOptions): Promise<HubReadiness> {
   let database: HubReadiness["database"] = "ready";

@@ -1,41 +1,34 @@
-# Cloudflare Access and Tunnel Runbook
+# Personal Device Pairing and Cloudflare Tunnel Runbook
 
 ## Required topology
 
 ```text
-Internet -> Cloudflare Access (default deny + MFA) -> Cloudflare Tunnel (outbound only)
-         -> http://127.0.0.1:8787 (hub origin)
+Android app -- TLS --> agents.myplanee.com -- Cloudflare Tunnel --> 127.0.0.1:8787 Hub
 ```
 
-The hub and adapter ports are not public services. The Tunnel originates outbound from the host; do not create inbound firewall/port-forward rules for the hub, OpenCode, or GJC. The Tunnel origin is the literal loopback address `127.0.0.1:8787`, not `localhost` and not a LAN address.
+Cloudflare Tunnel remains outbound-only. Hub, OpenCode, and GJC are never public-bound or router-forwarded. The Hub listener is the literal `127.0.0.1:8787`.
 
-## Access policy
+## Root secret and local administration
 
-1. Create the Access application for the exact production hostname.
-2. Start with a **default deny** policy. Add an explicit allow policy only for the named operator identity/group.
-3. Require MFA through the configured identity provider. Do not substitute IP allowlisting, a shared password, or an unauthenticated bypass for MFA.
-4. Set short, reviewed session policy appropriate to the operator workflow. Remove departed identities immediately.
-5. Keep the origin's JWT validation enabled. Access is an edge control, not a replacement for origin issuer, audience, signature, expiry, and authorization checks.
-6. Test access with an authorized MFA-complete identity and an unauthorized identity. Record only outcome/status/time; never record Access tokens, cookies, JWTs, client secrets, or tunnel tokens.
+Use Model B: create the pairing root secret once in a root-owned `0600` file containing exactly 32 random bytes. Run the Hub as the selected system service with `HUB_PAIRING_ROOT_SECRET_FILE` pointing to that file, `HUB_OWNER_ID` matching the owner of existing Hub sessions, and `HUB_WEB_ROOT` pointing to the built `apps/web/dist` directory. Do not put the file contents in an environment variable, SQLite, source control, logs, or documentation.
 
-## Tunnel configuration requirements
-
-- Use a separately managed `cloudflared` service/account from the hub. Do not combine it with a NanoClaw lifecycle unit.
-- Configure a named hostname service to `http://127.0.0.1:8787` only. Do not configure a wildcard or catch-all ingress that reaches local administrative services.
-- The connector makes outbound connections to Cloudflare. No inbound listener, router port-forward, or public bind is permitted for the hub origin.
-- Keep credentials in the selected secret store with restrictive access; this document intentionally contains no credentials or token commands.
-- Restart ordering is readiness-based: verify hub loopback health first, then verify Tunnel connectivity and external Access-protected health. launchd load order alone is not proof of readiness.
-
-## Verification and failure handling
-
-Run these non-destructive checks from the host:
+Generate a code only on the Mac hosting the Hub:
 
 ```sh
-curl --fail --silent --show-error http://127.0.0.1:8787/api/v1/health
-lsof -nP -iTCP:8787 -sTCP:LISTEN
-docker ps --format '{{.Names}} {{.Ports}}'
+sudo -E bun --cwd apps/hub run admin -- create-pairing
+sudo -E bun --cwd apps/hub run admin -- list-devices
+sudo -E bun --cwd apps/hub run admin -- revoke-device <device-id>
 ```
 
-The listener check must show `127.0.0.1:8787` only. The Docker listing must not publish the hub port or show NanoClaw outside its approved Docker publish policy. Verify the public hostname from the external uptime monitor or a browser authenticated through Access; a direct origin bypass is a failure, not an alternate test path.
+The first command intentionally prints a short-lived one-use code to the local terminal. Do not redirect it to logs or paste it into tickets.
 
-If Access denies an expected user, correct identity/MFA policy rather than weakening default deny. If the Tunnel is down, restore its outbound connector after loopback health succeeds; do not public-bind the hub. If a loopback listener is absent or on a non-loopback address, stop the rollout and correct the service configuration before exposing the hostname.
+## Verification and cutover
+
+1. From a separate client, anonymous `curl` to a protected Hub API must return `401` or `403` and no Hub data.
+2. Pair a physical Android device, restart the app, and reconnect its network. It must operate without browser login or MFA.
+3. Revoke the device locally and verify its next API request is rejected. Re-pair it and verify recovery.
+4. Verify `lsof -nP -iTCP:8787 -sTCP:LISTEN` shows only `127.0.0.1:8787` and `docker ps --format '{{.Names}} {{.Ports}}'` shows no Hub port publish.
+5. Restart the Tunnel and confirm the paired Android app reconnects.
+6. Only after these checks, delete the `Planee Agent Hub` Cloudflare Access application and policy. Before changing organization MFA or App Launcher, verify they protect no other Access application.
+
+If any step fails, keep or restore Cloudflare Access while diagnosing. Never open the hostname without Hub authentication and never create a temporary JWT compatibility path.

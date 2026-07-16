@@ -1,36 +1,40 @@
 import { describe, expect, test } from "bun:test";
 import { openCoreDatabase, type AgentAdapter } from "@planee/core";
-import { AccessJwtVerifier } from "./auth";
+import { DeviceCredentialVerifier } from "./auth";
 import { createHubServer, DEFAULT_HOST, DEFAULT_PORT, type PushSubscriptionService } from "./server";
 import { ActionApiError, HubPendingActionService, type ArtifactService } from "./actions";
 
-const encoder = new TextEncoder();
 const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
-const base64url = (value: Uint8Array): string => btoa(String.fromCharCode(...value)).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
-const makeJwt = async (privateKey: CryptoKey, claims: Record<string, unknown>, kid = "test-key"): Promise<string> => {
-  const header = base64url(encoder.encode(JSON.stringify({ alg: "RS256", kid })));
-  const payload = base64url(encoder.encode(JSON.stringify(claims)));
-  const signature = new Uint8Array(await crypto.subtle.sign("RSASSA-PKCS1-v1_5", privateKey, encoder.encode(`${header}.${payload}`)));
-  return `${header}.${payload}.${base64url(signature)}`;
-};
+const randomSecret = (): Uint8Array => crypto.getRandomValues(new Uint8Array(32));
 
 async function fixture(adapters?: Readonly<Record<string, AgentAdapter>>, setup?: (database: ReturnType<typeof openCoreDatabase>) => void) {
-  const pair = await crypto.subtle.generateKey({ name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" }, true, ["sign", "verify"]);
-  const jwk = { ...await crypto.subtle.exportKey("jwk", pair.publicKey), kid: "test-key" };
   const now = 1_700_000_000_000;
-  const auth = new AccessJwtVerifier({ issuer: "https://access.example", audience: "hub", jwks: { resolve: async () => ({ keys: [jwk] }) }, now: () => now });
   const database = openCoreDatabase(); database.createSession({ id: "s1", ownerId: "u1", adapter: "test", remoteId: "r1" }); database.setReconciliation("s1", "active", 1, true, "revision-1"); setup?.(database);
+  const auth = new DeviceCredentialVerifier({ database, ownerId: "u1", pairingSecret: randomSecret(), now: () => now });
   const server = createHubServer({ database, auth, publicOrigin: "https://hub.example", commandId: () => "c1", adapters, authorizeSession: (_sessionId, ownerId) => ownerId === "u1" });
-  const token = await makeJwt(pair.privateKey, { iss: "https://access.example", aud: "hub", sub: "u1", exp: now / 1000 + 120 });
-  return { database, auth, server, privateKey: pair.privateKey, now, token };
+  const pairing = await auth.createPairing({ expiresInMs: 60_000 });
+  const registration = await auth.redeemPairing({ code: pairing.code, deviceName: "Test device" });
+  return { database, auth, server, now, token: registration.credential };
 }
-const request = (path: string, token?: string, init: RequestInit = {}) => new Request(`http://loopback${path}`, { ...init, headers: { ...(init.headers ?? {}), ...(token ? { "cf-access-jwt-assertion": token } : {}) } });
+const request = (path: string, token?: string, init: RequestInit = {}) => new Request(`http://loopback${path}`, { ...init, headers: { ...(init.headers ?? {}), ...(token ? { authorization: `Bearer ${token}` } : {}) } });
 
 describe("hub origin API", () => {
-  test("health is available without credentials and defaults are loopback", async () => {
-    const { server, database } = await fixture();
+  test("health requires a credential and defaults are loopback", async () => {
+    const { server, database, token } = await fixture();
     expect(DEFAULT_HOST).toBe("127.0.0.1"); expect(DEFAULT_PORT).toBe(8787);
-    expect(await (await server.fetch(request("/api/v1/health"))).json()).toEqual({ ok: true, readiness: { ok: true, database: "ready", adapters: {}, recovery: "ready" } }); database.close();
+    expect((await server.fetch(request("/api/v1/health"))).status).toBe(401);
+    expect(await (await server.fetch(request("/api/v1/health", token))).json()).toEqual({ ok: true, readiness: { ok: true, database: "ready", adapters: {}, recovery: "ready" } }); database.close();
+  });
+
+  test("exchanges one valid pairing code for a device credential", async () => {
+    const { server, database, auth } = await fixture();
+    const pairing = await auth.createPairing({ expiresInMs: 60_000 });
+    const first = await server.fetch(request("/api/v1/pairings/redeem", undefined, { method: "POST", body: JSON.stringify({ code: pairing.code, deviceName: "Personal phone" }) }));
+    expect(first.status).toBe(201);
+    const registration = await first.json() as { credential: string };
+    expect((await server.fetch(request("/api/v1/sessions", registration.credential))).status).toBe(200);
+    expect((await server.fetch(request("/api/v1/pairings/redeem", undefined, { method: "POST", body: JSON.stringify({ code: pairing.code, deviceName: "Personal phone" }) }))).status).toBe(401);
+    database.close();
   });
 
   test("waits for startup recovery before processing mutations", async () => {
@@ -56,24 +60,23 @@ describe("hub origin API", () => {
     (database as unknown as { listCommandsForRecovery(): never }).listCommandsForRecovery = () => { throw new Error("recovery failed"); };
     const server = createHubServer({ database, auth, publicOrigin: "https://hub.example", authorizeSession: () => true });
     await tick();
-    expect(await (await server.fetch(request("/api/v1/health"))).json()).toEqual({ ok: false, readiness: { ok: false, database: "ready", adapters: {}, recovery: "failed" } });
+    expect(await (await server.fetch(request("/api/v1/health", token))).json()).toEqual({ ok: false, readiness: { ok: false, database: "ready", adapters: {}, recovery: "failed" } });
     expect((await server.fetch(request("/api/v1/sessions/s1/prompt", token, { method: "POST", headers: { origin: "https://hub.example", "idempotency-key": "blocked" }, body: JSON.stringify({ prompt: "blocked" }) }))).status).toBe(503);
     expect(database.getCommand("c1")).toBeNull();
     database.close();
   });
-  test("rejects missing and invalid JWTs but accepts a valid loopback request", async () => {
+  test("rejects missing and invalid credentials but accepts a valid loopback request", async () => {
     const { server, database, token } = await fixture();
     expect((await server.fetch(request("/api/v1/sessions"))).status).toBe(401);
     expect((await server.fetch(request("/api/v1/sessions", "nope"))).status).toBe(401);
     expect((await server.fetch(request("/api/v1/sessions", token))).status).toBe(200); database.close();
   });
 
-  test("rejects wrong audience and expired JWTs", async () => {
-    const { server, database, privateKey, now } = await fixture();
-    const wrongAudience = await makeJwt(privateKey, { iss: "https://access.example", aud: "other", sub: "u1", exp: now / 1000 + 120 });
-    const expired = await makeJwt(privateKey, { iss: "https://access.example", aud: "hub", sub: "u1", exp: now / 1000 - 61 });
-    expect((await server.fetch(request("/api/v1/sessions", wrongAudience))).status).toBe(401);
-    expect((await server.fetch(request("/api/v1/sessions", expired))).status).toBe(401); database.close();
+  test("rejects credentials that have been revoked", async () => {
+    const { server, database, auth, token } = await fixture();
+    const claims = await auth.verify(token);
+    expect(auth.revokeDevice(claims.deviceId)).toBe(true);
+    expect((await server.fetch(request("/api/v1/sessions", token))).status).toBe(401); database.close();
   });
 
   test("rejects mutation with a foreign origin", async () => {
@@ -329,9 +332,11 @@ describe("hub origin API", () => {
   });
 
   test("rejects authenticated users without session ownership", async () => {
-    const { database, auth, privateKey, now } = await fixture();
+    const { database, auth } = await fixture();
     const server = createHubServer({ database, auth, publicOrigin: "https://hub.example", authorizeSession: (_sessionId, ownerId) => ownerId === "u1" });
-    const other = await makeJwt(privateKey, { iss: "https://access.example", aud: "hub", sub: "u2", exp: now / 1000 + 120 });
+    const foreignAuth = new DeviceCredentialVerifier({ database, ownerId: "u2", pairingSecret: randomSecret() });
+    const pairing = await foreignAuth.createPairing({ expiresInMs: 60_000 });
+    const other = (await foreignAuth.redeemPairing({ code: pairing.code, deviceName: "Foreign device" })).credential;
     expect((await server.fetch(request("/api/v1/sessions", other))).json()).resolves.toEqual({ sessions: [] });
     expect((await server.fetch(request("/api/v1/sessions/s1/events", other))).status).toBe(403);
     expect((await server.fetch(request("/api/v1/sessions/s1/prompt", other, { method: "POST", headers: { origin: "https://hub.example", "idempotency-key": "foreign" }, body: JSON.stringify({ prompt: "hi" }) }))).status).toBe(403);

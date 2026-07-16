@@ -1,4 +1,5 @@
 import { renderActions as renderSessionActions } from "./actions";
+import { clearCredential, saveCredential, SecureCredentialUnavailableError, storedCredential } from "./credential";
 import { enablePush, revokePush, revokePushWhenPermissionLost } from "./push";
 import { MultiTabCoordinator } from "./multitab";
 type Session = {
@@ -36,6 +37,11 @@ let loadingSessions = false;
 let fetchError: string | null = null;
 let pollGeneration = 0;
 let pendingPrompt: { sessionId: string; prompt: string; key: string } | null = null;
+let credential: string | null = null;
+let pairingRequired = true;
+let pairingStatus: string | null = null;
+let pairingAvailable = true;
+let pairingValidation: "code" | "name" | null = null;
 const catchUpLocks = new Map<string, Promise<boolean>>();
 const crossTabSupported = typeof BroadcastChannel !== "undefined";
 const multiTab = new MultiTabCoordinator({
@@ -103,11 +109,15 @@ function csrfToken(): string | null {
 }
 
 async function api(path: string, init: RequestInit = {}): Promise<Response> {
+  if (!credential) throw new Error("This device is not paired.");
   const headers = new Headers(init.headers);
   headers.set("Accept", "application/json");
+  headers.set("Authorization", `Bearer ${credential}`);
   const csrf = csrfToken();
   if (init.method && init.method !== "GET" && csrf) headers.set("X-CSRF-Token", decodeURIComponent(csrf));
-  return fetch(`${API}${path}`, { ...init, headers, credentials: "same-origin", cache: "no-store" });
+  const response = await fetch(`${API}${path}`, { ...init, headers, credentials: "same-origin", cache: "no-store" });
+  if (response.status === 401) void requirePairing();
+  return response;
 }
 
 function fetchFailure(action: string, error: unknown): string {
@@ -139,6 +149,10 @@ function updateConnectionStatus(): void {
 
 function render(): void {
   app.replaceChildren();
+  if (pairingRequired) {
+    renderPairing();
+    return;
+  }
   const header = element("header");
   header.className = "topbar";
   header.append(element("h1", "Planee Agent Hub"));
@@ -174,6 +188,111 @@ function render(): void {
     navigation.append(button);
   }
   app.append(header, panel, navigation);
+}
+
+function renderPairing(): void {
+  const panel = element("section");
+  panel.className = "pairing-screen";
+  panel.append(element("h1", "Connect this device"), element("p", "Create a one-time pairing code on your Hub, then enter it here. You only need to do this once."));
+  const form = element("form");
+  form.className = "pairing-form";
+  const codeLabel = element("label", "Pairing code");
+  codeLabel.htmlFor = "pairing-code";
+  const code = element("input") as HTMLInputElement;
+  code.id = "pairing-code";
+  code.name = "pairing-code";
+  code.autocomplete = "one-time-code";
+  code.inputMode = "numeric";
+  code.maxLength = 6;
+  code.required = true;
+  code.disabled = !pairingAvailable;
+  if (pairingValidation === "code") {
+    code.setAttribute("aria-invalid", "true");
+    code.setAttribute("aria-describedby", "pairing-status");
+  }
+  const nameLabel = element("label", "Device name");
+  nameLabel.htmlFor = "device-name";
+  const name = element("input") as HTMLInputElement;
+  name.id = "device-name";
+  name.name = "device-name";
+  name.autocomplete = "off";
+  name.maxLength = 80;
+  name.required = true;
+  name.value = "Personal Android";
+  name.disabled = !pairingAvailable;
+  if (pairingValidation === "name") {
+    name.setAttribute("aria-invalid", "true");
+    name.setAttribute("aria-describedby", "pairing-status");
+  }
+  form.noValidate = true;
+  const submit = element("button", "Pair device");
+  submit.type = "submit";
+  submit.disabled = !pairingAvailable;
+  const status = element("p", pairingStatus ?? "");
+  status.id = "pairing-status";
+  status.className = "pairing-status";
+  status.setAttribute("aria-live", "polite");
+  form.append(codeLabel, code, nameLabel, name, submit, status);
+  form.addEventListener("submit", (event) => void submitPairing(event, code, name, submit));
+  panel.append(form);
+  app.append(panel);
+  if (typeof code.focus === "function") code.focus();
+}
+
+async function submitPairing(event: SubmitEvent, codeInput: HTMLInputElement, nameInput: HTMLInputElement, submit: HTMLButtonElement): Promise<void> {
+  event.preventDefault();
+  const code = codeInput.value.trim();
+  const deviceName = nameInput.value.trim();
+  if (!/^\d{6}$/.test(code)) {
+    pairingValidation = "code";
+    pairingStatus = "Enter the 6-digit pairing code.";
+    render();
+    return;
+  }
+  if (!deviceName) {
+    pairingValidation = "name";
+    pairingStatus = "Enter a name for this device.";
+    render();
+    return;
+  }
+  pairingValidation = null;
+  submit.disabled = true;
+  pairingStatus = "Pairing this device…";
+  try {
+    const response = await fetch(`${API}/pairings/redeem`, { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" }, body: JSON.stringify({ code, deviceName }), cache: "no-store" });
+    if (response.status === 401) {
+      pairingStatus = "That code is invalid, expired, or has already been used.";
+      render();
+      return;
+    }
+    if (!response.ok) throw new Error(`pairing request failed (${response.status})`);
+    const body: unknown = await response.json();
+    if (typeof body !== "object" || body === null || typeof (body as { credential?: unknown }).credential !== "string") throw new Error("invalid pairing response");
+    credential = (body as { credential: string }).credential;
+    await saveCredential(credential);
+    pairingRequired = false;
+    pairingStatus = null;
+    render();
+    void loadSessions();
+    reconnectUpdates();
+  } catch (error) {
+    if (error instanceof SecureCredentialUnavailableError) {
+      pairingAvailable = false;
+      pairingStatus = "This app requires Android secure storage to keep its device credential.";
+    } else pairingStatus = error instanceof TypeError ? "Network error. Check your connection and try again." : "Unable to pair this device. Try a new pairing code.";
+    render();
+  }
+}
+
+async function requirePairing(): Promise<void> {
+  if (pairingRequired) return;
+  credential = null;
+  pairingRequired = true;
+  pairingStatus = "This device is no longer authorized. Create a new pairing code to reconnect.";
+  ++pollGeneration;
+  window.clearTimeout(reconnectTimer);
+  await clearCredential();
+  render();
 }
 
 function renderSessions(panel: HTMLElement): void {
@@ -409,12 +528,25 @@ async function pollUpdates(generation: number): Promise<void> {
   reconnectTimer = window.setTimeout(() => void pollUpdates(generation), POLL_INTERVAL);
 }
 
-window.addEventListener("online", () => { online = true; reconnectUpdates(); });
+window.addEventListener("online", () => { online = true; if (!pairingRequired) reconnectUpdates(); });
 window.addEventListener("offline", () => { online = false; ++pollGeneration; window.clearTimeout(reconnectTimer); streamConnected = false; updateConnectionStatus(); });
 window.addEventListener("visibilitychange", () => void revokePushWhenPermissionLost(api));
 window.addEventListener("planee:logout", () => void revokePush(api));
 if ("serviceWorker" in navigator) void navigator.serviceWorker.register("/sw.js");
-render();
-void loadSessions();
-multiTab.start();
-reconnectUpdates();
+async function start(): Promise<void> {
+  try {
+    credential = await storedCredential();
+    pairingRequired = credential === null;
+  } catch (error) {
+    pairingRequired = true;
+    pairingAvailable = false;
+    pairingStatus = error instanceof SecureCredentialUnavailableError ? "This app requires Android secure storage to keep its device credential." : "Secure storage is unavailable. Restart the app and try again.";
+  }
+  render();
+  if (pairingRequired) return;
+  multiTab.start();
+  void loadSessions();
+  reconnectUpdates();
+}
+
+void start();

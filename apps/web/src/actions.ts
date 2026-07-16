@@ -54,7 +54,7 @@ export function parseActions(value: unknown, sessionId: string): PendingAction[]
     if (typeof item !== "object" || item === null) return [];
     const action = item as Record<string, unknown>;
     const version = action.version;
-    if (typeof action.id !== "string" || action.sessionId !== sessionId || typeof version !== "number" || !Number.isSafeInteger(version) || version < 0 || typeof action.type !== "string" || !isActionStatus(action.status) || typeof action.expiresAt !== "string" || !Object.hasOwn(action, "payload")) return [];
+    if (typeof action.id !== "string" || action.sessionId !== sessionId || typeof version !== "number" || !Number.isSafeInteger(version) || version < 0 || typeof action.type !== "string" || !isActionStatus(action.status) || typeof action.expiresAt !== "string" || !Object.prototype.hasOwnProperty.call(action, "payload")) return [];
     const artifactIds = Array.isArray(action.artifactIds) ? action.artifactIds.filter((id): id is string => typeof id === "string") : [];
     return [{ id: action.id, sessionId, version, type: action.type, status: action.status, expiresAt: action.expiresAt, payload: action.payload, artifactIds }];
   });
