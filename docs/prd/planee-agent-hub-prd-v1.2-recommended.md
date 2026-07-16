@@ -1,11 +1,11 @@
 # Planee Agent Hub PRD v1.2 — 권장안
 
-**상태:** 권장안 / 구현 전 검증 필요  
-**작성일:** 2026-07-15  
-**제품 형태:** Mac mini 단일 노드 기반 모바일 Agent 관리 허브  
-**대상 Agent:** OpenCode, Gajae-Code(GJC)  
+**상태:** 권장안. 기기 pairing 인증 경계와 Capacitor Android 앱 연결은 구현되어 있으나, 실기기·Tunnel·Cloudflare 제어면 검증은 별도 증적이 필요
+**작성일:** 2026-07-15
+**제품 형태:** Mac mini 단일 노드 기반 모바일 Agent 관리 허브
+**대상 Agent:** OpenCode, Gajae-Code(GJC)
 **외부 접속:** `agents.myplanee.com` + Cloudflare Tunnel + 기기별 pairing credential
-**모바일:** Android PWA 우선, 필요 시 Capacitor 앱 확장  
+**모바일:** Capacitor Android 앱. PWA 우선 전략은 후속 제품 결정
 **저장 방식:** 로컬 우선(Local-first), 실시간 우선, 연결 복구형 동기화  
 
 ---
@@ -945,11 +945,11 @@ agents.myplanee.com
 
 필수:
 
-- Tunnel
-- Hub device credential 검증
-- 1회 pairing code와 Android Keystore 저장
-- HSTS
-- rate limit
+- Cloudflare Tunnel
+- Hub 기기 credential 검증 (`Authorization: Bearer`)
+- 1회·짧은 수명의 pairing code
+- Android 앱 전용 `SharedPreferences` credential 저장과 `allowBackup=false`
+- HSTS와 rate limit은 배포·외부 경로에서 별도 검증
 - no port forwarding
 - no direct Agent port
 
@@ -967,8 +967,8 @@ GJC notification: 127.0.0.1
 ## 16.3 Secret Storage
 
 - pairing root secret은 root-owned `0600` 파일
-- Android Keystore 외의 browser storage에 device credential 저장 금지
-- Cloudflare token 로그 금지
+- Android 앱은 credential을 앱 전용 `SharedPreferences`에 저장하고 `allowBackup=false`를 사용한다. Keystore 암호화가 아니므로 분실·root된 기기 보호 수준은 더 낮다.
+- credential, Authorization header, pairing code는 로그에 남기지 않는다.
 - provider key DB 저장 금지
 
 ---
@@ -1219,7 +1219,7 @@ Cloudflare login
 통과 조건:
 
 - SSE reconnect 안정
-- Access session 갱신
+- 기기 credential으로 Access JWT 갱신 없이 재연결
 - Tunnel 재시작 후 자동 복구
 
 실패 시:
@@ -1252,8 +1252,8 @@ Cloudflare login
 ## 22.3 Security
 
 - Agent 포트 외부 비공개
-- Access 미인증 차단
-- credential browser 미전달
+- 인증되지 않은 Hub API 요청 차단
+- credential은 bundle·source·로그에 저장하지 않음
 - arbitrary shell 없음
 - audit에 secret 없음
 

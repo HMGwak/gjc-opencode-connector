@@ -6,14 +6,14 @@ Cloudflare Access, 조직 로그인, MFA, App Launcher에 의존하지 않고 An
 
 이 문서는 구현 작업의 순서와 완료 기준이다. 실제 비밀값, pairing code, device token, Cloudflare token은 문서·저장소·로그·테스트 fixture에 기록하지 않는다.
 
-## 2026-07-16 인수인계 상태
+## 2026-07-16 저장소 기준 상태
 
-- Cloudflare Access application `Planee Agent Hub`는 삭제했다. `agents.myplanee.com`은 Cloudflare Tunnel을 통해 Hub로 연결되며, Hub API 자체가 기기 credential을 검사한다.
-- Android 앱은 최초 1회 **숫자 6자리** pairing code로 등록한다. code는 5분 후 만료되고 한 번만 사용할 수 있다.
-- pairing 성공 뒤에는 기기별 credential으로 자동 연결한다. Cloudflare 로그인, 조직 MFA, App Launcher는 사용하지 않는다.
+- Hub 구현과 배포 plist에는 Cloudflare Access JWT verifier, issuer/AUD/JWKS 설정이 없다. `agents.myplanee.com`은 Cloudflare Tunnel을 거쳐 Hub로 연결되고, Hub API는 기기 credential을 검사한다.
+- Android 앱은 최초 1회 **숫자 6자리** pairing code로 등록한다. code는 기본 5분 후 만료되고 한 번만 사용할 수 있으며, 서버는 시도 횟수를 제한한다.
+- pairing 성공 뒤에는 기기별 credential으로 자동 연결한다. 앱 흐름에는 Cloudflare 로그인, 조직 MFA, App Launcher가 없다.
 - credential은 Android 앱 전용 `SharedPreferences`에 저장한다. 이 앱은 `allowBackup=false`이며, 개인 단일 사용자 환경을 위해 Keystore 암호화 대신 이 단순한 저장 방식을 사용한다. 분실·root된 기기에 대한 보호 수준은 Keystore보다 낮다.
-- Hub는 macOS LaunchDaemon `system/com.planee.agent-hub`로 실행된다. 데이터와 pairing root secret은 `/var/db/planee-agent-hub/`에 있고 root만 읽을 수 있다.
-- Zero Trust 조직 자체는 무료 상태로 남아 있다. Access 앱과 정책은 제거됐으며, 조직을 삭제해도 비용 절감은 없고 기존 `myplanee.cloudflareaccess.com` 이름만 영구 예약되므로 삭제하지 않는다.
+- 배포 plist는 Hub를 macOS LaunchDaemon `system/com.planee.agent-hub`로 실행하도록 구성하고, 데이터와 pairing root secret 경로를 `/var/db/planee-agent-hub/`로 지정한다. 실제 설치·실행 상태는 이 저장소만으로 확인할 수 없다.
+- Cloudflare Access application/policy의 삭제 여부와 Zero Trust 조직 상태는 외부 제어면 증적이 없으므로 이 문서에서 완료로 주장하지 않는다.
 
 ## 지켜야 할 경계
 
@@ -23,7 +23,7 @@ Android 앱 -- TLS --> agents.myplanee.com -- Cloudflare Tunnel --> 127.0.0.1:87
 
 - Hub는 계속 `127.0.0.1:8787`에만 bind한다.
 - Tunnel/DNS/ingress와 router port-forwarding은 변경하지 않는다.
-- 전환 전에는 Cloudflare Access를 삭제하지 않는다. 기기 인증을 구현·검증한 뒤에만 Access application을 제거한다.
+- Cloudflare Access 제거 여부는 외부 제어면에서 별도로 확인한다. 새 기기 인증을 구현·검증하고 이전 Hub 배포본을 복원할 수 있을 때에만 제거한다.
 - "인증 없음"으로 public hostname을 열지 않는다. 외부에서 추측 가능한 공유 비밀번호 하나로 보호하는 방식도 사용하지 않는다.
 
 ## 목표 사용자 경험
@@ -49,7 +49,7 @@ Android 앱 -- TLS --> agents.myplanee.com -- Cloudflare Tunnel --> 127.0.0.1:87
 - [x] 현재 Access JWT verifier와 Cloudflare issuer/AUD/JWKS 런타임 의존성을 제거한다.
 - [x] 모든 `/api/v1/*` 보호 endpoint에 새 인증과 owner/session 권한 검사를 적용한다.
 - [x] pairing 생성·등록·기기 목록·revoke 관리 경로를 최소 권한으로 구현한다. 생성·목록·revoke는 root secret을 외부 API로 보내지 않는 로컬 CLI다.
-- [x] 누락·만료·revoke·위조 credential은 모두 `401` 또는 `403`으로 fail closed 한다.
+- [x] 누락·revoke·위조 credential은 `401` 또는 `403`으로 fail closed 한다. pairing code의 만료·재사용·시도 횟수 초과도 거부한다.
 - [x] audit log에는 기기 식별자와 결과만 남기고 credential, Authorization header, pairing code를 남기지 않는다.
 
 ### 3. Android 앱 연결 흐름 구현
@@ -57,8 +57,8 @@ Android 앱 -- TLS --> agents.myplanee.com -- Cloudflare Tunnel --> 127.0.0.1:87
 - [x] Capacitor/Android의 앱 전용 저장소에 기기 credential을 보관한다. 웹 localStorage, bundle, source, 로그에는 저장하지 않는다.
 - [x] 첫 연결 화면에 pairing code 입력과 성공·만료·이미 사용됨·네트워크 실패 UX를 구현한다.
 - [x] 정상 실행 시 저장된 credential을 자동으로 `Authorization: Bearer` 요청에 붙인다.
-- [x] credential이 revoke 또는 만료되면 자동 재시도 루프 대신 pairing 화면으로 명확히 전환한다.
-- [x] 새 APK 설치 후 최초 pairing을 실기기에서 검증했다.
+- [x] credential이 revoke되면 자동 재시도 루프 대신 pairing 화면으로 명확히 전환한다.
+- [ ] 새 APK 설치 후 최초 pairing을 실기기에서 검증한다.
 - [ ] 앱 재시작, 기기 revoke 뒤 재등록을 실기기에서 추가 검증한다.
 
 ### 4. 테스트와 전환
@@ -71,10 +71,10 @@ Android 앱 -- TLS --> agents.myplanee.com -- Cloudflare Tunnel --> 127.0.0.1:87
 
 ### 5. Cloudflare Access 제거 (마지막 단계)
 
-- [x] `Planee Agent Hub` Cloudflare Access application과 관련 policy를 삭제했다.
-- [x] App Launcher에서 사용할 Access 앱은 없다. 무료 Zero Trust 조직은 유지한다.
-- [x] `agents.myplanee.com`이 Tunnel을 통해 Hub에 도달하며, 인증 없는 API 요청은 Hub에서 `401`으로 거부됨을 재검증했다.
-- [ ] `docs/runbooks/cloudflare-access.md`, PRD의 Access/MFA/JWT 서술, 환경 변수 문서를 새 기기 pairing 모델에 맞게 갱신한다.
+- [ ] `Planee Agent Hub` Cloudflare Access application과 관련 policy를 외부 제어면에서 삭제했음을 확인한다.
+- [ ] App Launcher와 조직 MFA가 다른 Access application을 보호하지 않음을 외부 제어면에서 확인한다.
+- [ ] `agents.myplanee.com`이 Tunnel을 통해 Hub에 도달하고 credential 없는 API 요청이 Hub에서 `401`으로 거부됨을 공개 경로에서 재검증한다.
+- [x] `docs/runbooks/cloudflare-access.md`와 PRD의 Access/MFA/JWT 서술을 새 기기 pairing 모델에 맞게 갱신했다.
 
 ## 완료 기준
 
@@ -82,11 +82,11 @@ Android 앱 -- TLS --> agents.myplanee.com -- Cloudflare Tunnel --> 127.0.0.1:87
 - 분실 기기 revoke는 즉시 이후 API 요청을 막는다.
 - public hostname에 인증 없는 요청은 Hub data/API에 접근할 수 없다.
 - origin은 계속 loopback-only이며 Tunnel 이외의 인터넷/LAN 노출이 없다.
-- Cloudflare Access와 그 JWT 검증 의존성은 제거되었고, 관련 문서와 테스트가 새 모델을 설명한다.
+- Hub의 Cloudflare Access JWT 검증 의존성은 제거되었고, 관련 문서와 테스트가 새 기기 credential 모델을 설명한다.
 
 ## 롤백
 
-새 기기 인증이 검증되기 전에는 기존 Cloudflare Access application을 유지한다. 전환 뒤 문제가 발견되면 Access application을 복원하고, 이미 배포한 앱이 새 credential 방식과 기존 Access JWT를 동시에 허용하도록 만드는 임시 우회는 만들지 않는다. 롤백은 공개 hostname을 인증 없이 여는 방식이 아니어야 한다.
+현재 Hub에는 Cloudflare Access JWT 검증 경로가 없으므로 Access application만 복원해서는 이전 앱을 사용할 수 없다. 전환 뒤 문제가 발견되면 Cloudflare Access application/policy와 Access JWT를 검증하던 이전 Hub 배포본을 함께 복원한다. 새 credential 방식과 기존 Access JWT를 동시에 허용하는 임시 우회는 만들지 않는다. 롤백은 공개 hostname을 인증 없이 여는 방식이 아니어야 한다.
 
 ## 운영 절차
 
@@ -122,13 +122,12 @@ env JAVA_HOME=/opt/homebrew/opt/openjdk@21 ANDROID_HOME=/opt/homebrew/share/andr
 
 ### Hub 재시작과 확인
 
-Hub TypeScript를 수정한 뒤에는 실행 중 프로세스가 이전 코드를 계속 들고 있을 수 있다. 아래처럼 LaunchDaemon을 재시작하고 반드시 공개 pairing endpoint까지 확인한다.
+Hub TypeScript를 수정한 뒤에는 실행 중 프로세스가 이전 코드를 계속 들고 있을 수 있다. 아래처럼 LaunchDaemon을 재시작한다.
 
 ```sh
 sudo launchctl bootout system/com.planee.agent-hub || true
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.planee.agent-hub.plist
 sudo launchctl kickstart -k system/com.planee.agent-hub
-curl -i https://agents.myplanee.com/api/v1/health
 ```
 
-정상 상태에서 공개 루트는 `200`, credential 없는 `/api/v1/health`는 `401`이다. `bootstrap`이 간헐적으로 `Input/output error`를 낸 경우에도 위의 `bootstrap`과 `kickstart` 두 명령을 다시 순서대로 실행해 복구할 수 있다. pairing code를 만든 뒤에는 공개 endpoint로 201 응답을 확인하는 검사용 code를 별도로 사용하고, 검사용으로 등록된 기기는 즉시 revoke한다.
+`/api/v1/health`는 유효한 기기 credential 없이는 `401`을 반환한다. `/`의 응답은 배포된 `HUB_WEB_ROOT`의 정적 파일 존재 여부에 따라 달라 고정된 `200` 상태 확인으로 사용하지 않는다. `/api/v1/pairings/redeem`은 최초 등록을 위해 의도적으로 인증 없이 열려 있으므로, 실제 pairing code를 상태 확인용으로 제출하지 않는다. `bootstrap`이 간헐적으로 `Input/output error`를 낸 경우에는 `bootstrap`과 `kickstart`를 다시 순서대로 실행한 뒤 서비스 로그와 인증된 health 요청으로 확인한다.
