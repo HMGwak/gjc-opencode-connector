@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { GjcAdapter, GjcAmbiguousMutationError } from "./gjc-adapter";
 
-const session = { id: "local", ownerId: "owner-1", adapter: "gjc", remoteId: "s1", status: "active" as const, reconciliationEpoch: 0, reconciled: false, remoteRevision: null, createdAt: "", updatedAt: "" };
+const session = { id: "local", ownerId: "owner-1", adapter: "gjc", remoteId: "s1", status: "active" as const, reconciliationEpoch: 0, reconciled: false, remoteRevision: null, controlMode: "controlled" as const, origin: "coordinator-start" as const, transcriptStatus: "available" as const, createdAt: "", updatedAt: "" };
 const events = (items: readonly unknown[]): AsyncIterable<unknown> => ({ async *[Symbol.asyncIterator]() { yield* items; } });
 const client = (overrides: Partial<ConstructorParameters<typeof GjcAdapter>[0]["client"]> = {}) => ({
   watchEvents: (_input: unknown) => events([]),

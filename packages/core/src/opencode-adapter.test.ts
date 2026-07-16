@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { openCoreDatabase } from "./database";
 import { OpenCodeAdapter } from "./opencode-adapter";
 
-const session = { id: "local", ownerId: "owner-1", adapter: "opencode", remoteId: "remote", status: "active" as const, reconciliationEpoch: 0, reconciled: false, remoteRevision: null, createdAt: "", updatedAt: "" };
+const session = { id: "local", ownerId: "owner-1", adapter: "opencode", remoteId: "remote", status: "active" as const, reconciliationEpoch: 0, reconciled: false, remoteRevision: null, controlMode: "view-only" as const, origin: "opencode-discovery" as const, transcriptStatus: "available" as const, createdAt: "", updatedAt: "" };
 const response = (body: unknown, status = 200) => new Response(status === 204 ? null : JSON.stringify(body), { status });
 
 describe("OpenCodeAdapter", () => {

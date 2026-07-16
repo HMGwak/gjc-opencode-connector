@@ -157,10 +157,17 @@ export class GjcOnDiskDiscovery {
       claimedAt: claimedAt.toISOString(),
       staleBefore: new Date(claimedAt.getTime() - VIEW_LEASE_MS).toISOString(),
     })) return;
-    this.options.database.projectRemoteBatch({
-      mode: "view", sessionId: session.id, adapter: "gjc", source: "gjc-ondisk",
-      cursorScope: "transcript", owner: this.viewOwner,
-      cursor: String(parsed.events.length + 1), events: parsed.events,
-    });
+    try {
+      this.options.database.projectRemoteBatch({
+        mode: "view", sessionId: session.id, adapter: "gjc", source: "gjc-ondisk",
+        cursorScope: "transcript", owner: this.viewOwner,
+        cursor: String(parsed.events.length + 1), events: parsed.events,
+      });
+    } catch {
+      this.options.database.upsertDiscoveredSession({
+        id: crypto.randomUUID(), ownerId: this.options.ownerId, adapter: "gjc", remoteId: filenameId,
+        controlMode: "view-only", origin: "ondisk-discovery", transcriptStatus: "unreadable", updatedAt,
+      });
+    }
   }
 }

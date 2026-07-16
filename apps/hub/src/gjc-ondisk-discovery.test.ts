@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { openCoreDatabase } from "@planee/core";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -65,5 +66,25 @@ describe("GjcOnDiskDiscovery", () => {
     state.sessions.set(id, { id: "local", controlMode: "controlled", origin: "coordinator-resume", transcriptStatus: "available" });
     await new GjcOnDiskDiscovery({ database: state.database, ownerId: "owner", codingAgentDir: root }).synchronize();
     expect(state.sessions.get(id)).toMatchObject({ controlMode: "controlled", origin: "coordinator-resume" });
+  });
+  test("deduplicates projection and preserves a promoted session", async () => {
+    const { root, id } = await storeFile([
+      JSON.stringify({ type: "session", version: 3, id: "12345678-1234-1234-1234-123456789abc", timestamp: "2026-07-16T10:00:00.000Z", cwd: "/repo" }),
+      JSON.stringify({ type: "message", id: "entry-1", parentId: null, timestamp: "2026-07-16T10:00:01.000Z", message: { role: "user", content: "hello" } }),
+      "",
+    ].join("\n"));
+    const database = openCoreDatabase();
+    const discovery = new GjcOnDiskDiscovery({ database, ownerId: "owner", codingAgentDir: root, viewOwner: "view-1" });
+    await discovery.synchronize();
+    await discovery.synchronize();
+    expect(database.sqlite.query("SELECT COUNT(*) AS count FROM events").get()).toEqual({ count: 1 });
+    database.sqlite.query("UPDATE sessions SET control_mode = 'controlled', origin = 'coordinator-resume' WHERE remote_id = ?").run(id);
+    await discovery.synchronize();
+    expect(database.listSessionsForOwner("owner")[0]).toMatchObject({
+      controlMode: "controlled",
+      origin: "coordinator-resume",
+      transcriptStatus: "available",
+    });
+    database.close();
   });
 });
