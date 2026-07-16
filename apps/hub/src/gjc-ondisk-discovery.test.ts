@@ -85,6 +85,19 @@ describe("GjcOnDiskDiscovery", () => {
     await new GjcOnDiskDiscovery({ database: state.database, ownerId: "owner", codingAgentDir: root }).synchronize();
     expect(state.sessions.get(id)).toMatchObject({ controlMode: "controlled", origin: "coordinator-resume" });
   });
+
+  test("skips re-parsing and re-projecting unchanged session files on resync", async () => {
+    const { root } = await storeFile([
+      JSON.stringify({ type: "session", version: 3, id: "12345678-1234-1234-1234-123456789abc", timestamp: "2026-07-16T10:00:00.000Z", cwd: "/repo" }),
+      JSON.stringify({ type: "message", id: "entry-1", timestamp: "2026-07-16T10:00:01.000Z", message: { role: "user", content: [{ type: "text", text: "hi" }] } }),
+      "",
+    ].join("\n"));
+    const state = fakeDatabase();
+    const discovery = new GjcOnDiskDiscovery({ database: state.database, ownerId: "owner", codingAgentDir: root });
+    await discovery.synchronize();
+    await discovery.synchronize();
+    expect(state.projected).toHaveLength(1);
+  });
   test("deduplicates projection and preserves a promoted session", async () => {
     const { root, id } = await storeFile([
       JSON.stringify({ type: "session", version: 3, id: "12345678-1234-1234-1234-123456789abc", timestamp: "2026-07-16T10:00:00.000Z", cwd: "/repo" }),

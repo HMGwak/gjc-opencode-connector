@@ -123,6 +123,9 @@ export class GjcOnDiskDiscovery {
   private readonly root: string;
   private readonly viewOwner: string;
   private readonly now: () => Date;
+  // Skip re-reading/re-parsing session files whose mtime has not advanced since the last sync,
+  // so an always-on daemon does full work once and near-zero per interval tick.
+  private readonly lastMtimeMs = new Map<string, number>();
 
   constructor(private readonly options: GjcOnDiskDiscoveryOptions) {
     this.root = join(options.codingAgentDir ?? join(homedir(), ".gjc", "agent"), "sessions");
@@ -157,10 +160,13 @@ export class GjcOnDiskDiscovery {
   }
 
   private async discoverFile(path: string, filenameId: string): Promise<void> {
+    let mtimeMs: number | null = null;
     let parsed: ParsedTranscript | null = null;
     let updatedAt = this.now().toISOString();
     try {
       const metadata = await stat(path);
+      mtimeMs = metadata.mtimeMs;
+      if (this.lastMtimeMs.get(filenameId) === mtimeMs) return;
       updatedAt = metadata.mtime.toISOString();
       parsed = parseTranscript(await readFile(path, "utf8"), filenameId, updatedAt);
       updatedAt = parsed.updatedAt;
@@ -173,7 +179,10 @@ export class GjcOnDiskDiscovery {
       controlMode: "view-only", origin: "ondisk-discovery",
       transcriptStatus: parsed ? "available" : "unreadable", updatedAt,
     });
-    if (!parsed) return;
+    if (!parsed) {
+      if (mtimeMs !== null) this.lastMtimeMs.set(filenameId, mtimeMs);
+      return;
+    }
 
     const claimedAt = this.now();
     if (!this.options.database.claimView({
@@ -188,6 +197,7 @@ export class GjcOnDiskDiscovery {
         cursorScope: "transcript", owner: this.viewOwner,
         cursor: String(parsed.events.length + 1), events: parsed.events,
       });
+      if (mtimeMs !== null) this.lastMtimeMs.set(filenameId, mtimeMs);
     } catch {
       this.options.database.upsertDiscoveredSession({
         id: crypto.randomUUID(), ownerId: this.options.ownerId, adapter: "gjc", remoteId: filenameId,
