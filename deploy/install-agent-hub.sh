@@ -18,6 +18,8 @@ runtime_target="$guard_dir/runtime"
 wrapper_target="$guard_dir/hub-guarded-launch.sh"
 runtime_config_target="$guard_dir/runtime.conf"
 data_dir="/private/var/db/planee-agent-hub"
+database_file="$data_dir/hub.sqlite"
+database_initializer="import { CoreDatabase } from \"@planee/core\"; const database = new CoreDatabase(\"$database_file\", { readonly: false }); database.close();"
 secret_file="$data_dir/pairing-root-secret"
 binary_schema_compatibility=1
 initializer_schema_compatibility=1
@@ -40,6 +42,11 @@ case "$bun_binary" in /*) ;; *) fail "Bun executable must be an absolute path; s
 [ -x "$bun_binary" ] || fail "Bun executable is missing or not executable: $bun_binary"
 
 if "$dry_run"; then
+  [ "$runtime_target/bin/bun" = "/Library/Application Support/planee-agent-hub/runtime/bin/bun" ] || fail "Installer database initializer must use the installed Bun runtime."
+  case "$database_initializer" in
+    *'from "@planee/core"'*'new CoreDatabase("/private/var/db/planee-agent-hub/hub.sqlite", { readonly: false })'*'database.close();') ;;
+    *) fail "Installer database initializer command is invalid." ;;
+  esac
   sh "$wrapper_source" --self-test
   echo "Hub installer dry-run: replace-never-coexists and schema-fence guard verified"
   exit 0
@@ -130,6 +137,15 @@ mv "$snapshot_stage" "$runtime_target"
 mv -f "$runtime_config_tmp" "$runtime_config_target"
 mv -f "$wrapper_tmp" "$wrapper_target"
 mv -f "$plist_tmp" "$plist_target"
+# Initialize through the installed immutable Core runtime before the every-start
+# guard reads schema_fence. Migration failures are fatal and cleanup leaves the
+# daemon stopped with no selectable runtime.
+if ! (
+  cd "$runtime_target"
+  "$runtime_target/bin/bun" --eval "$database_initializer"
+); then
+  fail "Could not initialize Hub database; service remains stopped. Repair or restore the DB backup and redeploy."
+fi
 
 if ! launchctl bootstrap system "$plist_target" || ! launchctl kickstart -k system/com.planee.agent-hub; then
   fail "Could not bootstrap current runtime; service remains stopped. Restore the DB backup and redeploy a compatible current runtime."
