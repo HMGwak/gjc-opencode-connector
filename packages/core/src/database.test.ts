@@ -204,7 +204,7 @@ test("applies the phase-0 migration idempotently across repeated opens", async (
   const filename = `/tmp/core-phase0-migration-${crypto.randomUUID()}.sqlite`;
   try {
     let db = new CoreDatabase(filename);
-    db.createSession({ id: "session-1", ownerId: "owner-1", adapter: "gjc", remoteId: "remote-1" });
+    db.sqlite.query("INSERT INTO sessions (id, owner_id, adapter, remote_id, status, created_at, updated_at) VALUES ('session-1', 'owner-1', 'gjc', 'remote-1', 'active', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')").run();
     expect(db.sqlite.query("PRAGMA user_version").get()).toEqual({ user_version: 1 });
     expect(db.sqlite.query("SELECT version, name FROM schema_migrations").all()).toEqual([
       { version: 1, name: "phase-0-runtime-foundation" },
