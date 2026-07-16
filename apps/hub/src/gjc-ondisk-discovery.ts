@@ -60,6 +60,31 @@ function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 
+const AUTH_TOKEN = /\b(?:bearer|basic)\s+[a-z0-9._~+/=-]+/gi;
+
+function textFromContent(content: unknown): string {
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const part of content) {
+    const p = record(part);
+    if (!p) continue;
+    if (p.type === "text" && typeof p.text === "string") parts.push(p.text);
+    else if (p.type === "toolCall" && typeof p.name === "string") parts.push(`[tool: ${p.name}]`);
+    else if (p.type === "thinking") parts.push("[thinking]");
+  }
+  return parts.join("\n").replace(AUTH_TOKEN, "[redacted]");
+}
+
+// The journal forbids secret-like keys/values, so project a minimal display shape
+// (type/role/text) instead of the raw GJC entry, which carries usage.totalTokens etc.
+function sanitizeEntry(entry: Record<string, unknown>): Record<string, unknown> {
+  const message = record(entry.message);
+  if (!message) return { type: entry.type };
+  const role = typeof message.role === "string" ? message.role : undefined;
+  const text = textFromContent(message.content);
+  return { type: entry.type, ...(role ? { role } : {}), ...(text ? { text } : {}) };
+}
+
 function parseTranscript(text: string, filenameId: string, fallbackUpdatedAt: string): ParsedTranscript {
   const lines = text.split(/\r?\n/);
   if (lines.at(-1) === "") lines.pop();
@@ -77,17 +102,17 @@ function parseTranscript(text: string, filenameId: string, fallbackUpdatedAt: st
   const events: RemoteProjectionEvent[] = [];
   for (let index = 1; index < parsed.length; index++) {
     const entry = record(parsed[index]);
-    if (!entry || typeof entry.type !== "string" || typeof entry.id !== "string" || typeof entry.timestamp !== "string") {
-      throw new Error(`Unrecognized GJC transcript entry at line ${index + 1}`);
-    }
+    if (!entry || typeof entry.type !== "string") continue;
+    const nativeId = typeof entry.id === "string" && entry.id.length > 0 ? `${entry.id}#${index + 1}` : `pos:${index + 1}`;
+    const createdAt = typeof entry.timestamp === "string" ? entry.timestamp : fallbackUpdatedAt;
     events.push({
-      sourceEventId: entry.id,
+      sourceEventId: nativeId,
       sourceRevision: String(version),
       sourcePosition: index + 1,
       contentHash: sha256(lines[index]!),
       type: `gjc.${entry.type}`,
-      payload: entry,
-      createdAt: entry.timestamp,
+      payload: sanitizeEntry(entry),
+      createdAt,
     });
   }
   const lastTimestamp = events.at(-1)?.createdAt;

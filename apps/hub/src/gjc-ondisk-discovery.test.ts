@@ -49,7 +49,25 @@ describe("GjcOnDiskDiscovery", () => {
     expect(await new GjcOnDiskDiscovery({ database: state.database, ownerId: "owner", codingAgentDir: root }).synchronize()).toBe(1);
     expect(state.sessions.get(id)).toMatchObject({ controlMode: "view-only", origin: "ondisk-discovery", transcriptStatus: "available" });
     expect(state.projected).toHaveLength(1);
-    expect(state.projected[0]).toMatchObject({ mode: "view", source: "gjc-ondisk", cursor: "2", events: [{ sourceEventId: "entry-1", sourcePosition: 2 }] });
+    expect(state.projected[0]).toMatchObject({ mode: "view", source: "gjc-ondisk", cursor: "2", events: [{ sourceEventId: "entry-1#2", sourcePosition: 2 }] });
+  });
+
+  test("projects a sanitized transcript carrying token/usage metadata without tripping the secret guard", async () => {
+    const { root } = await storeFile([
+      JSON.stringify({ type: "session", version: 3, id: "12345678-1234-1234-1234-123456789abc", timestamp: "2026-07-16T10:00:00.000Z", cwd: "/repo" }),
+      JSON.stringify({ type: "message", id: "m1", timestamp: "2026-07-16T10:00:01.000Z", message: { role: "assistant", content: [{ type: "text", text: "done" }, { type: "toolCall", name: "bash", arguments: { cmd: "ls" } }], usage: { totalTokens: 42, inputTokens: 10 } } }),
+      "",
+    ].join("\n"));
+    const database = openCoreDatabase(join(root, "hub.sqlite"));
+    try {
+      expect(await new GjcOnDiskDiscovery({ database, ownerId: "owner", codingAgentDir: root }).synchronize()).toBe(1);
+      const session = database.listSessionsForOwner("owner")[0]!;
+      expect(session.transcriptStatus).toBe("available");
+      const message = (database.listEvents(session.id) as Array<{ type: string; payload: unknown }>).find((event) => event.type === "gjc.message");
+      expect(message?.payload).toEqual({ type: "message", role: "assistant", text: "done\n[tool: bash]" });
+    } finally {
+      database.close();
+    }
   });
 
   test("keeps an unreadable transcript listed and projects nothing", async () => {
