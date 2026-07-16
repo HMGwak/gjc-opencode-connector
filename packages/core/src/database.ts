@@ -61,6 +61,15 @@ CREATE TABLE IF NOT EXISTS sessions (
   reconciliation_epoch INTEGER NOT NULL DEFAULT 0 CHECK (reconciliation_epoch >= 0),
   reconciled INTEGER NOT NULL DEFAULT 0 CHECK (reconciled IN (0, 1)),
   remote_revision TEXT,
+  epoch_owner TEXT,
+  epoch_claimed_at TEXT,
+  view_owner TEXT,
+  view_claimed_at TEXT,
+  control_mode TEXT NOT NULL DEFAULT 'view-only' CHECK (control_mode IN ('view-only', 'controlled')),
+  origin TEXT NOT NULL DEFAULT 'ondisk-discovery' CHECK (origin IN ('ondisk-discovery', 'coordinator-start', 'coordinator-resume', 'coordinator-continuation', 'opencode-discovery')),
+  transcript_status TEXT NOT NULL DEFAULT 'available' CHECK (transcript_status IN ('available', 'unreadable')),
+  control_cutover_seq INTEGER,
+  continuation_parent_id TEXT REFERENCES sessions(id),
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE (adapter, remote_id)
@@ -73,9 +82,15 @@ CREATE TABLE IF NOT EXISTS events (
   type TEXT NOT NULL,
   payload_json TEXT NOT NULL,
   created_at TEXT NOT NULL,
+  source_event_id TEXT,
+  source_revision TEXT,
+  source_position INTEGER,
+  content_hash TEXT,
+  source TEXT CHECK (source IN ('gjc-ondisk', 'gjc-coordinator', 'opencode')),
   PRIMARY KEY (session_id, seq)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS events_session_created_idx ON events(session_id, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS events_source_identity_idx ON events(session_id, source, source_event_id) WHERE source IS NOT NULL AND source_event_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS commands (
   id TEXT PRIMARY KEY,
   session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -84,6 +99,9 @@ CREATE TABLE IF NOT EXISTS commands (
   correlation_id TEXT,
   attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
   lease_expires_at TEXT,
+  claimed_epoch INTEGER,
+  claimed_epoch_owner TEXT,
+  pending_action_id TEXT REFERENCES pending_actions(id),
   payload_json TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -91,8 +109,10 @@ CREATE TABLE IF NOT EXISTS commands (
 CREATE INDEX IF NOT EXISTS commands_session_state_idx ON commands(session_id, state);
 CREATE TABLE IF NOT EXISTS pending_actions (
   id TEXT PRIMARY KEY,
+  session_id TEXT REFERENCES sessions(id),
+  remote_ref TEXT,
   version INTEGER NOT NULL CHECK (version >= 1),
-  state TEXT NOT NULL CHECK (state IN ('pending', 'answered', 'cancelled', 'expired', 'unknown')),
+  state TEXT NOT NULL CHECK (state IN ('pending', 'dispatching', 'answered', 'cancelled', 'expired', 'unknown')),
   payload_json TEXT NOT NULL,
   answer_json TEXT,
   expires_at TEXT NOT NULL,
@@ -100,6 +120,50 @@ CREATE TABLE IF NOT EXISTS pending_actions (
   updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS pending_actions_state_expires_idx ON pending_actions(state, expires_at);
+CREATE UNIQUE INDEX IF NOT EXISTS pending_actions_remote_ref_idx ON pending_actions(session_id, remote_ref) WHERE session_id IS NOT NULL AND remote_ref IS NOT NULL;
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version INTEGER PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  applied_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS session_provisions (
+  id TEXT PRIMARY KEY,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  kind TEXT NOT NULL CHECK (kind IN ('start', 'resume', 'continuation')),
+  source_session_id TEXT REFERENCES sessions(id),
+  session_id TEXT REFERENCES sessions(id),
+  state TEXT NOT NULL CHECK (state IN ('pending', 'dispatching', 'confirmed', 'failed', 'unknown')),
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS session_provisions_active_source_idx ON session_provisions(source_session_id) WHERE source_session_id IS NOT NULL AND state IN ('pending', 'dispatching');
+CREATE TABLE IF NOT EXISTS remote_cursors (
+  session_id TEXT NOT NULL REFERENCES sessions(id),
+  adapter TEXT NOT NULL,
+  source TEXT NOT NULL,
+  cursor_scope TEXT NOT NULL,
+  cursor_value TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (session_id, adapter, source, cursor_scope)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS turns (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES sessions(id),
+  remote_id TEXT,
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (session_id, remote_id)
+);
+CREATE TABLE IF NOT EXISTS opencode_instances (
+  id TEXT PRIMARY KEY,
+  port INTEGER NOT NULL CHECK (port > 0 AND port <= 65535),
+  password_fingerprint TEXT NOT NULL CHECK (length(password_fingerprint) = 64),
+  first_seen_at TEXT NOT NULL,
+  last_health_ok_at TEXT NOT NULL,
+  UNIQUE (port, password_fingerprint)
+);
 CREATE TABLE IF NOT EXISTS audit_log (
   id INTEGER PRIMARY KEY,
   action TEXT NOT NULL,
@@ -148,6 +212,77 @@ CREATE TABLE IF NOT EXISTS device_credentials (
 );
 CREATE INDEX IF NOT EXISTS device_credentials_owner_created_idx ON device_credentials(owner_id, created_at DESC);
 `;
+const migrationBootstrap = `
+CREATE TABLE IF NOT EXISTS sessions (
+  id TEXT PRIMARY KEY, owner_id TEXT, adapter TEXT NOT NULL, remote_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('active', 'stale', 'unknown', 'terminal')),
+  reconciliation_epoch INTEGER NOT NULL DEFAULT 0, reconciled INTEGER NOT NULL DEFAULT 0,
+  remote_revision TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  UNIQUE (adapter, remote_id)
+);
+CREATE TABLE IF NOT EXISTS events (
+  session_id TEXT NOT NULL REFERENCES sessions(id), seq INTEGER NOT NULL, type TEXT NOT NULL,
+  payload_json TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (session_id, seq)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS commands (
+  id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
+  idempotency_key TEXT NOT NULL UNIQUE,
+  state TEXT NOT NULL CHECK (state IN ('accepted', 'dispatching', 'remote-confirmed', 'applied', 'failed', 'unknown')),
+  correlation_id TEXT, attempt INTEGER NOT NULL DEFAULT 0, lease_expires_at TEXT,
+  payload_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pending_actions (
+  id TEXT PRIMARY KEY, version INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'answered', 'cancelled', 'expired', 'unknown')),
+  payload_json TEXT NOT NULL, answer_json TEXT, expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+`;
+
+const columnsOf = (database: Database, table: string): Set<string> =>
+  new Set((database.query(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(({ name }) => name));
+
+const addMissingColumns = (database: Database, table: string, definitions: readonly string[]): void => {
+  const columns = columnsOf(database, table);
+  for (const definition of definitions) {
+    const name = definition.split(/\s+/, 1)[0]!;
+    if (!columns.has(name)) database.exec(`ALTER TABLE ${table} ADD COLUMN ${definition}`);
+  }
+};
+
+const migratePhase0 = (database: Database): void => {
+  database.exec(migrationBootstrap);
+  addMissingColumns(database, "sessions", [
+    "owner_id TEXT", "epoch_owner TEXT", "epoch_claimed_at TEXT", "view_owner TEXT", "view_claimed_at TEXT",
+    "control_mode TEXT NOT NULL DEFAULT 'view-only' CHECK (control_mode IN ('view-only', 'controlled'))",
+    "origin TEXT NOT NULL DEFAULT 'ondisk-discovery' CHECK (origin IN ('ondisk-discovery', 'coordinator-start', 'coordinator-resume', 'coordinator-continuation', 'opencode-discovery'))",
+    "transcript_status TEXT NOT NULL DEFAULT 'available' CHECK (transcript_status IN ('available', 'unreadable'))",
+    "control_cutover_seq INTEGER", "continuation_parent_id TEXT REFERENCES sessions(id)",
+  ]);
+  addMissingColumns(database, "events", [
+    "source_event_id TEXT", "source_revision TEXT", "source_position INTEGER", "content_hash TEXT",
+    "source TEXT CHECK (source IN ('gjc-ondisk', 'gjc-coordinator', 'opencode'))",
+  ]);
+
+  if (!columnsOf(database, "pending_actions").has("session_id")) {
+    database.exec(`
+      ALTER TABLE pending_actions RENAME TO pending_actions_legacy;
+      CREATE TABLE pending_actions (
+        id TEXT PRIMARY KEY, session_id TEXT REFERENCES sessions(id), remote_ref TEXT,
+        version INTEGER NOT NULL CHECK (version >= 1),
+        state TEXT NOT NULL CHECK (state IN ('pending', 'dispatching', 'answered', 'cancelled', 'expired', 'unknown')),
+        payload_json TEXT NOT NULL, answer_json TEXT, expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      INSERT INTO pending_actions (id, version, state, payload_json, answer_json, expires_at, created_at, updated_at)
+        SELECT id, version, state, payload_json, answer_json, expires_at, created_at, updated_at FROM pending_actions_legacy;
+      DROP TABLE pending_actions_legacy;
+    `);
+  }
+  addMissingColumns(database, "commands", [
+    "claimed_epoch INTEGER", "claimed_epoch_owner TEXT", "pending_action_id TEXT REFERENCES pending_actions(id)",
+  ]);
+};
 
 interface SessionRow {
   id: string; owner_id: string | null; adapter: string; remote_id: string; status: SessionStatus;
@@ -204,10 +339,17 @@ export class CoreDatabase {
     this.filename = filename;
     this.sqlite = new Database(filename, { create: true, strict: true });
     this.sqlite.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
-    this.sqlite.exec(schema);
-    const columns = this.sqlite.query("PRAGMA table_info(sessions)").all() as Array<{ name: string }>;
-    if (!columns.some((column) => column.name === "owner_id")) this.sqlite.exec("ALTER TABLE sessions ADD COLUMN owner_id TEXT");
-    this.sqlite.exec("CREATE INDEX IF NOT EXISTS sessions_owner_updated_idx ON sessions(owner_id, updated_at DESC)");
+    this.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      migratePhase0(this.sqlite);
+      this.sqlite.exec(schema);
+      this.sqlite.query("INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (1, 'phase-0-runtime-foundation', ?)").run(now());
+      this.sqlite.exec("PRAGMA user_version = 1");
+      this.sqlite.exec("COMMIT");
+    } catch (cause) {
+      this.sqlite.exec("ROLLBACK");
+      throw cause;
+    }
     // Legacy sessions had no owner. They are deliberately invisible until claimed.
     this.sqlite.query("UPDATE sessions SET status = 'unknown', reconciled = 0, updated_at = ? WHERE owner_id IS NULL").run(now());
   }
@@ -279,7 +421,7 @@ export class CoreDatabase {
 
   setReconciliation(id: string, status: SessionStatus, epoch: number, reconciled: boolean, remoteRevision: string | null): Session {
     if ((status === "stale" || status === "unknown") && reconciled) throw new Error("Stale or unknown sessions cannot be reconciled");
-    const result = this.sqlite.query("UPDATE sessions SET status = ?, reconciliation_epoch = ?, reconciled = ?, remote_revision = ?, updated_at = ? WHERE id = ? AND owner_id IS NOT NULL AND reconciliation_epoch <= ?").run(status, epoch, reconciled ? 1 : 0, remoteRevision, now(), id, epoch);
+    const result = this.sqlite.query("UPDATE sessions SET status = ?, reconciliation_epoch = ?, reconciled = ?, remote_revision = ?, updated_at = ? WHERE id = ? AND owner_id IS NOT NULL AND reconciliation_epoch = ?").run(status, epoch, reconciled ? 1 : 0, remoteRevision, now(), id, epoch - 1);
     if (result.changes !== 1) throw new Error("Session does not exist or reconciliation epoch is stale");
     return this.getSession(id)!;
   }
