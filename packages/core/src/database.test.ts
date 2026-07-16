@@ -200,3 +200,26 @@ describe("CoreDatabase", () => {
     db.close();
     await Bun.file(filename).delete();
   });
+test("applies the phase-0 migration idempotently across repeated opens", async () => {
+  const filename = `/tmp/core-phase0-migration-${crypto.randomUUID()}.sqlite`;
+  try {
+    let db = new CoreDatabase(filename);
+    db.createSession({ id: "session-1", ownerId: "owner-1", adapter: "gjc", remoteId: "remote-1" });
+    expect(db.sqlite.query("PRAGMA user_version").get()).toEqual({ user_version: 1 });
+    expect(db.sqlite.query("SELECT version, name FROM schema_migrations").all()).toEqual([
+      { version: 1, name: "phase-0-runtime-foundation" },
+    ]);
+    db.close();
+
+    db = new CoreDatabase(filename);
+    expect(db.sqlite.query("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({ count: 1 });
+    expect(db.sqlite.query("SELECT id, control_mode, origin, transcript_status FROM sessions").all()).toEqual([
+      { id: "session-1", control_mode: "view-only", origin: "ondisk-discovery", transcript_status: "available" },
+    ]);
+    db.close();
+  } finally {
+    await Bun.file(filename).delete();
+    await Bun.file(`${filename}-wal`).delete();
+    await Bun.file(`${filename}-shm`).delete();
+  }
+});
