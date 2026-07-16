@@ -13,14 +13,16 @@ export class BackupRestoreError extends Error {
 export interface BackupResult { readonly path: string; readonly bytes: number; }
 export interface RestoreResult { readonly restoredPath: string; readonly quarantinePath: string; }
 export interface AuditSecretFinding { readonly auditId: number; readonly reason: string; }
+export interface BackupSource { readonly sqlite: Database; readonly filename: string; }
 
 /** Creates a consistent SQLite snapshot without stopping writers, then publishes it atomically. */
-export async function backupDatabase(database: CoreDatabase, destination: string): Promise<BackupResult> {
+export async function backupDatabase(database: BackupSource, destination: string): Promise<BackupResult> {
   if (database.filename === ":memory:") throw new BackupRestoreError("In-memory databases cannot be backed up to a durable path");
   await mkdir(dirname(destination), { recursive: true });
   const temporary = temporaryPath(destination);
   try {
     database.sqlite.exec(`VACUUM INTO ${sqlString(temporary)}`);
+    integrityCheck(temporary);
     await rename(temporary, destination);
     return { path: destination, bytes: (await stat(destination)).size };
   } catch (cause) {
