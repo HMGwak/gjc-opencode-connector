@@ -1,11 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import { openCoreDatabase, type AgentAdapter } from "@planee/core";
 import { DeviceCredentialVerifier } from "./auth";
-import { createHubServer, DEFAULT_HOST, DEFAULT_PORT, type PushSubscriptionService } from "./server";
+import { createHubServer, DEFAULT_HOST, DEFAULT_PORT, DEFAULT_SNAPSHOT_MAX_ROWS, DEFAULT_SNAPSHOT_TTL_MS, type PushSubscriptionService } from "./server";
 import { ActionApiError, HubPendingActionService, type ArtifactService } from "./actions";
 
 const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 const randomSecret = (): Uint8Array => crypto.getRandomValues(new Uint8Array(32));
+const prepareArchiveCandidate = (database: ReturnType<typeof openCoreDatabase>, id: string, epoch: number) => {
+  database.setReconciliation(id, "terminal", epoch, true, `revision-${epoch}`);
+  database.sqlite.query("UPDATE sessions SET updated_at = ? WHERE id = ?").run("2020-01-01T00:00:00.000Z", id);
+};
 
 async function fixture(adapters?: Readonly<Record<string, AgentAdapter>>, setup?: (database: ReturnType<typeof openCoreDatabase>) => void) {
   const now = 1_700_000_000_000;
@@ -204,24 +208,36 @@ describe("hub origin API", () => {
     const { database, auth, token } = await fixture();
     const actions = new HubPendingActionService(database);
     const core = new (await import("@planee/core")).PendingActionService(database);
-    core.create({ id: "action-1", expiresAt: "2030-01-01T00:00:00.000Z", payload: { ownerId: "u1", sessionId: "s1", type: "approve", payload: { value: 1 }, artifactIds: [] } });
+    database.createPendingAction({ id: "action-1", ownerId: "u1", sessionId: "s1", expiresAt: "2030-01-01T00:00:00.000Z", payload: { ownerId: "u1", sessionId: "s1", type: "approve", payload: { allowedResponses: ["approve", "reject"] }, artifactIds: [] } });
     const server = createHubServer({ database, auth, publicOrigin: "https://hub.example", actions });
-    const response = await server.fetch(request("/api/v1/actions/action-1/response", token, { method: "POST", headers: { origin: "https://hub.example", "idempotency-key": "answer-1" }, body: JSON.stringify({ version: 1, response: true }) }));
+    const invalid = await server.fetch(request("/api/v1/actions/action-1/response", token, { method: "POST", headers: { origin: "https://hub.example", "idempotency-key": "answer-invalid" }, body: JSON.stringify({ version: 1, response: true }) }));
+    expect(invalid.status).toBe(400);
+    expect(await invalid.json()).toEqual({ error: { code: "action_invalid", message: "Invalid action request" } });
+    expect(database.getPendingAction("action-1")).toMatchObject({ state: "pending", version: 1, answer: null });
+    const arbitrary = await server.fetch(request("/api/v1/actions/action-1/response", token, { method: "POST", headers: { origin: "https://hub.example", "idempotency-key": "answer-arbitrary" }, body: JSON.stringify({ version: 1, response: "arbitrary" }) }));
+    expect(arbitrary.status).toBe(400);
+    expect(database.getPendingAction("action-1")).toMatchObject({ state: "pending", version: 1, answer: null });
+    const response = await server.fetch(request("/api/v1/actions/action-1/response", token, { method: "POST", headers: { origin: "https://hub.example", "idempotency-key": "answer-1" }, body: JSON.stringify({ version: 1, response: "approve" }) }));
     expect(response.status).toBe(202);
-    expect(database.getPendingAction("action-1")).toMatchObject({ state: "answered", version: 2, answer: true });
+    expect(database.getPendingAction("action-1")).toMatchObject({ state: "answered", version: 2, answer: "approve" });
     expect(database.sqlite.query("SELECT action, session_id FROM audit_log WHERE action = 'pending-action.answered'").all()).toEqual([{ action: "pending-action.answered", session_id: "s1" }]);
     expect(database.listEvents("s1")).toMatchObject([{ type: "action.responded", payload: { actionId: "action-1", version: 2, ownerId: "u1" } }]);
-    const duplicateResponse = await server.fetch(request("/api/v1/actions/action-1/response", token, { method: "POST", headers: { origin: "https://hub.example", "idempotency-key": "answer-1-retry" }, body: JSON.stringify({ version: 1, response: true }) }));
+    const duplicateResponse = await server.fetch(request("/api/v1/actions/action-1/response", token, { method: "POST", headers: { origin: "https://hub.example", "idempotency-key": "answer-1-retry" }, body: JSON.stringify({ version: 1, response: "approve" }) }));
     expect(duplicateResponse.status).toBe(200);
     expect(database.listEvents("s1").filter((event) => event.type === "action.responded")).toHaveLength(1);
+    database.createPendingAction({ id: "action-no-responses", ownerId: "u1", sessionId: "s1", expiresAt: "2030-01-01T00:00:00.000Z", payload: { ownerId: "u1", sessionId: "s1", type: "approve", payload: {}, artifactIds: [] } });
+    const nonAnswerable = await server.fetch(request("/api/v1/actions/action-no-responses/response", token, { method: "POST", headers: { origin: "https://hub.example", "idempotency-key": "answer-none" }, body: JSON.stringify({ version: 1, response: "approve" }) }));
+    expect(nonAnswerable.status).toBe(400);
+    expect(database.getPendingAction("action-no-responses")).toMatchObject({ state: "pending", version: 1, answer: null });
 
-    core.create({ id: "action-2", expiresAt: "2030-01-01T00:00:00.000Z", payload: { ownerId: "u1", sessionId: "s1", type: "approve", payload: {}, artifactIds: [] } });
+    database.createPendingAction({ id: "action-2", ownerId: "u1", sessionId: "s1", expiresAt: "2030-01-01T00:00:00.000Z", payload: { ownerId: "u1", sessionId: "s1", type: "approve", payload: { allowedResponses: ["approve"] }, artifactIds: [] } });
     database.setReconciliation("s1", "terminal", 2, true, "revision-2");
-    const failed = await server.fetch(request("/api/v1/actions/action-2/response", token, { method: "POST", headers: { origin: "https://hub.example", "idempotency-key": "answer-2" }, body: JSON.stringify({ version: 1, response: true }) }));
+    const failed = await server.fetch(request("/api/v1/actions/action-2/response", token, { method: "POST", headers: { origin: "https://hub.example", "idempotency-key": "answer-2" }, body: JSON.stringify({ version: 1, response: "approve" }) }));
     expect(failed.status).toBe(500);
     expect(database.getPendingAction("action-2")).toMatchObject({ state: "pending", version: 1 });
     expect(database.sqlite.query("SELECT COUNT(*) AS count FROM audit_log WHERE action = 'pending-action.answered' AND payload_json LIKE '%action-2%'").get()).toEqual({ count: 0 });
-    core.create({ id: "action-3", expiresAt: "2030-01-01T00:00:00.000Z", payload: { ownerId: "u2", sessionId: "s1", type: "approve", payload: {}, artifactIds: [] } });
+    database.createSession({ id: "s2", ownerId: "u2", adapter: "test", remoteId: "r2" });
+    database.createPendingAction({ id: "action-3", ownerId: "u2", sessionId: "s2", expiresAt: "2030-01-01T00:00:00.000Z", payload: { ownerId: "u2", sessionId: "s2", type: "approve", payload: {}, artifactIds: [] } });
     const foreignResponse = await server.fetch(request("/api/v1/actions/action-3/response", token, { method: "POST", headers: { origin: "https://hub.example", "idempotency-key": "foreign" }, body: JSON.stringify({ version: 1, response: true }) }));
     expect(foreignResponse.status).toBe(403);
     expect(() => actions.respondWithEvent({ id: "action-3", ownerId: "u1", version: 1, response: true, idempotencyKey: "foreign-direct" })).toThrow(ActionApiError);
@@ -236,7 +252,7 @@ describe("hub origin API", () => {
     let raceMetadataCalls = 0;
     const keys = new Set<string>();
     let concurrentDuplicateResponders = 0;
-    const action = { id: "act_opaque", ownerId: "u1", sessionId: "s1", version: 2, expiresAt: "2030-01-01T00:00:00.000Z", status: "answered" as const, type: "approve", payload: {}, artifactIds: ["artifact_opaque"] };
+    const action = { id: "act_opaque", ownerId: "u1", sessionId: "s1", version: 2, expiresAt: "2030-01-01T00:00:00.000Z", status: "answered" as const, type: "approve", payload: {}, allowedResponses: [], artifactIds: ["artifact_opaque"] };
     const listedActions = [action, ...["missing", "expired", "forbidden", "invalid"].map((id) => ({ ...action, id }))];
     const artifact = { id: "a", ownerId: "u1", name: "result.txt", contentType: "text/plain", size: 2, createdAt: "2025-01-01T00:00:00.000Z" };
     const respond = async ({ id, version, idempotencyKey }: { id: string; version: number; idempotencyKey: string }) => {
@@ -340,6 +356,268 @@ describe("hub origin API", () => {
     expect((await server.fetch(request("/api/v1/sessions", other))).json()).resolves.toEqual({ sessions: [] });
     expect((await server.fetch(request("/api/v1/sessions/s1/events", other))).status).toBe(403);
     expect((await server.fetch(request("/api/v1/sessions/s1/prompt", other, { method: "POST", headers: { origin: "https://hub.example", "idempotency-key": "foreign" }, body: JSON.stringify({ prompt: "hi" }) }))).status).toBe(403);
+    database.close();
+  });
+  test("lists only actionable, owner-visible HITL actions", async () => {
+    const { database, auth, token } = await fixture();
+    const core = new (await import("@planee/core")).PendingActionService(database);
+    const actions = new HubPendingActionService(database);
+    const create = (id: string, sessionId: string, ownerId = "u1", payload: unknown = {}) => database.createPendingAction({
+      id,
+      ownerId,
+      sessionId,
+      expiresAt: "2030-01-01T00:00:00.000Z",
+      payload: { ownerId, sessionId, type: "approve", payload, artifactIds: [] },
+    });
+
+    database.createSession({ id: "archived", ownerId: "u1", adapter: "test", remoteId: "archived" });
+    database.createSession({ id: "blocked", ownerId: "u1", adapter: "test", remoteId: "blocked" });
+    prepareArchiveCandidate(database, "archived", 1);
+    database.archiveSessionForOwner({ id: "archived", ownerId: "u1" });
+    create("pending", "s1");
+    create("dispatching", "s1");
+    database.sqlite.query("UPDATE pending_actions SET state = 'dispatching' WHERE id = ?").run("dispatching");
+    create("unknown-intervention", "s1", "u1", { requiresOwnerIntervention: true, allowedResponses: ["retry", "cancel"] });
+    core.markUnknown("unknown-intervention", 1);
+    create("unknown-terminal", "s1");
+    core.markUnknown("unknown-terminal", 1);
+    create("answered", "s1");
+    core.respond({ id: "answered", version: 1, answer: true });
+    create("cancelled", "s1");
+    core.cancel("cancelled", 1);
+    create("expired", "s1");
+    core.expire("expired", 1);
+    create("archived-action", "archived");
+    create("blocked-action", "blocked");
+    database.createSession({ id: "foreign", ownerId: "u2", adapter: "test", remoteId: "foreign" });
+    create("foreign-action", "foreign", "u2");
+
+    const server = createHubServer({
+      database,
+      auth,
+      publicOrigin: "https://hub.example",
+      actions,
+      authorizeSession: (sessionId, ownerId) => ownerId === "u1" && sessionId !== "blocked",
+    });
+    for (const path of ["/api/v1/hitl", "/api/v1/inbox"]) {
+      const body = await (await server.fetch(request(path, token))).json() as { actions: Array<{ id: string }> };
+      expect(body.actions.map(({ id }) => id).sort()).toEqual(["dispatching", "pending", "unknown-intervention"]);
+    }
+    database.close();
+  });
+  test("applies HITL session visibility before action responses", async () => {
+    const { database, auth, token } = await fixture();
+    const core = new (await import("@planee/core")).PendingActionService(database);
+    const actions = new HubPendingActionService(database);
+    const create = (id: string, sessionId: string) => database.createPendingAction({
+      id,
+      ownerId: "u1",
+      sessionId,
+      expiresAt: "2030-01-01T00:00:00.000Z",
+      payload: { ownerId: "u1", sessionId, type: "approve", payload: id === "allowed-response" ? { allowedResponses: [{ value: "approve", label: "Approve request" }, "reject"] } : {}, artifactIds: [] },
+    });
+    database.createSession({ id: "archived-response", ownerId: "u1", adapter: "test", remoteId: "archived-response" });
+    database.createSession({ id: "blocked-response", ownerId: "u1", adapter: "test", remoteId: "blocked-response" });
+    prepareArchiveCandidate(database, "archived-response", 1);
+    database.archiveSessionForOwner({ id: "archived-response", ownerId: "u1" });
+    create("allowed-response", "s1");
+    create("archived-response", "archived-response");
+    create("blocked-response", "blocked-response");
+    const responseCalls: string[] = [];
+    const actionService = {
+      list: actions.list.bind(actions),
+      respondWithEvent: async (input: Parameters<typeof actions.respondWithEvent>[0]) => {
+        responseCalls.push(input.id);
+        return actions.respondWithEvent(input);
+      },
+    };
+    const server = createHubServer({
+      database,
+      auth,
+      publicOrigin: "https://hub.example",
+      actions: actionService as unknown as HubPendingActionService,
+      authorizeSession: (sessionId, ownerId) => ownerId === "u1" && sessionId !== "blocked-response",
+    });
+    const respond = (id: string) => server.fetch(request(`/api/v1/actions/${id}/response`, token, {
+      method: "POST",
+      headers: { origin: "https://hub.example", "idempotency-key": id },
+      body: JSON.stringify({ version: 1, response: "approve" }),
+    }));
+    expect(await (await server.fetch(request("/api/v1/hitl", token))).json()).toEqual({ actions: [expect.objectContaining({ id: "allowed-response" })] });
+    expect(await (await server.fetch(request("/api/v1/actions", token))).json()).toEqual({ actions: [expect.objectContaining({ id: "allowed-response", allowedResponses: [{ value: "approve", label: "Approve request" }, "reject"] })] });
+    for (const id of ["blocked-response", "archived-response"]) {
+      const response = await respond(id);
+      expect(response.status).toBe(403);
+      expect(await response.json()).toEqual({ error: { code: "action_forbidden", message: "Forbidden" } });
+      expect(database.getPendingAction(id)).toMatchObject({ state: "pending", version: 1 });
+      expect(database.listEvents(id === "blocked-response" ? "blocked-response" : "archived-response")).toEqual([]);
+    }
+    expect(responseCalls).toEqual([]);
+    expect((await respond("allowed-response")).status).toBe(202);
+    expect(responseCalls).toEqual(["allowed-response"]);
+    expect(database.getPendingAction("allowed-response")).toMatchObject({ state: "answered", version: 2, answer: "approve" });
+    database.close();
+  });
+  test("does not expose denied-session work", async () => {
+    const { database, auth, token } = await fixture();
+    database.createSession({ id: "denied-work", ownerId: "u1", adapter: "test", remoteId: "denied-work" });
+    database.upsertWorkItem({ id: "visible-work", ownerId: "u1", sessionId: "s1", remoteId: "visible", state: "open", payload: {} });
+    database.upsertWorkItem({ id: "denied-work", ownerId: "u1", sessionId: "denied-work", remoteId: "denied", state: "open", payload: {} });
+    const server = createHubServer({
+      database,
+      auth,
+      publicOrigin: "https://hub.example",
+      authorizeSession: (sessionId, ownerId) => ownerId === "u1" && sessionId !== "denied-work",
+    });
+    const body = await (await server.fetch(request("/api/v1/work", token))).json() as { work: Array<{ id: string }> };
+    expect(body.work.map(({ id }) => id)).toEqual(["visible-work"]);
+    database.close();
+  });
+  test("materializes snapshots through Core's authorized allowlist", async () => {
+    const { database, auth, token } = await fixture();
+    database.createSession({ id: "denied-snapshot", ownerId: "u1", adapter: "test", remoteId: "denied-snapshot" });
+    database.upsertWorkItem({ id: "visible-snapshot-work", ownerId: "u1", sessionId: "s1", remoteId: "visible-snapshot", state: "open", payload: {} });
+    database.upsertWorkItem({ id: "denied-snapshot-work", ownerId: "u1", sessionId: "denied-snapshot", remoteId: "denied-snapshot", state: "open", payload: {} });
+    const server = createHubServer({
+      database,
+      auth,
+      publicOrigin: "https://hub.example",
+      authorizeSession: (sessionId, ownerId) => ownerId === "u1" && sessionId !== "denied-snapshot",
+    });
+    const created = await server.fetch(request("/api/v1/snapshot", token));
+    expect(created.status).toBe(200);
+    const snapshot = await created.json() as { token: string };
+    const page = await (await server.fetch(request(`/api/v1/snapshots/${snapshot.token}`, token))).json() as { rows: Array<{ key: string }> };
+    expect(page.rows.map(({ key }) => key).sort()).toEqual(["session:s1", "work:visible-snapshot-work"]);
+    database.close();
+  });
+  test("returns 410 for a snapshot token evicted by the owner quota", async () => {
+    const { database, server, token } = await fixture();
+    const snapshots: string[] = [];
+    for (let index = 0; index < 4; index += 1) {
+      const created = await server.fetch(request("/api/v1/snapshot", token));
+      expect(created.status).toBe(200);
+      snapshots.push((await created.json() as { token: string }).token);
+    }
+    const evicted = snapshots.find((snapshot) => !database.sqlite.query("SELECT 1 FROM snapshot_tokens WHERE token = ?").get(snapshot));
+    expect(evicted).toBeDefined();
+    const response = await server.fetch(request(`/api/v1/snapshots/${evicted}`, token));
+    expect(response.status).toBe(410);
+    expect(await response.json()).toEqual({ error: { code: "snapshot_expired", message: "Snapshot expired or unavailable" } });
+    database.close();
+  });
+  test("accepts exactly the default snapshot row cap and returns 413 one row above it", async () => {
+    const { database, server, token } = await fixture();
+    for (let index = 0; index < DEFAULT_SNAPSHOT_MAX_ROWS - 1; index += 1) database.upsertWorkItem({ id: `at-quota-${index}`, ownerId: "u1", sessionId: "s1", remoteId: `at-quota-${index}`, state: "open", payload: {} });
+    expect((await server.fetch(request("/api/v1/snapshot", token))).status).toBe(200);
+    database.upsertWorkItem({ id: "over-quota", ownerId: "u1", sessionId: "s1", remoteId: "over-quota", state: "open", payload: {} });
+    const response = await server.fetch(request("/api/v1/snapshot", token));
+    expect(response.status).toBe(413);
+    expect(await response.json()).toEqual({ error: { code: "snapshot_too_large", message: "Snapshot exceeds size limit" } });
+    database.close();
+  });
+  test("returns snapshot_unavailable for unrelated snapshot failures", async () => {
+    const { database, server, token } = await fixture();
+    database.sqlite.exec("CREATE TRIGGER reject_snapshot_token BEFORE INSERT ON snapshot_tokens BEGIN SELECT RAISE(ABORT, 'storage unavailable'); END");
+    const response = await server.fetch(request("/api/v1/snapshot", token));
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: { code: "snapshot_unavailable", message: "Snapshot unavailable" } });
+    database.close();
+  });
+  test("keeps snapshot tokens valid until the 10-minute expiry boundary", async () => {
+    const { database, auth, token, now: initialNow } = await fixture();
+    let now = initialNow;
+    const server = createHubServer({
+      database,
+      auth,
+      publicOrigin: "https://hub.example",
+      now: () => now,
+      authorizeSession: (_sessionId, ownerId) => ownerId === "u1",
+    });
+    const created = await server.fetch(request("/api/v1/snapshot", token));
+    expect(created.status).toBe(200);
+    const { token: snapshotToken } = await created.json() as { token: string };
+    now += DEFAULT_SNAPSHOT_TTL_MS - 1;
+    expect((await server.fetch(request(`/api/v1/snapshots/${snapshotToken}`, token))).status).toBe(200);
+    now += 1;
+    const expired = await server.fetch(request(`/api/v1/snapshots/${snapshotToken}`, token));
+    expect(expired.status).toBe(410);
+    expect(await expired.json()).toEqual({ error: { code: "snapshot_expired", message: "Snapshot expired or unavailable" } });
+    database.close();
+  });
+  test("filters denied session SSE rows in SQL before applying the page limit", async () => {
+    const { database, auth, token } = await fixture();
+    database.createSession({ id: "denied-sse", ownerId: "u1", adapter: "test", remoteId: "denied-sse" });
+    for (let index = 0; index < 100; index += 1) database.enqueueSse("u1", { type: "denied", index }, "denied-sse");
+    database.enqueueSse("u1", { type: "allowed" }, "s1");
+    database.enqueueSse("u1", { type: "owner.refresh" }, "s1");
+    database.enqueueSse("u1", { type: "owner.unsafe", payload: { detail: "denied" } }, "denied-sse");
+    const server = createHubServer({ database, auth, publicOrigin: "https://hub.example", authorizeSession: (sessionId) => sessionId !== "denied-sse" });
+    const response = await server.fetch(request("/api/v1/events", token));
+    expect(response.status).toBe(200);
+    const body = await response.text();
+    expect(body).toContain("owner.refresh");
+    expect(body).toContain("allowed");
+    expect(body).not.toContain("denied-sse");
+    expect(body).not.toContain("owner.unsafe");
+    database.close();
+  });
+  test("requires a snapshot reset when the SSE cursor is older than Core retention", async () => {
+    const { database, server, token } = await fixture();
+    database.appendEvent("s1", "retained", {});
+    database.sqlite.query("DELETE FROM sse_outbox WHERE id = (SELECT MIN(id) FROM sse_outbox WHERE owner_id = ?)").run("u1");
+    expect(database.minimumRetainedSseCursor("u1")).toBeGreaterThan(0);
+    const response = await server.fetch(request("/api/v1/events?after=0", token));
+    expect(response.status).toBe(410);
+    expect(await response.json()).toEqual({ reset: "snapshot-required" });
+    database.close();
+  });
+  test("archives owned sessions idempotently, records device-attributed audits, and exposes owner-scoped workflow lists", async () => {
+    const { database, auth, server, token } = await fixture();
+    const deviceId = (await auth.verify(token)).deviceId;
+    expect(await (await server.fetch(request("/api/v1/work", token))).json()).toEqual({ work: [] });
+    expect(await (await server.fetch(request("/api/v1/hitl", token))).json()).toEqual({ actions: [] });
+    const archive = { method: "POST", headers: { origin: "https://hub.example" } };
+    const immediate = await server.fetch(request("/api/v1/sessions/s1/archive", token, archive));
+    expect(immediate.status).toBe(409);
+    prepareArchiveCandidate(database, "s1", 2);
+    const first = await server.fetch(request("/api/v1/sessions/s1/archive", token, archive));
+    expect(first.status).toBe(200);
+    const archived = await first.json();
+    expect(archived).toMatchObject({ session: { id: "s1", archivedAt: expect.any(String) } });
+    const repeat = await server.fetch(request("/api/v1/sessions/s1/archive", token, archive));
+    expect(repeat.status).toBe(200);
+    expect(await repeat.json()).toEqual(archived);
+    expect(await (await server.fetch(request("/api/v1/history", token))).json()).toMatchObject({ sessions: [{ id: "s1", archivedAt: expect.any(String) }] });
+    expect((await server.fetch(request("/api/v1/sessions/s1/prompt", token, { method: "POST", headers: { origin: "https://hub.example", "idempotency-key": "archived" }, body: JSON.stringify({ prompt: "blocked" }) }))).status).toBe(409);
+    expect((await server.fetch(request("/api/v1/sessions/s1/unarchive", token, archive))).status).toBe(200);
+    expect(database.sqlite.query("SELECT action, actor_id, device_id, correlation_id FROM audit_log WHERE session_id = ? ORDER BY id").all("s1")).toEqual([
+      { action: "session.archived", actor_id: "owner", device_id: deviceId, correlation_id: expect.any(String) },
+      { action: "session.unarchived", actor_id: "owner", device_id: deviceId, correlation_id: expect.any(String) },
+    ]);
+    const audits = database.sqlite.query("SELECT correlation_id FROM audit_log WHERE session_id = ? ORDER BY id").all("s1") as Array<{ correlation_id: string }>;
+    expect(audits.every(({ correlation_id }) => correlation_id.length > 0)).toBeTrue();
+    database.close();
+  });
+  test("rejects prompts for view-only sessions", async () => {
+    const { database, server, token } = await fixture();
+    database.sqlite.query("UPDATE sessions SET control_mode = 'view-only' WHERE id = ?").run("s1");
+    expect((await server.fetch(request("/api/v1/sessions/s1/prompt", token, { method: "POST", headers: { origin: "https://hub.example", "idempotency-key": "view-only" }, body: JSON.stringify({ prompt: "blocked" }) }))).status).toBe(409);
+    database.close();
+  });
+  test("serves finite session catch-up, honors Last-Event-ID, and rejects unsafe cursors", async () => {
+    const { database, server, token } = await fixture();
+    database.appendEvent("s1", "message", { text: "one" });
+    database.appendEvent("s1", "message", { text: "two" });
+
+    const response = await server.fetch(request("/api/v1/sessions/s1/events", token, { headers: { "last-event-id": "1" } }));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("text/event-stream; charset=utf-8");
+    expect(response.headers.get("x-stream-mode")).toBe("finite-catch-up");
+    expect(response.headers.get("connection")).toBeNull();
+    expect(await response.text()).toContain("id: 2");
+
+    expect((await server.fetch(request("/api/v1/sessions/s1/events?after=9007199254740992", token))).status).toBe(400);
     database.close();
   });
 });

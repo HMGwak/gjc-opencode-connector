@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { CoreDatabase } from "./database";
+import { redactForSink } from "./redact";
 import type { PushPayload, PushSubscription } from "./types";
 
 export interface PushSubscriptionInput {
@@ -89,7 +90,7 @@ export class PushService {
 
   async notify(ownerId: string, payload: PushPayload): Promise<{ readonly sent: number; readonly removed: number }> {
     if (!ownerId) throw new PushValidationError("Push subscription owner is required");
-    const minimized = this.validatePayload(payload);
+    const minimized = redactForSink("push", this.validatePayload(payload)) as PushPayload;
     const at = this.now().toISOString();
     let removed = this.options.database.deleteExpiredPushSubscriptions(at);
     let sent = 0;

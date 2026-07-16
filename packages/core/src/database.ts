@@ -1,10 +1,15 @@
 import { Database } from "bun:sqlite";
 import type {
+  BackfillJob,
+  BackfillJobState,
   AuditEntry,
   Command,
   CommandState,
   PendingAction,
   PendingActionState,
+  ProjectionCheckpoint,
+  ProjectionFailure,
+  ProjectionGap,
   PushSubscription,
   Session,
   SessionControlMode,
@@ -13,16 +18,12 @@ import type {
   SessionStatus,
   StoredPushSubscription,
   TranscriptStatus,
+  WorkItem,
 } from "./types";
+import { SecretDataError, assertSecretFree as assertRedactedSecretFree, redactDiagnostic, redactForCommand, redactForSink, type SinkKind } from "./redact";
 
-const SECRET_KEY = /(?:secret|password|token|api[_-]?key|authorization|credential|private[_-]?key|auth)/i;
 
-export class SecretDataError extends Error {
-  constructor(message = "Persistent journals must not contain secrets") {
-    super(message);
-    this.name = "SecretDataError";
-  }
-}
+export { SecretDataError } from "./redact";
 export class CorruptPersistentDataError extends Error {
   constructor(readonly record: string, cause?: unknown) {
     super(`Persisted ${record} JSON is corrupt`);
@@ -33,25 +34,13 @@ export class CorruptPersistentDataError extends Error {
 
 
 export function assertSecretFree(value: unknown): void {
-  const visit = (item: unknown, path: string): void => {
-    if (typeof item === "string") {
-      if (/\b(?:bearer|basic)\s+[a-z0-9._~+/=-]+/i.test(item)) {
-        throw new SecretDataError(`Secret-like value at ${path}`);
-      }
-      return;
-    }
-    if (Array.isArray(item)) {
-      item.forEach((entry, index) => visit(entry, `${path}[${index}]`));
-      return;
-    }
-    if (item !== null && typeof item === "object") {
-      for (const [key, entry] of Object.entries(item)) {
-        if (SECRET_KEY.test(key)) throw new SecretDataError(`Secret-like key at ${path}.${key}`);
-        visit(entry, `${path}.${key}`);
-      }
-    }
-  };
-  visit(value, "payload");
+  try {
+    assertRedactedSecretFree(value);
+  } catch (cause) {
+    if (cause instanceof SecretDataError) throw cause;
+    if (cause instanceof Error) throw new SecretDataError(cause.message);
+    throw cause;
+  }
 }
 
 const schema = `
@@ -71,14 +60,21 @@ CREATE TABLE IF NOT EXISTS sessions (
   control_mode TEXT NOT NULL DEFAULT 'view-only' CHECK (control_mode IN ('view-only', 'controlled')),
   origin TEXT NOT NULL DEFAULT 'ondisk-discovery' CHECK (origin IN ('ondisk-discovery', 'coordinator-start', 'coordinator-resume', 'coordinator-continuation', 'opencode-discovery')),
   transcript_status TEXT NOT NULL DEFAULT 'available' CHECK (transcript_status IN ('available', 'unreadable')),
+  active_projector_version TEXT,
   control_cutover_seq INTEGER,
   continuation_parent_id TEXT REFERENCES sessions(id),
+  archived_at TEXT,
+  archive_reason TEXT CHECK (archive_reason IN ('manual', 'retention')),
+  archive_cursor_seq INTEGER CHECK (archive_cursor_seq IS NULL OR archive_cursor_seq > 0),
+  workdir TEXT,
+  source_created_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE (adapter, remote_id)
 );
 CREATE INDEX IF NOT EXISTS sessions_status_idx ON sessions(status);
 CREATE INDEX IF NOT EXISTS sessions_owner_updated_idx ON sessions(owner_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS sessions_owner_source_created_idx ON sessions(owner_id, source_created_at);
 CREATE TABLE IF NOT EXISTS events (
   session_id TEXT NOT NULL REFERENCES sessions(id),
   seq INTEGER NOT NULL CHECK (seq > 0),
@@ -113,6 +109,7 @@ CREATE INDEX IF NOT EXISTS commands_session_state_idx ON commands(session_id, st
 CREATE TABLE IF NOT EXISTS pending_actions (
   id TEXT PRIMARY KEY,
   session_id TEXT REFERENCES sessions(id),
+  owner_id TEXT NOT NULL DEFAULT '',
   remote_ref TEXT,
   version INTEGER NOT NULL CHECK (version >= 1),
   state TEXT NOT NULL CHECK (state IN ('pending', 'dispatching', 'answered', 'cancelled', 'expired', 'unknown')),
@@ -124,6 +121,104 @@ CREATE TABLE IF NOT EXISTS pending_actions (
 );
 CREATE INDEX IF NOT EXISTS pending_actions_state_expires_idx ON pending_actions(state, expires_at);
 CREATE UNIQUE INDEX IF NOT EXISTS pending_actions_remote_ref_idx ON pending_actions(session_id, remote_ref) WHERE session_id IS NOT NULL AND remote_ref IS NOT NULL;
+CREATE TABLE IF NOT EXISTS work_items (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL CHECK (length(trim(owner_id)) > 0),
+  session_id TEXT NOT NULL REFERENCES sessions(id),
+  remote_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  projector_version TEXT NOT NULL DEFAULT 'legacy',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (session_id, remote_id, projector_version)
+);
+CREATE INDEX IF NOT EXISTS work_items_owner_updated_idx ON work_items(owner_id, updated_at DESC);
+CREATE TABLE IF NOT EXISTS session_projection_checkpoints (
+  session_id TEXT NOT NULL REFERENCES sessions(id),
+  projector_version TEXT NOT NULL,
+  next_expected_seq INTEGER NOT NULL CHECK (next_expected_seq > 0),
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (session_id, projector_version)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS session_projection_gaps (
+  session_id TEXT NOT NULL REFERENCES sessions(id),
+  projector_version TEXT NOT NULL,
+  seq INTEGER NOT NULL CHECK (seq > 0),
+  reason TEXT NOT NULL CHECK (reason IN ('missing', 'out-of-order', 'failed')),
+  resolved_at TEXT,
+  detected_at TEXT NOT NULL,
+  PRIMARY KEY (session_id, projector_version, seq)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS late_event_quarantine (
+  owner_id TEXT NOT NULL CHECK (length(trim(owner_id)) > 0),
+  session_id TEXT NOT NULL REFERENCES sessions(id),
+  seq INTEGER NOT NULL CHECK (seq > 0),
+  projector_version TEXT NOT NULL,
+  reason TEXT NOT NULL CHECK (reason IN ('late-event')),
+  state TEXT NOT NULL CHECK (state IN ('quarantined', 'reopened')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  reopened_at TEXT,
+  PRIMARY KEY (session_id, seq, projector_version)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS late_event_quarantine_owner_state_idx ON late_event_quarantine(owner_id, state, updated_at DESC);
+CREATE INDEX IF NOT EXISTS late_event_quarantine_session_state_idx ON late_event_quarantine(session_id, state, seq);
+CREATE TABLE IF NOT EXISTS projection_failures (
+  session_id TEXT NOT NULL REFERENCES sessions(id),
+  projector_version TEXT NOT NULL,
+  seq INTEGER NOT NULL CHECK (seq > 0),
+  reason TEXT NOT NULL,
+  failed_at TEXT NOT NULL,
+  PRIMARY KEY (session_id, projector_version, seq)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS projection_effects (
+  session_id TEXT NOT NULL REFERENCES sessions(id),
+  projector_version TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  effect_key TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (session_id, projector_version, seq, effect_key)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS sse_outbox (
+  id INTEGER PRIMARY KEY,
+  owner_id TEXT NOT NULL CHECK (length(trim(owner_id)) > 0),
+  session_id TEXT NOT NULL REFERENCES sessions(id),
+  event_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS sse_outbox_owner_id_idx ON sse_outbox(owner_id, id);
+CREATE TABLE IF NOT EXISTS snapshot_tokens (
+  token TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL CHECK (length(trim(owner_id)) > 0),
+  watermark INTEGER NOT NULL,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS snapshot_rows (
+  token TEXT NOT NULL REFERENCES snapshot_tokens(token) ON DELETE CASCADE,
+  row_key TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  PRIMARY KEY (token, row_key)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS schema_fence (
+  name TEXT PRIMARY KEY,
+  min_version INTEGER NOT NULL,
+  active INTEGER NOT NULL CHECK(active IN (0,1)),
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS backfill_jobs (
+  name TEXT PRIMARY KEY,
+  cursor_json TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('pending','running','paused','complete','failed')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  started_at TEXT,
+  paused_at TEXT,
+  completed_at TEXT,
+  failed_at TEXT,
+  error TEXT,
+  updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version INTEGER PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,
@@ -172,6 +267,9 @@ CREATE TABLE IF NOT EXISTS audit_log (
   action TEXT NOT NULL,
   session_id TEXT REFERENCES sessions(id),
   command_id TEXT REFERENCES commands(id),
+  actor_id TEXT,
+  device_id TEXT,
+  correlation_id TEXT,
   payload_json TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
@@ -240,6 +338,14 @@ CREATE TABLE IF NOT EXISTS pending_actions (
   payload_json TEXT NOT NULL, answer_json TEXT, expires_at TEXT NOT NULL,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS corrupt_payloads (
+  record_type TEXT NOT NULL,
+  record_id TEXT NOT NULL,
+  payload_column TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  detected_at TEXT NOT NULL,
+  PRIMARY KEY (record_type, record_id, payload_column)
+);
 `;
 
 const columnsOf = (database: Database, table: string): Set<string> =>
@@ -252,15 +358,315 @@ const addMissingColumns = (database: Database, table: string, definitions: reado
     if (!columns.has(name)) database.exec(`ALTER TABLE ${table} ADD COLUMN ${definition}`);
   }
 };
+const tableSql = (database: Database, table: string): string | null =>
+  (database.query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) as { sql: string } | null)?.sql ?? null;
+const inTransaction = (database: Database, callback: () => void): void => {
+  const savepoint = `migration_${crypto.randomUUID().replaceAll("-", "")}`;
+  database.exec(`SAVEPOINT ${savepoint}`);
+  try {
+    callback();
+    database.exec(`RELEASE SAVEPOINT ${savepoint}`);
+  } catch (cause) {
+    database.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+    database.exec(`RELEASE SAVEPOINT ${savepoint}`);
+    throw cause;
+  }
+};
+const migrateSseOutbox = (database: Database): void => {
+  inTransaction(database, () => {
+    const columns = columnsOf(database, "sse_outbox");
+    if (columns.size === 0) return;
+    const required = ["id", "session_id", "event_json", "created_at"];
+    const missing = required.filter((column) => !columns.has(column));
+    if (missing.length) throw new Error(`Unsupported sse_outbox schema: missing columns ${missing.join(", ")}`);
+    if (!columns.has("owner_id")) database.exec("ALTER TABLE sse_outbox ADD COLUMN owner_id TEXT");
+    database.exec("UPDATE sse_outbox SET owner_id = (SELECT owner_id FROM sessions WHERE sessions.id = sse_outbox.session_id) WHERE owner_id IS NULL OR trim(owner_id) = '';");
+    const unresolved = database.query(`
+      SELECT id
+      FROM sse_outbox
+      WHERE session_id IS NULL
+        OR owner_id IS NULL
+        OR trim(owner_id) = ''
+        OR NOT EXISTS (
+          SELECT 1 FROM sessions
+          WHERE sessions.id = sse_outbox.session_id AND sessions.owner_id = sse_outbox.owner_id
+        )
+      ORDER BY id
+    `).all() as Array<{ id: number }>;
+    if (unresolved.length > 0) {
+      throw new Error(`Cannot migrate sse_outbox without a provable session owner; manual repair required: ${unresolved.map(({ id }) => id).join(",")}`);
+    }
+    const current = tableSql(database, "sse_outbox")?.replace(/\s+/g, " ") ?? "";
+    const finalOwner = /owner_id\s+TEXT\s+NOT\s+NULL\s+CHECK\s*\(\s*length\s*\(\s*trim\s*\(\s*owner_id\s*\)\s*\)\s*>\s*0\s*\)/i.test(current);
+    const finalSession = /session_id\s+TEXT\s+NOT\s+NULL\s+REFERENCES\s+sessions\s*\(\s*id\s*\)/i.test(current);
+    const noOwnerDefault = !/owner_id\s+TEXT[^,)]*\bDEFAULT\b/i.test(current);
+    const sessionForeignKey = (database.query("PRAGMA foreign_key_list(sse_outbox)").all() as Array<{ table: string; from: string }>).some((key) => key.table === "sessions" && key.from === "session_id");
+    const ownerIndex = database.query("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'sse_outbox_owner_id_idx'").get() !== null;
+    if (finalOwner && finalSession && noOwnerDefault && sessionForeignKey && ownerIndex) return;
+    database.exec(`
+      DROP INDEX IF EXISTS sse_outbox_owner_id_idx;
+      ALTER TABLE sse_outbox RENAME TO sse_outbox_legacy;
+      CREATE TABLE sse_outbox (
+        id INTEGER PRIMARY KEY,
+        owner_id TEXT NOT NULL CHECK (length(trim(owner_id)) > 0),
+        session_id TEXT NOT NULL REFERENCES sessions(id),
+        event_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO sse_outbox (id, owner_id, session_id, event_json, created_at)
+        SELECT legacy.id, legacy.owner_id, legacy.session_id, legacy.event_json, legacy.created_at
+        FROM sse_outbox_legacy AS legacy
+        JOIN sessions ON sessions.id = legacy.session_id AND sessions.owner_id = legacy.owner_id
+        WHERE legacy.owner_id IS NOT NULL AND trim(legacy.owner_id) <> ''
+        ORDER BY legacy.id;
+      DROP TABLE sse_outbox_legacy;
+      CREATE INDEX sse_outbox_owner_id_idx ON sse_outbox(owner_id, id);
+    `);
+  });
+};
+/**
+ * M2--M7 tables are deliberately listed here rather than inferred from callers.
+ * A database can have been opened by an older binary, so this is also the last
+ * line of defence against silently accepting a partially-created migration.
+ *
+ * `copy`, `valid`, and `order` are intentionally table-specific.  A repair must
+ * never guess an owner, coerce a value, or choose a duplicate winner.
+ */
+const m2SchemaManifest = {
+  sessions: { columns: ["id", "owner_id", "adapter", "remote_id", "status", "reconciliation_epoch", "reconciled", "remote_revision", "epoch_owner", "epoch_claimed_at", "view_owner", "view_claimed_at", "control_mode", "origin", "transcript_status", "active_projector_version", "control_cutover_seq", "continuation_parent_id", "archived_at", "archive_reason", "archive_cursor_seq", "workdir", "source_created_at", "created_at", "updated_at"], foreignKeys: [["continuation_parent_id", "sessions"]], checks: ["control_mode", "origin", "transcript_status"], unique: [], indexes: ["sessions_status_idx", "sessions_owner_updated_idx", "sessions_owner_source_created_idx"] },
+  work_items: { columns: ["id", "owner_id", "session_id", "remote_id", "state", "payload_json", "projector_version", "created_at", "updated_at"], foreignKeys: [["session_id", "sessions"]], checks: ["owner_id"], unique: [["session_id", "remote_id", "projector_version"]], indexes: ["work_items_owner_updated_idx"] },
+  late_event_quarantine: { columns: ["owner_id", "session_id", "seq", "projector_version", "reason", "state", "created_at", "updated_at", "reopened_at"], foreignKeys: [["session_id", "sessions"]], checks: ["owner_id", "seq", "reason", "state"], unique: [["session_id", "seq", "projector_version"]], indexes: ["late_event_quarantine_owner_state_idx", "late_event_quarantine_session_state_idx"] },
+  sse_outbox: { columns: ["id", "owner_id", "session_id", "event_json", "created_at"], foreignKeys: [["session_id", "sessions"]], checks: ["owner_id"], unique: [], indexes: ["sse_outbox_owner_id_idx"] },
+  session_projection_checkpoints: { columns: ["session_id", "projector_version", "next_expected_seq", "updated_at"], foreignKeys: [["session_id", "sessions"]], checks: ["next_expected_seq"], unique: [["session_id", "projector_version"]], indexes: [] },
+  session_projection_gaps: { columns: ["session_id", "projector_version", "seq", "reason", "resolved_at", "detected_at"], foreignKeys: [["session_id", "sessions"]], checks: ["seq", "reason"], unique: [["session_id", "projector_version", "seq"]], indexes: [] },
+  projection_failures: { columns: ["session_id", "projector_version", "seq", "reason", "failed_at"], foreignKeys: [["session_id", "sessions"]], checks: ["seq"], unique: [["session_id", "projector_version", "seq"]], indexes: [] },
+  projection_effects: { columns: ["session_id", "projector_version", "seq", "effect_key", "created_at"], foreignKeys: [["session_id", "sessions"]], checks: [], unique: [["session_id", "projector_version", "seq", "effect_key"]], indexes: [] },
+  snapshot_tokens: { columns: ["token", "owner_id", "watermark", "expires_at", "created_at"], foreignKeys: [], checks: ["owner_id"], unique: [], indexes: [] },
+  snapshot_rows: { columns: ["token", "row_key", "payload_json"], foreignKeys: [["token", "snapshot_tokens"]], checks: [], unique: [["token", "row_key"]], indexes: [] },
+  backfill_jobs: { columns: ["name", "cursor_json", "state", "attempts", "started_at", "paused_at", "completed_at", "failed_at", "error", "updated_at"], foreignKeys: [], checks: ["state", "attempts"], unique: [], indexes: [] },
+  schema_fence: { columns: ["name", "min_version", "active", "updated_at"], foreignKeys: [], checks: ["active"], unique: [], indexes: [] },
+  audit_log: { columns: ["id", "action", "session_id", "command_id", "actor_id", "device_id", "correlation_id", "payload_json", "created_at"], foreignKeys: [["session_id", "sessions"], ["command_id", "commands"]], checks: [], unique: [], indexes: ["audit_log_session_created_idx"] },
+} as const;
+
+type RebuildDescriptor = { copy: string; valid: string; id: string; order: string };
+const m2Rebuilds: Record<string, RebuildDescriptor> = {
+  work_items: { copy: "id, owner_id, session_id, remote_id, state, payload_json, projector_version, created_at, updated_at", valid: "id IS NOT NULL AND length(trim(owner_id)) > 0 AND session_id IN (SELECT id FROM sessions) AND remote_id IS NOT NULL AND state IS NOT NULL AND payload_json IS NOT NULL AND projector_version IS NOT NULL AND created_at IS NOT NULL AND updated_at IS NOT NULL AND id = (SELECT MIN(candidate.id) FROM work_items_rebuilt AS candidate WHERE candidate.session_id = work_items_rebuilt.session_id AND candidate.remote_id = work_items_rebuilt.remote_id AND candidate.projector_version = work_items_rebuilt.projector_version)", id: "id", order: "id" },
+  late_event_quarantine: { copy: "owner_id, session_id, seq, projector_version, reason, state, created_at, updated_at, reopened_at", valid: "length(trim(owner_id)) > 0 AND session_id IN (SELECT id FROM sessions) AND seq > 0 AND reason = 'late-event' AND state IN ('quarantined', 'reopened')", id: "session_id || ':' || seq || ':' || projector_version", order: "session_id, seq, projector_version" },
+  sse_outbox: { copy: "id, owner_id, session_id, event_json, created_at", valid: "id IS NOT NULL AND length(trim(owner_id)) > 0 AND EXISTS (SELECT 1 FROM sessions WHERE sessions.id = sse_outbox_rebuilt.session_id AND sessions.owner_id = sse_outbox_rebuilt.owner_id) AND event_json IS NOT NULL AND created_at IS NOT NULL", id: "id", order: "id" },
+  session_projection_checkpoints: { copy: "session_id, projector_version, next_expected_seq, updated_at", valid: "session_id IN (SELECT id FROM sessions) AND next_expected_seq > 0", id: "session_id || ':' || projector_version", order: "session_id, projector_version" },
+  projection_failures: { copy: "session_id, projector_version, seq, reason, failed_at", valid: "session_id IN (SELECT id FROM sessions) AND seq > 0", id: "session_id || ':' || projector_version || ':' || seq", order: "session_id, projector_version, seq" },
+  projection_effects: { copy: "session_id, projector_version, seq, effect_key, created_at", valid: "session_id IN (SELECT id FROM sessions) AND seq IS NOT NULL AND effect_key IS NOT NULL", id: "session_id || ':' || projector_version || ':' || seq || ':' || effect_key", order: "session_id, projector_version, seq, effect_key" },
+  snapshot_rows: { copy: "token, row_key, payload_json", valid: "token IN (SELECT token FROM snapshot_tokens) AND row_key IS NOT NULL AND payload_json IS NOT NULL", id: "token || ':' || row_key", order: "token, row_key" },
+  schema_fence: { copy: "name, min_version, active, updated_at", valid: "name IS NOT NULL AND min_version IS NOT NULL AND active IN (0, 1) AND updated_at IS NOT NULL", id: "name", order: "name" },
+  audit_log: { copy: "id, action, session_id, command_id, actor_id, device_id, correlation_id, payload_json, created_at", valid: "id IS NOT NULL AND action IS NOT NULL AND (session_id IS NULL OR session_id IN (SELECT id FROM sessions)) AND (command_id IS NULL OR command_id IN (SELECT id FROM commands)) AND payload_json IS NOT NULL AND created_at IS NOT NULL", id: "id", order: "id" },
+  snapshot_tokens: { copy: "token, owner_id, watermark, expires_at, created_at", valid: "token IS NOT NULL AND length(trim(owner_id)) > 0 AND watermark IS NOT NULL AND expires_at IS NOT NULL AND created_at IS NOT NULL", id: "token", order: "token" },
+  backfill_jobs: { copy: "name, cursor_json, state, attempts, started_at, paused_at, completed_at, failed_at, error, updated_at", valid: "name IS NOT NULL AND cursor_json IS NOT NULL AND json_valid(cursor_json) AND state IN ('pending', 'running', 'paused', 'complete', 'failed') AND attempts >= 0 AND updated_at IS NOT NULL", id: "name", order: "name" },
+};
+
+const recreateM2Index = (database: Database, index: string): void => {
+  const definitions: Record<string, string> = {
+    sessions_status_idx: "CREATE INDEX sessions_status_idx ON sessions(status)",
+    sessions_owner_updated_idx: "CREATE INDEX sessions_owner_updated_idx ON sessions(owner_id, updated_at DESC)",
+    sessions_owner_source_created_idx: "CREATE INDEX sessions_owner_source_created_idx ON sessions(owner_id, source_created_at)",
+    work_items_owner_updated_idx: "CREATE INDEX work_items_owner_updated_idx ON work_items(owner_id, updated_at DESC)",
+    late_event_quarantine_owner_state_idx: "CREATE INDEX late_event_quarantine_owner_state_idx ON late_event_quarantine(owner_id, state, updated_at DESC)",
+    late_event_quarantine_session_state_idx: "CREATE INDEX late_event_quarantine_session_state_idx ON late_event_quarantine(session_id, state, seq)",
+    sse_outbox_owner_id_idx: "CREATE INDEX sse_outbox_owner_id_idx ON sse_outbox(owner_id, id)",
+    audit_log_session_created_idx: "CREATE INDEX audit_log_session_created_idx ON audit_log(session_id, created_at)",
+  };
+  database.exec(definitions[index]!);
+};
+
+const m2ShapeMismatch = (database: Database, table: string, requirement: typeof m2SchemaManifest[keyof typeof m2SchemaManifest]): string | null => {
+  const columns = columnsOf(database, table);
+  const missing = requirement.columns.filter((column) => !columns.has(column));
+  if (missing.length) return `missing columns ${missing.join(", ")}`;
+  const sql = tableSql(database, table)?.replace(/\s+/g, " ") ?? "";
+  for (const check of requirement.checks) if (!new RegExp(`\\b${check}\\b[^,]*CHECK\\s*\\(`, "i").test(sql)) return `missing check for ${check}`;
+  const foreignKeys = database.query(`PRAGMA foreign_key_list(${table})`).all() as Array<{ from: string; table: string }>;
+  for (const [from, target] of requirement.foreignKeys) if (!foreignKeys.some((key) => key.from === from && key.table === target)) return `missing foreign key ${from} -> ${target}`;
+  const indexes = database.query(`PRAGMA index_list(${table})`).all() as Array<{ name: string; unique: number }>;
+  for (const unique of requirement.unique) if (!indexes.some((index) => index.unique === 1 && (database.query(`PRAGMA index_info(${index.name})`).all() as Array<{ name: string }>).map(({ name }) => name).join(",") === unique.join(","))) return `missing unique constraint (${unique.join(", ")})`;
+  return null;
+};
+
+const rebuildM2Table = (database: Database, table: string, descriptor: RebuildDescriptor, reason: string): void => {
+  const legacy = `${table}_rebuilt`;
+  database.exec(`ALTER TABLE ${table} RENAME TO ${legacy};`);
+  database.exec(schema);
+  database.query(`INSERT OR IGNORE INTO corrupt_payloads (record_type, record_id, payload_column, payload_json, detected_at) SELECT ?, CAST(${descriptor.id} AS TEXT), 'row', ?, ? FROM ${legacy} WHERE NOT (${descriptor.valid}) ORDER BY ${descriptor.order}`).run(table, json("projection-diagnostics", { reason }), now());
+  database.exec(`INSERT INTO ${table} (${descriptor.copy}) SELECT ${descriptor.copy} FROM ${legacy} WHERE ${descriptor.valid} ORDER BY ${descriptor.order}; DROP TABLE ${legacy};`);
+};
+
+const preflightM2Schema = (database: Database): void => {
+  for (const [table, requirement] of Object.entries(m2SchemaManifest)) {
+    const mismatch = m2ShapeMismatch(database, table, requirement);
+    if (mismatch) {
+      const descriptor = m2Rebuilds[table];
+      if (!descriptor) throw new Error(`Unsupported ${table} schema: ${mismatch}; ownership/FK mapping is unrepairable`);
+      rebuildM2Table(database, table, descriptor, mismatch);
+    }
+    for (const index of requirement.indexes) if (!database.query("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?").get(index)) recreateM2Index(database, index);
+    const revalidated = m2ShapeMismatch(database, table, requirement);
+    if (revalidated) throw new Error(`Unsupported ${table} schema after rebuild: ${revalidated}`);
+  }
+};
+const validateSchema = (database: Database): void => {
+  const requirements: Record<string, readonly string[]> = {
+    work_items: ["id", "owner_id", "session_id", "remote_id", "state", "payload_json", "projector_version", "created_at", "updated_at"],
+    pending_actions: ["id", "session_id", "owner_id", "remote_ref", "version", "state", "payload_json", "answer_json", "expires_at", "created_at", "updated_at"],
+    backfill_jobs: ["name", "cursor_json", "state", "attempts", "started_at", "paused_at", "completed_at", "failed_at", "error", "updated_at"],
+  };
+  for (const [table, required] of Object.entries(requirements)) {
+    const missing = required.filter((column) => !columnsOf(database, table).has(column));
+    if (missing.length) throw new Error(`Unsupported ${table} schema: missing columns ${missing.join(", ")}`);
+  }
+  const requireShape = (table: string, pattern: RegExp, detail: string): void => {
+    if (!pattern.test(tableSql(database, table)?.replace(/\s+/g, " ") ?? "")) throw new Error(`Unsupported ${table} schema: missing ${detail}`);
+  };
+  requireShape("work_items", /UNIQUE\s*\(\s*session_id\s*,\s*remote_id\s*,\s*projector_version\s*\)/i, "unique session remote projector constraint");
+  requireShape("work_items", /length\s*\(\s*trim\s*\(\s*owner_id\s*\)\s*\)\s*>\s*0/i, "non-empty owner check");
+  requireShape("pending_actions", /state\s+TEXT\s+NOT\s+NULL\s+CHECK\s*\(\s*state\s+IN\s*\(\s*'pending'\s*,\s*'dispatching'\s*,\s*'answered'\s*,\s*'cancelled'\s*,\s*'expired'\s*,\s*'unknown'\s*\)\s*\)/i, "supported state check");
+  requireShape("backfill_jobs", /state\s+TEXT\s+NOT\s+NULL\s+CHECK\s*\(\s*state\s+IN\s*\(\s*'pending'\s*,\s*'running'\s*,\s*'paused'\s*,\s*'complete'\s*,\s*'failed'\s*\)\s*\)/i, "supported state check");
+  requireShape("session_projection_gaps", /reason\s+TEXT\s+NOT\s+NULL\s+CHECK\s*\(\s*reason\s+IN\s*\(\s*'missing'\s*,\s*'out-of-order'\s*,\s*'failed'\s*\)\s*\)/i, "canonical projection gap reason check");
+  requireShape("sse_outbox", /owner_id\s+TEXT\s+NOT\s+NULL\s+CHECK\s*\(\s*length\s*\(\s*trim\s*\(\s*owner_id\s*\)\s*\)\s*>\s*0\s*\)/i, "non-empty owner check");
+  requireShape("sse_outbox", /owner_id\s+TEXT(?![^,)]*\bDEFAULT\b)\s+NOT\s+NULL\s+CHECK\s*\(\s*length\s*\(\s*trim\s*\(\s*owner_id\s*\)\s*\)\s*>\s*0\s*\)/i, "owner without a default and with a non-empty check");
+  requireShape("sse_outbox", /session_id\s+TEXT\s+NOT\s+NULL\s+REFERENCES\s+sessions\s*\(\s*id\s*\)/i, "required session foreign key");
+  for (const [table, target] of [["work_items", "sessions"], ["pending_actions", "sessions"]] as const) {
+    if (!(database.query(`PRAGMA foreign_key_list(${table})`).all() as Array<{ table: string }>).some((key) => key.table === target)) throw new Error(`Unsupported ${table} schema: missing foreign key to ${target}`);
+  }
+  if (!(database.query("PRAGMA foreign_key_list(sse_outbox)").all() as Array<{ table: string; from: string }>).some((key) => key.table === "sessions" && key.from === "session_id")) throw new Error("Unsupported sse_outbox schema: missing foreign key to sessions");
+  for (const index of ["work_items_owner_updated_idx", "pending_actions_state_expires_idx", "sse_outbox_owner_id_idx"]) {
+    if (!database.query("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?").get(index)) throw new Error(`Unsupported schema: missing index ${index}`);
+  }
+};
+const redactPersistedDiagnostics = (database: Database): void => {
+  const projectionFailures = database.query("SELECT session_id, projector_version, seq, reason FROM projection_failures").all() as Array<{ session_id: string; projector_version: string; seq: number; reason: string }>;
+  for (const failure of projectionFailures) database.query("UPDATE projection_failures SET reason = ? WHERE session_id = ? AND projector_version = ? AND seq = ?").run(redactDiagnostic("projection-diagnostics", failure.reason), failure.session_id, failure.projector_version, failure.seq);
+
+  const backfillJobs = database.query("SELECT name, error FROM backfill_jobs WHERE error IS NOT NULL").all() as Array<{ name: string; error: string }>;
+  for (const job of backfillJobs) database.query("UPDATE backfill_jobs SET error = ? WHERE name = ?").run(redactDiagnostic("projection-diagnostics", job.error), job.name);
+
+  const corruptPayloads = database.query("SELECT record_type, record_id, payload_column, payload_json FROM corrupt_payloads").all() as Array<{ record_type: string; record_id: string; payload_column: string; payload_json: string }>;
+  for (const payload of corruptPayloads) database.query("UPDATE corrupt_payloads SET payload_json = ? WHERE record_type = ? AND record_id = ? AND payload_column = ?").run(redactDiagnostic("projection-diagnostics", payload.payload_json), payload.record_type, payload.record_id, payload.payload_column);
+
+  const audits = database.query("SELECT rowid, payload_json FROM audit_log").all() as Array<{ rowid: number; payload_json: string }>;
+  for (const audit of audits) {
+    const safe = redactDiagnostic("audit", audit.payload_json);
+    if (safe !== audit.payload_json) database.query("UPDATE audit_log SET payload_json = ? WHERE rowid = ?").run(json("audit", safe), audit.rowid);
+  }
+};
+
+const repairBackfillJobs = (database: Database): void => {
+  const columns = columnsOf(database, "backfill_jobs");
+  if (columns.size === 0) return;
+  const required = ["name", "cursor_json", "state", "attempts", "started_at", "completed_at", "error", "updated_at"];
+  if (!required.every((column) => columns.has(column))) {
+    database.exec(`
+      ALTER TABLE backfill_jobs RENAME TO backfill_jobs_legacy;
+      INSERT OR IGNORE INTO corrupt_payloads (record_type, record_id, payload_column, payload_json, detected_at)
+        SELECT 'backfill_job', rowid, 'row', '{"reason":"unsupported legacy schema"}', '${now()}'
+        FROM backfill_jobs_legacy;
+      DROP TABLE backfill_jobs_legacy;
+    `);
+    return;
+  }
+  const definition = tableSql(database, "backfill_jobs")?.replace(/\s+/g, " ") ?? "";
+  if (/CHECK\s*\(\s*state\s+IN\s*\(\s*'pending'\s*,\s*'running'\s*,\s*'paused'\s*,\s*'complete'\s*,\s*'failed'\s*\)\s*\)/i.test(definition)) return;
+
+  database.exec(`
+    ALTER TABLE backfill_jobs RENAME TO backfill_jobs_legacy;
+    INSERT OR IGNORE INTO corrupt_payloads (record_type, record_id, payload_column, payload_json, detected_at)
+      SELECT 'backfill_job', COALESCE(name, rowid), 'row',
+        json_object('name', name, 'cursor_json', cursor_json, 'state', state), '${now()}'
+      FROM backfill_jobs_legacy
+      WHERE name IS NULL OR cursor_json IS NULL OR NOT json_valid(cursor_json)
+        OR state NOT IN ('pending', 'running', 'paused', 'complete', 'failed');
+    CREATE TABLE backfill_jobs (
+      name TEXT PRIMARY KEY,
+      cursor_json TEXT NOT NULL,
+      state TEXT NOT NULL CHECK(state IN ('pending','running','paused','complete','failed')),
+      attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+      started_at TEXT,
+      paused_at TEXT,
+      completed_at TEXT,
+      failed_at TEXT,
+      error TEXT,
+      updated_at TEXT NOT NULL
+    );
+    INSERT INTO backfill_jobs (name, cursor_json, state, attempts, started_at, paused_at, completed_at, failed_at, error, updated_at)
+      SELECT name, cursor_json, state, COALESCE(attempts, 0), started_at, ${columns.has("paused_at") ? "paused_at" : "NULL"}, completed_at, ${columns.has("failed_at") ? "failed_at" : "NULL"}, error, updated_at
+      FROM backfill_jobs_legacy
+      WHERE name IS NOT NULL AND cursor_json IS NOT NULL AND json_valid(cursor_json)
+        AND state IN ('pending', 'running', 'paused', 'complete', 'failed')
+        AND COALESCE(attempts, 0) >= 0 AND updated_at IS NOT NULL;
+    DROP TABLE backfill_jobs_legacy;
+  `);
+};
+const migrateProjectionGaps = (database: Database): void => {
+  const existing = tableSql(database, "session_projection_gaps");
+  if (!existing || /reason\s+TEXT\s+NOT\s+NULL\s+CHECK\s*\(\s*reason\s+IN\s*\(\s*'missing'\s*,\s*'out-of-order'\s*,\s*'failed'\s*\)\s*\)/i.test(existing)) return;
+  const invalid = database.query(`
+    SELECT session_id, projector_version, seq, reason, resolved_at, detected_at
+    FROM session_projection_gaps
+    WHERE reason NOT IN ('missing', 'out-of-order', 'failed', 'projection-failure')
+  `).all() as Array<{ session_id: string; projector_version: string; seq: number; reason: string; resolved_at: string | null; detected_at: string }>;
+  for (const row of invalid) {
+    database.query("INSERT OR IGNORE INTO corrupt_payloads (record_type, record_id, payload_column, payload_json, detected_at) VALUES (?, ?, ?, ?, ?)").run(
+      "session_projection_gap",
+      `${row.session_id}:${row.projector_version}:${row.seq}`,
+      "reason",
+      json("projection-diagnostics", { reason: row.reason }),
+      row.detected_at,
+    );
+  }
+  database.exec(`
+    ALTER TABLE session_projection_gaps RENAME TO session_projection_gaps_legacy;
+    CREATE TABLE session_projection_gaps (
+      session_id TEXT NOT NULL REFERENCES sessions(id),
+      projector_version TEXT NOT NULL,
+      seq INTEGER NOT NULL CHECK (seq > 0),
+      reason TEXT NOT NULL CHECK (reason IN ('missing', 'out-of-order', 'failed')),
+      resolved_at TEXT,
+      detected_at TEXT NOT NULL,
+      PRIMARY KEY (session_id, projector_version, seq)
+    ) WITHOUT ROWID;
+    INSERT INTO session_projection_gaps (session_id, projector_version, seq, reason, resolved_at, detected_at)
+      SELECT session_id, projector_version, seq,
+        CASE reason WHEN 'projection-failure' THEN 'failed' ELSE reason END,
+        resolved_at, detected_at
+      FROM session_projection_gaps_legacy
+      WHERE reason IN ('missing', 'out-of-order', 'failed', 'projection-failure');
+    DROP TABLE session_projection_gaps_legacy;
+  `);
+};
 
 const migratePhase0 = (database: Database): void => {
   database.exec(migrationBootstrap);
+  migrateSseOutbox(database);
+  repairBackfillJobs(database);
+  migrateProjectionGaps(database);
+  const quarantineUnsupportedTable = (table: "work_items" | "pending_actions", required: readonly string[]): void => {
+    const columns = columnsOf(database, table);
+    if (columns.size === 0 || required.every((column) => columns.has(column))) return;
+    database.exec(`
+      ALTER TABLE ${table} RENAME TO ${table}_unsupported_legacy;
+      INSERT OR IGNORE INTO corrupt_payloads (record_type, record_id, payload_column, payload_json, detected_at)
+        SELECT '${table}', rowid, 'row', '{"reason":"unsupported legacy schema"}', '${now()}'
+        FROM ${table}_unsupported_legacy;
+      DROP TABLE ${table}_unsupported_legacy;
+    `);
+  };
+  quarantineUnsupportedTable("work_items", ["id", "owner_id", "session_id", "remote_id", "state", "payload_json", "created_at", "updated_at"]);
+  quarantineUnsupportedTable("pending_actions", ["id", "version", "state", "payload_json", "answer_json", "expires_at", "created_at", "updated_at"]);
   addMissingColumns(database, "sessions", [
     "owner_id TEXT", "epoch_owner TEXT", "epoch_claimed_at TEXT", "view_owner TEXT", "view_claimed_at TEXT",
     "control_mode TEXT NOT NULL DEFAULT 'view-only' CHECK (control_mode IN ('view-only', 'controlled'))",
     "origin TEXT NOT NULL DEFAULT 'ondisk-discovery' CHECK (origin IN ('ondisk-discovery', 'coordinator-start', 'coordinator-resume', 'coordinator-continuation', 'opencode-discovery'))",
     "transcript_status TEXT NOT NULL DEFAULT 'available' CHECK (transcript_status IN ('available', 'unreadable'))",
-    "control_cutover_seq INTEGER", "continuation_parent_id TEXT REFERENCES sessions(id)",
+    "control_cutover_seq INTEGER", "continuation_parent_id TEXT REFERENCES sessions(id)", "archived_at TEXT",
+    "archive_reason TEXT CHECK (archive_reason IN ('manual', 'retention'))", "archive_cursor_seq INTEGER CHECK (archive_cursor_seq IS NULL OR archive_cursor_seq > 0)",
+    "active_projector_version TEXT", "title TEXT", "workdir TEXT", "source_created_at TEXT",
   ]);
   addMissingColumns(database, "events", [
     "source_event_id TEXT", "source_revision TEXT", "source_position INTEGER", "content_hash TEXT",
@@ -285,18 +691,73 @@ const migratePhase0 = (database: Database): void => {
   addMissingColumns(database, "commands", [
     "claimed_epoch INTEGER", "claimed_epoch_owner TEXT", "pending_action_id TEXT REFERENCES pending_actions(id)",
   ]);
+  if (columnsOf(database, "pending_actions").size > 0) addMissingColumns(database, "pending_actions", ["owner_id TEXT NOT NULL DEFAULT ''"]);
+  if (columnsOf(database, "work_items").size > 0) addMissingColumns(database, "work_items", ["projector_version TEXT NOT NULL DEFAULT 'legacy'"]);
+  if (columnsOf(database, "audit_log").size > 0) addMissingColumns(database, "audit_log", ["actor_id TEXT", "device_id TEXT", "correlation_id TEXT"]);
+  if (columnsOf(database, "pending_actions").has("owner_id")) database.exec("UPDATE pending_actions SET owner_id = COALESCE((SELECT owner_id FROM sessions WHERE sessions.id = pending_actions.session_id), '') WHERE owner_id = ''");
+  const unresolved = database.query("SELECT id FROM pending_actions WHERE trim(owner_id) = '' OR owner_id IS NULL").all() as Array<{ id: string }>;
+  if (unresolved.length > 0) throw new Error(`Cannot migrate pending actions without a session owner: ${unresolved.map(({ id }) => id).join(",")}`);
+  const pendingSchema = database.query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'pending_actions'").get() as { sql: string } | null;
+  if (pendingSchema?.sql.includes("DEFAULT ''") || !pendingSchema?.sql.includes("length(trim(owner_id)) > 0") || !pendingSchema?.sql.includes("REFERENCES sessions(id)") || !/state\s+TEXT\s+NOT\s+NULL\s+CHECK\s*\(\s*state\s+IN\s*\(\s*'pending'\s*,\s*'dispatching'\s*,\s*'answered'\s*,\s*'cancelled'\s*,\s*'expired'\s*,\s*'unknown'\s*\)\s*\)/i.test(pendingSchema.sql)) {
+    database.exec(`
+      ALTER TABLE pending_actions RENAME TO pending_actions_owner_legacy;
+      CREATE TABLE pending_actions (
+        id TEXT PRIMARY KEY,
+        session_id TEXT REFERENCES sessions(id),
+        owner_id TEXT NOT NULL CHECK (length(trim(owner_id)) > 0),
+        remote_ref TEXT,
+        version INTEGER NOT NULL CHECK (version >= 1),
+        state TEXT NOT NULL CHECK (state IN ('pending', 'dispatching', 'answered', 'cancelled', 'expired', 'unknown')),
+        payload_json TEXT NOT NULL,
+        answer_json TEXT,
+        expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO pending_actions (id, session_id, owner_id, remote_ref, version, state, payload_json, answer_json, expires_at, created_at, updated_at)
+        SELECT id, session_id, owner_id, remote_ref, version, state, payload_json, answer_json, expires_at, created_at, updated_at
+        FROM pending_actions_owner_legacy;
+      DROP TABLE pending_actions_owner_legacy;
+    `);
+  }
+  const commandForeignKeys = database.query("PRAGMA foreign_key_list(commands)").all() as Array<{ table: string }>;
+  if (commandForeignKeys.some(({ table }) => table === "pending_actions_owner_legacy")) {
+    database.exec(`
+      ALTER TABLE commands RENAME TO commands_pending_action_legacy;
+      CREATE TABLE commands (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id),
+        idempotency_key TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL CHECK (state IN ('accepted', 'dispatching', 'remote-confirmed', 'applied', 'failed', 'unknown')),
+        correlation_id TEXT,
+        attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
+        lease_expires_at TEXT,
+        claimed_epoch INTEGER,
+        claimed_epoch_owner TEXT,
+        pending_action_id TEXT REFERENCES pending_actions(id),
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO commands (id, session_id, idempotency_key, state, correlation_id, attempt, lease_expires_at, claimed_epoch, claimed_epoch_owner, pending_action_id, payload_json, created_at, updated_at)
+        SELECT id, session_id, idempotency_key, state, correlation_id, attempt, lease_expires_at, claimed_epoch, claimed_epoch_owner, pending_action_id, payload_json, created_at, updated_at
+        FROM commands_pending_action_legacy;
+      DROP TABLE commands_pending_action_legacy;
+    `);
+  }
 };
 
 interface SessionRow {
   id: string; owner_id: string | null; adapter: string; remote_id: string; status: SessionStatus;
   reconciliation_epoch: number; reconciled: number; remote_revision: string | null;
-  control_mode: SessionControlMode; origin: SessionOrigin; transcript_status: TranscriptStatus;
-  created_at: string; updated_at: string;
+  control_mode: SessionControlMode; origin: SessionOrigin; transcript_status: TranscriptStatus; active_projector_version: string | null; archived_at: string | null;
+  title: string | null; workdir: string | null; source_created_at: string | null; created_at: string; updated_at: string;
 }
 interface EventRow { session_id: string; seq: number; type: string; payload_json: string; created_at: string; }
 interface CommandRow { id: string; session_id: string; idempotency_key: string; state: CommandState; correlation_id: string | null; attempt: number; lease_expires_at: string | null; payload_json: string; created_at: string; updated_at: string; }
-interface AuditRow { id: number; action: string; session_id: string | null; command_id: string | null; payload_json: string; created_at: string; }
-interface PendingActionRow { id: string; version: number; state: PendingActionState; payload_json: string; answer_json: string | null; expires_at: string; created_at: string; updated_at: string; }
+interface AuditRow { id: number; action: string; session_id: string | null; command_id: string | null; actor_id: string | null; device_id: string | null; correlation_id: string | null; payload_json: string; created_at: string; }
+interface PendingActionRow { id: string; session_id: string | null; owner_id: string; version: number; state: PendingActionState; payload_json: string; answer_json: string | null; expires_at: string; created_at: string; updated_at: string; }
+interface WorkItemRow { id: string; owner_id: string; session_id: string; remote_id: string; state: string; projector_version: string; payload_json: string; created_at: string; updated_at: string; }
 interface PushSubscriptionRow { endpoint_hash: string; owner_id: string; encrypted_material: string; expires_at: string | null; created_at: string; updated_at: string; }
 interface DevicePairingRow { id: string; owner_id: string; code_hash: string; expires_at: string; attempts: number; max_attempts: number; consumed_at: string | null; created_at: string; }
 interface DeviceCredentialRow { id: string; owner_id: string; device_name: string; credential_hash: string; created_at: string; last_used_at: string | null; revoked_at: string | null; }
@@ -311,12 +772,12 @@ export type DeviceCredential = {
 };
 
 const now = (): string => new Date().toISOString();
-const json = (value: unknown): string => {
-  const serialized = JSON.stringify(value);
-  if (typeof serialized !== "string") throw new TypeError("Persistent payloads must serialize to JSON values");
-  assertSecretFree(JSON.parse(serialized));
-  return serialized;
-};
+const SSE_OUTBOX_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
+const SSE_OUTBOX_MAX_ROWS_PER_OWNER = 10_000;
+const json = (sink: SinkKind, value: unknown): string => JSON.stringify(redactForSink(sink, value));
+/** Commands are durable but intentionally not an authoritative §3 sink. */
+const commandJson = (value: unknown): string => JSON.stringify(redactForCommand(value));
+const projectionGapReason = (reason: "out-of-order" | "failed"): string => redactForSink("projection-diagnostics", reason) as string;
 const decodeJson = <T>(value: string, record: string): T => {
   try {
     return JSON.parse(value) as T;
@@ -330,12 +791,13 @@ const asSession = (row: SessionRow): Session => {
     id: row.id, ownerId: row.owner_id, adapter: row.adapter, remoteId: row.remote_id,
     status: row.status, reconciliationEpoch: row.reconciliation_epoch, reconciled: row.reconciled === 1,
     remoteRevision: row.remote_revision, controlMode: row.control_mode, origin: row.origin,
-    transcriptStatus: row.transcript_status, createdAt: row.created_at, updatedAt: row.updated_at,
+    transcriptStatus: row.transcript_status, activeProjectorVersion: row.active_projector_version, archivedAt: row.archived_at, title: row.title, workdir: row.workdir,
+    sourceCreatedAt: row.source_created_at, createdAt: row.created_at, updatedAt: row.updated_at,
   };
 };
 const asEvent = <T>(row: EventRow): SessionEvent<T> => ({ sessionId: row.session_id, seq: row.seq, type: row.type, payload: decodeJson<T>(row.payload_json, `event ${row.session_id}:${row.seq}`), createdAt: row.created_at });
 const asCommand = <T>(row: CommandRow): Command<T> => ({ id: row.id, sessionId: row.session_id, idempotencyKey: row.idempotency_key, state: row.state, correlationId: row.correlation_id, attempt: row.attempt, leaseExpiresAt: row.lease_expires_at, payload: decodeJson<T>(row.payload_json, `command ${row.id}`), createdAt: row.created_at, updatedAt: row.updated_at });
-const asAudit = <T>(row: AuditRow): AuditEntry<T> => ({ id: row.id, action: row.action, sessionId: row.session_id, commandId: row.command_id, payload: decodeJson<T>(row.payload_json, `audit ${row.id}`), createdAt: row.created_at });
+const asAudit = <T>(row: AuditRow): AuditEntry<T> => ({ id: row.id, action: row.action, sessionId: row.session_id, commandId: row.command_id, actorId: row.actor_id, deviceId: row.device_id, correlationId: row.correlation_id, payload: decodeJson<T>(row.payload_json, `audit ${row.id}`), createdAt: row.created_at });
 const asPushSubscription = (row: PushSubscriptionRow): StoredPushSubscription => ({ ownerId: row.owner_id, endpointHash: row.endpoint_hash, encryptedMaterial: row.encrypted_material, expiresAt: row.expires_at, createdAt: row.created_at, updatedAt: row.updated_at });
 const asDeviceCredential = (row: DeviceCredentialRow): DeviceCredential => ({ id: row.id, ownerId: row.owner_id, deviceName: row.device_name, createdAt: row.created_at, lastUsedAt: row.last_used_at, revokedAt: row.revoked_at });
 
@@ -343,17 +805,31 @@ export class CoreDatabase {
   readonly sqlite: Database;
   readonly filename: string;
   private transactionDepth = 0;
+  private readonly readOnly: boolean;
 
-  constructor(filename = ":memory:") {
+  constructor(filename = ":memory:", options: { readonly?: boolean } = {}) {
     this.filename = filename;
-    this.sqlite = new Database(filename, { create: true, strict: true });
-    this.sqlite.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
+    this.readOnly = options.readonly === true;
+    this.sqlite = new Database(filename, { create: !this.readOnly, readonly: this.readOnly, strict: true });
+    this.sqlite.exec(this.readOnly ? "PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;" : "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
+    if (this.readOnly) {
+      validateSchema(this.sqlite);
+      return;
+    }
     this.sqlite.exec("BEGIN IMMEDIATE");
     try {
       migratePhase0(this.sqlite);
       this.sqlite.exec(schema);
+      preflightM2Schema(this.sqlite);
+      redactPersistedDiagnostics(this.sqlite);
+      validateSchema(this.sqlite);
       this.sqlite.query("INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (1, 'phase-0-runtime-foundation', ?)").run(now());
       this.sqlite.exec("PRAGMA user_version = 1");
+      this.sqlite.query("INSERT INTO schema_fence (name, min_version, active, updated_at) VALUES ('phase-0-runtime-foundation', 1, 1, ?) ON CONFLICT(name) DO UPDATE SET min_version = excluded.min_version, active = excluded.active, updated_at = excluded.updated_at").run(now());
+      this.sqlite.query("INSERT INTO schema_fence (name, min_version, active, updated_at) VALUES ('min_binary_version', 1, 1, ?) ON CONFLICT(name) DO UPDATE SET min_version = excluded.min_version, active = excluded.active, updated_at = excluded.updated_at").run(now());
+      this.sqlite.query("INSERT OR IGNORE INTO backfill_jobs (name, cursor_json, state, updated_at) VALUES ('pending-actions-owner', '{}', 'complete', ?)").run(now());
+      this.sqlite.query("INSERT OR IGNORE INTO backfill_jobs (name, cursor_json, state, updated_at) VALUES ('historical-projection-v1', '{}', 'pending', ?)").run(now());
+      this.sqlite.query("INSERT OR IGNORE INTO backfill_jobs (name, cursor_json, state, updated_at) VALUES ('historical-archive-backfill-v1', '{}', 'pending', ?)").run(now());
       this.sqlite.exec("COMMIT");
     } catch (cause) {
       this.sqlite.exec("ROLLBACK");
@@ -365,7 +841,7 @@ export class CoreDatabase {
 
   close(): void { this.sqlite.close(); }
   private quarantine(recordType: string, recordId: string, payloadColumn: string, payload: string): void {
-    this.sqlite.query("INSERT OR IGNORE INTO corrupt_payloads (record_type, record_id, payload_column, payload_json, detected_at) VALUES (?, ?, ?, ?, ?)").run(recordType, recordId, payloadColumn, payload, now());
+    this.sqlite.query("INSERT OR IGNORE INTO corrupt_payloads (record_type, record_id, payload_column, payload_json, detected_at) VALUES (?, ?, ?, ?, ?)").run(recordType, recordId, payloadColumn, json("projection-diagnostics", { reason: redactDiagnostic("projection-diagnostics", payload) }), now());
   }
   private corrupt<T>(recordType: string, recordId: string, payloadColumn: string, payload: string, decode: () => T): T {
     try {
@@ -379,9 +855,31 @@ export class CoreDatabase {
   private pendingAction<T, A>(row: PendingActionRow): PendingAction<T, A> {
     const payload = this.corrupt("pending_action", row.id, "payload_json", row.payload_json, () => decodeJson<T>(row.payload_json, `pending action ${row.id}`));
     const answer = row.answer_json === null ? null : this.corrupt("pending_action", row.id, "answer_json", row.answer_json, () => decodeJson<A>(row.answer_json!, `pending action answer ${row.id}`));
-    return { id: row.id, version: row.version, state: row.state, payload, answer, expiresAt: row.expires_at, createdAt: row.created_at, updatedAt: row.updated_at };
+    return { id: row.id, sessionId: row.session_id, ownerId: row.owner_id, version: row.version, state: row.state, payload, answer, expiresAt: row.expires_at, createdAt: row.created_at, updatedAt: row.updated_at };
+  }
+  private workItem<T>(row: WorkItemRow): WorkItem<T> {
+    return { id: row.id, ownerId: row.owner_id, sessionId: row.session_id, remoteId: row.remote_id, state: row.state, projectorVersion: row.projector_version, payload: this.corrupt("work_item", row.id, "payload_json", row.payload_json, () => decodeJson<T>(row.payload_json, `work item ${row.id}`)), createdAt: row.created_at, updatedAt: row.updated_at };
+  }
+  private enqueueMobileState(ownerId: string, sessionId: string | null, type: string, payload: unknown): void {
+    if (sessionId === null) return;
+    const session = this.getSessionForOwner(sessionId, ownerId);
+    if (!session) throw new Error("SSE state requires an owned session");
+    this.sqlite.query("INSERT INTO sse_outbox (owner_id, session_id, event_json, created_at) VALUES (?, ?, ?, ?)").run(ownerId, session.id, json("sse-outbox", { type, sessionId, payload }), now());
+    this.pruneSseOutbox(ownerId);
+  }
+  private pruneSseOutbox(ownerId: string): void {
+    const cutoff = new Date(Date.now() - SSE_OUTBOX_RETENTION_MS).toISOString();
+    this.sqlite.query("DELETE FROM sse_outbox WHERE owner_id = ? AND created_at < ?").run(ownerId, cutoff);
+    this.sqlite.query("DELETE FROM sse_outbox WHERE id IN (SELECT id FROM sse_outbox WHERE owner_id = ? ORDER BY id DESC LIMIT -1 OFFSET ?)").run(ownerId, SSE_OUTBOX_MAX_ROWS_PER_OWNER);
   }
 
+  private quarantineLateEvent(session: Session, seq: number): void {
+    this.sqlite.query(`
+      INSERT OR IGNORE INTO late_event_quarantine (
+        owner_id, session_id, seq, projector_version, reason, state, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, 'late-event', 'quarantined', ?, ?)
+    `).run(session.ownerId, session.id, seq, session.activeProjectorVersion ?? "legacy", now(), now());
+  }
   transaction<T>(work: () => T): T {
     const savepoint = `core_transaction_${this.transactionDepth}`;
     const nested = this.transactionDepth > 0;
@@ -402,32 +900,51 @@ export class CoreDatabase {
 
   createSession(input: Pick<Session, "id" | "ownerId" | "adapter" | "remoteId">): Session {
     if (!input.ownerId) throw new TypeError("Session owner is required");
-    const timestamp = now();
-    this.sqlite.query("INSERT INTO sessions (id, owner_id, adapter, remote_id, status, control_mode, origin, created_at, updated_at) VALUES (?, ?, ?, ?, 'active', 'controlled', 'coordinator-start', ?, ?)").run(input.id, input.ownerId, input.adapter, input.remoteId, timestamp, timestamp);
-    return this.getSession(input.id)!;
+    return this.transaction(() => {
+      const timestamp = now();
+      this.sqlite.query("INSERT INTO sessions (id, owner_id, adapter, remote_id, status, control_mode, origin, created_at, updated_at) VALUES (?, ?, ?, ?, 'active', 'controlled', 'coordinator-start', ?, ?)").run(input.id, input.ownerId, input.adapter, input.remoteId, timestamp, timestamp);
+      const session = this.getSession(input.id)!;
+      this.enqueueMobileState(input.ownerId, session.id, "session.created", session);
+      return session;
+    });
   }
 
   upsertDiscoveredSession(input: {
     id: string; ownerId: string; adapter: "gjc"; remoteId: string; controlMode: "view-only";
     origin: "ondisk-discovery"; transcriptStatus: TranscriptStatus; updatedAt: string;
+    title?: string | null; workdir?: string | null; sourceCreatedAt?: string | null;
   }): Session {
     if (!input.ownerId) throw new TypeError("Session owner is required");
-    const createdAt = now();
-    this.sqlite.query(`
-      INSERT INTO sessions (
-        id, owner_id, adapter, remote_id, status, control_mode, origin, transcript_status, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
-      ON CONFLICT(adapter, remote_id) DO UPDATE SET
-        updated_at = excluded.updated_at,
-        transcript_status = excluded.transcript_status
-    `).run(
-      input.id, input.ownerId, input.adapter, input.remoteId, input.controlMode, input.origin,
-      input.transcriptStatus, createdAt, input.updatedAt,
-    );
-    const row = this.sqlite.query("SELECT * FROM sessions WHERE adapter = ? AND remote_id = ? AND owner_id IS NOT NULL")
-      .get(input.adapter, input.remoteId) as SessionRow | null;
-    if (!row) throw new Error("Discovered session belongs to another owner or is quarantined");
-    return asSession(row);
+    return this.transaction(() => {
+      const existing = this.sqlite.query("SELECT * FROM sessions WHERE adapter = ? AND remote_id = ?").get(input.adapter, input.remoteId) as SessionRow | null;
+      if (existing?.owner_id && existing.owner_id !== input.ownerId) throw new Error("Discovered session belongs to another owner or is quarantined");
+      const changed = !existing || existing.transcript_status !== input.transcriptStatus ||
+        (input.title !== undefined && input.title !== existing.title) ||
+        (input.workdir !== undefined && input.workdir !== existing.workdir) ||
+        (input.sourceCreatedAt !== undefined && input.sourceCreatedAt !== existing.source_created_at);
+      const createdAt = now();
+      this.sqlite.query(`
+        INSERT INTO sessions (
+          id, owner_id, adapter, remote_id, status, control_mode, origin, transcript_status,
+          title, workdir, source_created_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(adapter, remote_id) DO UPDATE SET
+          updated_at = excluded.updated_at,
+          transcript_status = excluded.transcript_status,
+          title = COALESCE(excluded.title, sessions.title),
+          workdir = COALESCE(excluded.workdir, sessions.workdir),
+          source_created_at = COALESCE(excluded.source_created_at, sessions.source_created_at)
+      `).run(
+        input.id, input.ownerId, input.adapter, input.remoteId, input.controlMode, input.origin,
+        input.transcriptStatus, input.title ?? null, input.workdir ?? null, input.sourceCreatedAt ?? null, createdAt, input.updatedAt,
+      );
+      const row = this.sqlite.query("SELECT * FROM sessions WHERE adapter = ? AND remote_id = ? AND owner_id = ?")
+        .get(input.adapter, input.remoteId, input.ownerId) as SessionRow | null;
+      if (!row) throw new Error("Discovered session belongs to another owner or is quarantined");
+      const session = asSession(row);
+      if (changed) this.enqueueMobileState(input.ownerId, session.id, existing ? "session.discovered-updated" : "session.discovered", session);
+      return session;
+    });
   }
 
   claimView(input: { sessionId: string; owner: string; claimedAt: string; staleBefore: string }): boolean {
@@ -476,9 +993,11 @@ export class CoreDatabase {
             source_revision, source_position, content_hash, source
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
-          input.sessionId, nextSeq, event.type, json(event.payload), event.createdAt, event.sourceEventId,
+          input.sessionId, nextSeq, event.type, json("events", event.payload), event.createdAt, event.sourceEventId,
           event.sourceRevision, event.sourcePosition, event.contentHash, input.source,
         );
+        const archivedSession = this.getSession(input.sessionId);
+        if (archivedSession?.archivedAt) this.quarantineLateEvent(archivedSession, nextSeq);
         inserted++;
       }
       this.sqlite.query(`
@@ -511,6 +1030,53 @@ export class CoreDatabase {
       return result.changes === 1 ? this.getSessionForOwner(id, ownerId) : null;
     });
   }
+  getSessionByRemoteIdForOwner(ownerId: string, adapter: string, remoteId: string): Session | null {
+    const row = this.sqlite.query("SELECT * FROM sessions WHERE owner_id = ? AND adapter = ? AND remote_id = ?").get(ownerId, adapter, remoteId) as SessionRow | null;
+    return row ? asSession(row) : null;
+  }
+  listArchivedSessionsForOwner(ownerId: string): Session[] {
+    return (this.sqlite.query("SELECT * FROM sessions WHERE owner_id = ? AND archived_at IS NOT NULL ORDER BY archived_at DESC").all(ownerId) as SessionRow[]).map(asSession);
+  }
+  archiveSessionForOwner(input: { id: string; ownerId: string; archivedAt?: string; archiveReason?: "manual" | "retention"; actorId?: "owner" | "system"; deviceId?: string | null; correlationId?: string }): Session | null {
+    if (!input.ownerId) throw new TypeError("Session owner is required");
+    this.validateTransitionAudit(input);
+    return this.transaction(() => {
+      const session = this.getSessionForOwner(input.id, input.ownerId);
+      if (!session) return null;
+      if (session.archivedAt) return session;
+      const timestamp = input.archivedAt ?? now();
+      const eligibility = this.canArchiveSessionForOwner(input.id, input.ownerId, timestamp);
+      if (!eligibility.eligible) throw new Error(`Session cannot be archived: ${eligibility.blockers.join(",")}`);
+      const cursor = (this.sqlite.query("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM events WHERE session_id = ?").get(input.id) as { seq: number }).seq;
+      const changed = this.sqlite.query("UPDATE sessions SET archived_at = ?, archive_reason = ?, archive_cursor_seq = ?, updated_at = ? WHERE id = ? AND owner_id = ? AND archived_at IS NULL AND reconciliation_epoch = ? AND active_projector_version IS ?").run(timestamp, input.archiveReason ?? "manual", cursor, timestamp, input.id, input.ownerId, session.reconciliationEpoch, session.activeProjectorVersion);
+      if (changed.changes !== 1) throw new Error("Archive transition lost");
+      const updated = this.getSessionForOwner(input.id, input.ownerId);
+      if (!updated) throw new Error("Archived session disappeared");
+      this.writeTransitionAudit("session.archived", updated, input);
+      this.enqueueMobileState(input.ownerId, updated.id, "session.archived", updated);
+      return updated;
+    });
+  }
+  archiveSessionsBeforeForOwner(input: { ownerId: string; sourceCreatedAtBefore: string; archivedAt?: string }): Session[] {
+    if (!input.ownerId) throw new TypeError("Session owner is required");
+    return this.transaction(() => {
+      const timestamp = input.archivedAt ?? now();
+      const correlationId = crypto.randomUUID();
+      const candidates = this.sqlite.query(`
+        SELECT * FROM sessions
+        WHERE owner_id = ? AND archived_at IS NULL
+          AND source_created_at IS NOT NULL AND source_created_at < ?
+        ORDER BY source_created_at ASC
+      `).all(input.ownerId, input.sourceCreatedAtBefore) as SessionRow[];
+      const archived: Session[] = [];
+      for (const candidate of candidates) {
+        if (!this.canArchiveSessionForOwner(candidate.id, input.ownerId, timestamp).eligible) continue;
+        const result = this.archiveSessionForOwner({ id: candidate.id, ownerId: input.ownerId, archivedAt: timestamp, archiveReason: "retention", actorId: "system", correlationId });
+        if (result) archived.push(result);
+      }
+      return archived;
+    });
+  }
 
   listSessionsForOwner(ownerId: string): Session[] {
     const rows = this.sqlite.query("SELECT * FROM sessions WHERE owner_id = ? ORDER BY updated_at DESC").all(ownerId) as SessionRow[];
@@ -528,11 +1094,14 @@ export class CoreDatabase {
     return this.transaction(() => {
       const session = this.getSession(sessionId);
       if (!session) throw new Error("Session does not exist");
-      if (session.status === "terminal") throw new Error("Terminal sessions are immutable");
+      if (session.status === "terminal" && !session.archivedAt) throw new Error("Terminal sessions are immutable");
       const row = this.sqlite.query("SELECT COALESCE(MAX(seq), 0) AS seq FROM events WHERE session_id = ?").get(sessionId) as { seq: number };
-      const event: EventRow = { session_id: sessionId, seq: row.seq + 1, type, payload_json: json(payload), created_at: now() };
-      this.sqlite.query("INSERT INTO events (session_id, seq, type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)").run(event.session_id, event.seq, event.type, event.payload_json, event.created_at);
-      return asEvent<T>(event);
+      const event: EventRow = { session_id: sessionId, seq: row.seq + 1, type, payload_json: json("events", payload), created_at: now() };
+      this.sqlite.query("INSERT INTO events (session_id, seq, type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)").run(event.session_id, event.seq, event.type, json("events", payload), event.created_at);
+      if (session.archivedAt) this.quarantineLateEvent(session, event.seq);
+      const appended = asEvent<T>(event);
+      this.enqueueMobileState(session.ownerId, sessionId, "event.appended", appended);
+      return appended;
     });
   }
   listEvents<T>(sessionId: string, after = 0): SessionEvent<T>[] {
@@ -581,9 +1150,11 @@ export class CoreDatabase {
     if (session.status === "terminal") throw new Error("Terminal sessions are immutable");
     if (!session.reconciled) throw new Error("Mutation rejected while session requires reconciliation");
     const timestamp = now();
-    const payload = json(input.payload);
+    const payload = commandJson(input.payload);
     this.sqlite.query("INSERT INTO commands (id, session_id, idempotency_key, state, payload_json, created_at, updated_at) VALUES (?, ?, ?, 'accepted', ?, ?, ?)").run(input.id, input.sessionId, input.idempotencyKey, payload, timestamp, timestamp);
-    return { command: this.getCommand<T>(input.id)!, duplicate: false };
+    const command = this.getCommand<T>(input.id)!;
+    this.enqueueMobileState(session.ownerId, session.id, "command.accepted", command);
+    return { command, duplicate: false };
   }
 
   getCommand<T>(id: string): Command<T> | null {
@@ -629,29 +1200,61 @@ export class CoreDatabase {
       const updated = this.sqlite.query(`UPDATE commands SET state = ?, lease_expires_at = NULL, updated_at = ? WHERE id = ? AND state IN (${expected.map(() => "?").join(", ")})`).run(state, now(), id, ...expected);
       if (updated.changes !== 1) throw new Error("Command transition lost");
       this.appendEvent(command.sessionId, eventType, eventPayload);
-      return this.getCommand<T>(id)!;
+      const transitioned = this.getCommand<T>(id)!;
+      const session = this.getSession(command.sessionId)!;
+      this.enqueueMobileState(session.ownerId, session.id, "command.updated", transitioned);
+      return transitioned;
     });
   }
 
-  createPendingAction<T>(input: { id: string; payload: T; expiresAt: string }): PendingAction<T> {
-    const timestamp = now();
-    this.sqlite.query("INSERT INTO pending_actions (id, version, state, payload_json, expires_at, created_at, updated_at) VALUES (?, 1, 'pending', ?, ?, ?, ?)").run(input.id, json(input.payload), input.expiresAt, timestamp, timestamp);
-    return this.getPendingAction<T>(input.id)!;
+  createPendingAction<T>(input: { id: string; ownerId?: string; sessionId?: string; remoteRef?: string; payload: T; expiresAt: string }): PendingAction<T> {
+    const ownerId = input.ownerId ?? (input.sessionId ? this.getSession(input.sessionId)?.ownerId : undefined);
+    if (!ownerId?.trim()) throw new TypeError("Pending action owner is required");
+    if (input.sessionId && !this.getSessionForOwner(input.sessionId, ownerId)) throw new Error("Session does not exist for owner");
+    return this.transaction(() => {
+      const timestamp = now();
+      this.sqlite.query("INSERT INTO pending_actions (id, session_id, owner_id, remote_ref, version, state, payload_json, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, 1, 'pending', ?, ?, ?, ?)").run(input.id, input.sessionId ?? null, ownerId, input.remoteRef ?? null, json("pending-actions", input.payload), input.expiresAt, timestamp, timestamp);
+      const action = this.getPendingAction<T>(input.id)!;
+      this.enqueueMobileState(ownerId, action.sessionId, "pending-action.created", action);
+      return action;
+    });
+  }
+  createPendingActionForOwner<T>(input: { id: string; ownerId: string; sessionId: string; remoteRef?: string; payload: T; expiresAt: string }): PendingAction<T> {
+    return this.createPendingAction(input);
   }
 
   getPendingAction<T, A = unknown>(id: string): PendingAction<T, A> | null {
     const row = this.sqlite.query("SELECT * FROM pending_actions WHERE id = ?").get(id) as PendingActionRow | null;
     return row ? this.pendingAction<T, A>(row) : null;
   }
-
-  updatePendingAction<T, A>(input: { id: string; expectedVersion: number; state: Exclude<PendingActionState, "pending">; answer?: A; updatedAt: string }): PendingAction<T, A> | null {
-    const result = this.sqlite.query("UPDATE pending_actions SET state = ?, answer_json = ?, version = version + 1, updated_at = ? WHERE id = ? AND state = 'pending' AND version = ?").run(input.state, input.answer === undefined ? null : json(input.answer), input.updatedAt, input.id, input.expectedVersion);
-    return result.changes === 1 ? this.getPendingAction<T, A>(input.id) : null;
+  getPendingActionForOwner<T, A = unknown>(id: string, ownerId: string): PendingAction<T, A> | null {
+    const row = this.sqlite.query("SELECT * FROM pending_actions WHERE id = ? AND owner_id = ?").get(id, ownerId) as PendingActionRow | null;
+    return row ? this.pendingAction<T, A>(row) : null;
   }
 
-  writeAudit<T>(input: { action: string; sessionId?: string; commandId?: string; payload: T }): AuditEntry<T> {
-    const payload = json(input.payload); const timestamp = now();
-    const result = this.sqlite.query("INSERT INTO audit_log (action, session_id, command_id, payload_json, created_at) VALUES (?, ?, ?, ?, ?)").run(input.action, input.sessionId ?? null, input.commandId ?? null, payload, timestamp);
+  updatePendingAction<T, A>(input: { id: string; expectedVersion: number; state: Exclude<PendingActionState, "pending">; answer?: A; updatedAt: string }): PendingAction<T, A> | null {
+    return this.transaction(() => {
+      const result = this.sqlite.query("UPDATE pending_actions SET state = ?, answer_json = ?, version = version + 1, updated_at = ? WHERE id = ? AND state = 'pending' AND version = ?").run(input.state, input.answer === undefined ? null : json("pending-actions", input.answer), input.updatedAt, input.id, input.expectedVersion);
+      const action = result.changes === 1 ? this.getPendingAction<T, A>(input.id) : null;
+      if (action) this.enqueueMobileState(action.ownerId, action.sessionId, "pending-action.updated", action);
+      return action;
+    });
+  }
+  private validateTransitionAudit(input: { actorId?: "owner" | "system"; deviceId?: string | null; correlationId?: string }): void {
+    if (input.actorId === "owner" && (!input.deviceId || !input.correlationId?.trim())) throw new TypeError("Owner transition audit requires a device and correlation");
+    if (input.actorId === "system" && input.deviceId !== undefined && input.deviceId !== null) throw new TypeError("System transition audit cannot have a device");
+  }
+  private writeTransitionAudit(action: string, session: Session, input: { actorId?: "owner" | "system"; deviceId?: string | null; correlationId?: string }): void {
+    const actorId = input.actorId ?? "system";
+    this.writeAudit({
+      action, sessionId: session.id, actorId, deviceId: actorId === "system" ? undefined : input.deviceId ?? undefined,
+      correlationId: input.correlationId ?? crypto.randomUUID(), payload: { result: action === "session.archived" ? "archived" : "unarchived" },
+    });
+  }
+
+  writeAudit<T>(input: { action: string; sessionId?: string; commandId?: string; actorId?: string; deviceId?: string; correlationId?: string; payload: T }): AuditEntry<T> {
+    const timestamp = now();
+    const result = this.sqlite.query("INSERT INTO audit_log (action, session_id, command_id, actor_id, device_id, correlation_id, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(input.action, input.sessionId ?? null, input.commandId ?? null, input.actorId ?? null, input.deviceId ?? null, input.correlationId ?? null, json("audit", typeof input.payload === "string" ? redactDiagnostic("audit", input.payload) : input.payload), timestamp);
     const row = this.sqlite.query("SELECT * FROM audit_log WHERE id = ?").get(result.lastInsertRowid) as AuditRow;
     return asAudit<T>(row);
   }
@@ -663,12 +1266,13 @@ export class CoreDatabase {
     if (!/^[a-f0-9]{64}$/.test(input.endpointHash)) throw new TypeError("Push endpoint hash must be a SHA-256 hex digest");
     if (!input.ownerId) throw new TypeError("Push subscription owner is required");
     if (!input.encryptedMaterial) throw new TypeError("Push subscription material is required");
+    const safe = redactForSink("push", input) as typeof input;
     return this.transaction(() => {
-      const existing = this.sqlite.query("SELECT * FROM push_subscriptions WHERE endpoint_hash = ?").get(input.endpointHash) as PushSubscriptionRow | null;
-      if (existing && existing.owner_id !== input.ownerId) throw new Error("Push endpoint belongs to another owner");
+      const existing = this.sqlite.query("SELECT * FROM push_subscriptions WHERE endpoint_hash = ?").get(safe.endpointHash) as PushSubscriptionRow | null;
+      if (existing && existing.owner_id !== safe.ownerId) throw new Error("Push endpoint belongs to another owner");
       const timestamp = now();
-      this.sqlite.query("INSERT INTO push_subscriptions (endpoint_hash, owner_id, encrypted_material, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(endpoint_hash) DO UPDATE SET encrypted_material = excluded.encrypted_material, expires_at = excluded.expires_at, updated_at = excluded.updated_at").run(input.endpointHash, input.ownerId, input.encryptedMaterial, input.expiresAt ?? null, timestamp, timestamp);
-      const stored = this.getStoredPushSubscription(input.ownerId, input.endpointHash);
+      this.sqlite.query("INSERT INTO push_subscriptions (endpoint_hash, owner_id, encrypted_material, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(endpoint_hash) DO UPDATE SET encrypted_material = excluded.encrypted_material, expires_at = excluded.expires_at, updated_at = excluded.updated_at").run((redactForSink("push", input) as typeof input).endpointHash, (redactForSink("push", input) as typeof input).ownerId, (redactForSink("push", input) as typeof input).encryptedMaterial, (redactForSink("push", input) as typeof input).expiresAt ?? null, timestamp, timestamp);
+      const stored = this.getStoredPushSubscription(safe.ownerId, safe.endpointHash);
       if (!stored) throw new Error("Push subscription was not stored");
       const { encryptedMaterial: _encryptedMaterial, ...subscription } = stored;
       return subscription;
@@ -721,7 +1325,7 @@ export class CoreDatabase {
     if (!/^[a-f0-9]{64}$/.test(credentialHash)) return null;
     const row = this.sqlite.query("SELECT * FROM device_credentials WHERE credential_hash = ? AND revoked_at IS NULL").get(credentialHash) as DeviceCredentialRow | null;
     if (!row) return null;
-    this.sqlite.query("UPDATE device_credentials SET last_used_at = ? WHERE id = ?").run(at, row.id);
+    if (!this.readOnly) this.sqlite.query("UPDATE device_credentials SET last_used_at = ? WHERE id = ?").run(at, row.id);
     return { ...asDeviceCredential(row), lastUsedAt: at };
   }
 
@@ -736,6 +1340,325 @@ export class CoreDatabase {
   listPendingActions<T, A = unknown>(): PendingAction<T, A>[] {
     const rows = this.sqlite.query("SELECT * FROM pending_actions ORDER BY created_at ASC").all() as PendingActionRow[];
     return rows.map((row) => this.pendingAction<T, A>(row));
+  }
+  listPendingActionsForOwner<T, A = unknown>(ownerId: string): PendingAction<T, A>[] {
+    const rows = this.sqlite.query("SELECT * FROM pending_actions WHERE owner_id = ? ORDER BY created_at ASC").all(ownerId) as PendingActionRow[];
+    return rows.map((row) => this.pendingAction<T, A>(row));
+  }
+  activateProjectorVersion(input: { sessionId: string; ownerId: string; projectorVersion: string; expectedCurrentVersion?: string | null }): boolean {
+    if (!input.ownerId || !input.projectorVersion) return false;
+    return this.transaction(() => {
+      const timestamp = now();
+      const changed = input.expectedCurrentVersion == null
+        ? this.sqlite.query("UPDATE sessions SET active_projector_version = ?, reconciliation_epoch = reconciliation_epoch + 1, updated_at = ? WHERE id = ? AND owner_id = ? AND active_projector_version IS NOT ? AND (active_projector_version IS NULL OR active_projector_version = 'legacy')").run(input.projectorVersion, timestamp, input.sessionId, input.ownerId, input.projectorVersion)
+        : this.sqlite.query("UPDATE sessions SET active_projector_version = ?, reconciliation_epoch = reconciliation_epoch + 1, updated_at = ? WHERE id = ? AND owner_id = ? AND active_projector_version = ? AND active_projector_version IS NOT ?").run(input.projectorVersion, timestamp, input.sessionId, input.ownerId, input.expectedCurrentVersion, input.projectorVersion);
+      if (changed.changes !== 1) return false;
+      const session = this.getSessionForOwner(input.sessionId, input.ownerId);
+      if (!session) throw new Error("Activated session disappeared");
+      this.enqueueMobileState(input.ownerId, input.sessionId, "session.projector-version-activated", session);
+      return true;
+    });
+  }
+  cutoverProjectorVersion<T>(input: {
+    sessionId: string; ownerId: string; projectorVersion: string; expectedCurrentVersion: string | null;
+    expectedReconciliationEpoch: number;
+    workItems: ReadonlyArray<{ id: string; remoteId: string; state: string; payload: T }>;
+  }): boolean {
+    if (!input.ownerId || !input.projectorVersion || !Number.isSafeInteger(input.expectedReconciliationEpoch) || input.expectedReconciliationEpoch < 0) return false;
+    const casFailed = new Error("Projector cutover CAS failed");
+    try {
+      return this.transaction(() => {
+        const timestamp = now();
+        const changedItems: Array<{ id: string; remoteId: string; state: string; payload: T }> = [];
+        for (const item of input.workItems) {
+          const payload = json("work-items", item.payload);
+          const existing = this.sqlite.query("SELECT state, payload_json FROM work_items WHERE session_id = ? AND remote_id = ? AND projector_version = ?").get(input.sessionId, item.remoteId, input.projectorVersion) as { state: string; payload_json: string } | null;
+          if (existing?.state === item.state && existing.payload_json === payload) continue;
+          this.sqlite.query("INSERT INTO work_items (id, owner_id, session_id, remote_id, state, payload_json, projector_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id, remote_id, projector_version) DO UPDATE SET state = excluded.state, payload_json = excluded.payload_json, updated_at = excluded.updated_at").run(item.id, input.ownerId, input.sessionId, item.remoteId, item.state, json("work-items", item.payload), input.projectorVersion, timestamp, timestamp);
+          changedItems.push(item);
+        }
+        const changed = this.sqlite.query("UPDATE sessions SET active_projector_version = ?, reconciliation_epoch = reconciliation_epoch + 1, updated_at = ? WHERE id = ? AND owner_id = ? AND archived_at IS NULL AND active_projector_version IS ? AND reconciliation_epoch = ?").run(input.projectorVersion, timestamp, input.sessionId, input.ownerId, input.expectedCurrentVersion, input.expectedReconciliationEpoch);
+        if (changed.changes !== 1) throw casFailed;
+        const session = this.getSessionForOwner(input.sessionId, input.ownerId);
+        if (!session) throw new Error("Activated session disappeared");
+        for (const item of changedItems) {
+          const row = this.sqlite.query("SELECT * FROM work_items WHERE session_id = ? AND remote_id = ? AND projector_version = ?").get(input.sessionId, item.remoteId, input.projectorVersion) as WorkItemRow;
+          this.enqueueMobileState(input.ownerId, input.sessionId, "work-item.upserted", this.workItem<T>(row));
+        }
+        this.enqueueMobileState(input.ownerId, input.sessionId, "session.projector-version-activated", session);
+        return true;
+      });
+    } catch (cause) {
+      if (cause === casFailed) return false;
+      throw cause;
+    }
+  }
+  upsertWorkItem<T>(input: { id: string; ownerId: string; sessionId: string; remoteId: string; state: string; payload: T; projectorVersion?: string }): WorkItem<T> {
+    if (!input.ownerId || !input.remoteId || !this.getSessionForOwner(input.sessionId, input.ownerId)) throw new Error("Work item must belong to an owned session");
+    return this.transaction(() => {
+      const timestamp = now(); const version = input.projectorVersion ?? "legacy"; const payload = json("work-items", input.payload);
+      const existing = this.sqlite.query("SELECT * FROM work_items WHERE session_id = ? AND remote_id = ? AND projector_version = ?").get(input.sessionId, input.remoteId, version) as WorkItemRow | null;
+      if (existing && existing.state === input.state && existing.payload_json === payload) return this.workItem<T>(existing);
+      this.sqlite.query("INSERT INTO work_items (id, owner_id, session_id, remote_id, state, payload_json, projector_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_id, remote_id, projector_version) DO UPDATE SET state = excluded.state, payload_json = excluded.payload_json, updated_at = excluded.updated_at").run(input.id, input.ownerId, input.sessionId, input.remoteId, input.state, json("work-items", input.payload), version, timestamp, timestamp);
+      const item = this.workItem<T>(this.sqlite.query("SELECT * FROM work_items WHERE session_id = ? AND remote_id = ? AND projector_version = ?").get(input.sessionId, input.remoteId, version) as WorkItemRow);
+      this.enqueueMobileState(input.ownerId, input.sessionId, "work-item.upserted", item);
+      return item;
+    });
+  }
+  listWorkItemsForOwner<T>(ownerId: string): WorkItem<T>[] {
+    return (this.sqlite.query(`
+      SELECT work_items.* FROM work_items
+      JOIN sessions ON sessions.id = work_items.session_id
+      WHERE work_items.owner_id = ?
+        AND sessions.owner_id = ?
+        AND sessions.archived_at IS NULL
+        AND work_items.projector_version = COALESCE(sessions.active_projector_version, 'legacy')
+      ORDER BY work_items.updated_at DESC
+    `).all(ownerId, ownerId) as WorkItemRow[]).map((row) => this.workItem<T>(row));
+  }
+  getProjectionCheckpoint(sessionId: string, projectorVersion = "legacy"): ProjectionCheckpoint {
+    const row = this.sqlite.query("SELECT * FROM session_projection_checkpoints WHERE session_id = ? AND projector_version = ?").get(sessionId, projectorVersion) as { session_id: string; projector_version: string; next_expected_seq: number; updated_at: string } | null;
+    return row ? { sessionId: row.session_id, projectorVersion: row.projector_version, nextExpectedSeq: row.next_expected_seq, updatedAt: row.updated_at } : { sessionId, projectorVersion, nextExpectedSeq: 1, updatedAt: "" };
+  }
+  #advanceAppliedProjection(input: { sessionId: string; ownerId: string; projectorVersion: string; seq: number }): boolean {
+    const timestamp = now();
+    const changed = this.sqlite.query("UPDATE session_projection_checkpoints SET next_expected_seq = ?, updated_at = ? WHERE session_id = ? AND projector_version = ? AND next_expected_seq = ?").run(input.seq + 1, timestamp, input.sessionId, input.projectorVersion, input.seq);
+    if (changed.changes === 0 && this.sqlite.query("INSERT OR IGNORE INTO session_projection_checkpoints (session_id, projector_version, next_expected_seq, updated_at) VALUES (?, ?, ?, ?)").run(input.sessionId, input.projectorVersion, input.seq + 1, timestamp).changes === 0) return false;
+    this.sqlite.query("UPDATE session_projection_gaps SET resolved_at = ? WHERE session_id = ? AND projector_version = ? AND seq = ? AND resolved_at IS NULL").run(redactForSink("projection-diagnostics", timestamp) as string, input.sessionId, input.projectorVersion, input.seq);
+    this.sqlite.query("DELETE FROM projection_failures WHERE session_id = ? AND projector_version = ? AND seq = ?").run(input.sessionId, input.projectorVersion, input.seq);
+    this.enqueueMobileState(input.ownerId, input.sessionId, "projection.applied", { projectorVersion: input.projectorVersion, seq: input.seq });
+    return true;
+  }
+  listProjectionGaps(sessionId: string, projectorVersion = "legacy"): ProjectionGap[] {
+    return (this.sqlite.query("SELECT * FROM session_projection_gaps WHERE session_id = ? AND projector_version = ? ORDER BY seq").all(sessionId, projectorVersion) as Array<{ session_id: string; projector_version: string; seq: number; reason: string; resolved_at: string | null; detected_at: string }>).map((r) => ({ sessionId: r.session_id, projectorVersion: r.projector_version, seq: r.seq, reason: r.reason, resolvedAt: r.resolved_at, detectedAt: r.detected_at }));
+  }
+  applyProjection(input: { sessionId: string; ownerId: string; projectorVersion: string; apply: (event: SessionEvent) => void; effectKey?: string }): number {
+    if (!input.ownerId.trim() || !this.getSessionForOwner(input.sessionId, input.ownerId)) throw new Error("Session does not exist for owner");
+    let applied = 0;
+    for (;;) {
+      let failed: { seq: number; reason: string } | null = null;
+      try {
+        const advanced = this.transaction(() => {
+          const checkpoint = this.getProjectionCheckpoint(input.sessionId, input.projectorVersion);
+          const session = this.getSessionForOwner(input.sessionId, input.ownerId);
+          if (!session || session.archivedAt) return false;
+          const event = this.sqlite.query("SELECT * FROM events WHERE session_id = ? AND seq = ?").get(input.sessionId, checkpoint.nextExpectedSeq) as EventRow | null;
+          if (!event) {
+            const higherEvent = this.sqlite.query("SELECT seq FROM events WHERE session_id = ? AND seq > ? ORDER BY seq LIMIT 1").get(input.sessionId, checkpoint.nextExpectedSeq) as { seq: number } | null;
+            if (higherEvent) this.sqlite.query("INSERT OR IGNORE INTO session_projection_gaps (session_id, projector_version, seq, reason, detected_at) VALUES (?, ?, ?, ?, ?)")
+              .run(input.sessionId, input.projectorVersion, higherEvent.seq, projectionGapReason("out-of-order"), now());
+            return false;
+          }
+          try {
+            const effectKey = input.effectKey ?? "applyProjection";
+            const effectExists = this.sqlite.query("SELECT 1 FROM projection_effects WHERE session_id = ? AND projector_version = ? AND seq = ? AND effect_key = ?").get(input.sessionId, input.projectorVersion, event.seq, effectKey);
+            if (!effectExists) {
+              input.apply(asEvent(event));
+              this.sqlite.query("INSERT INTO projection_effects VALUES (?, ?, ?, ?, ?)").run(input.sessionId, input.projectorVersion, event.seq, effectKey, now());
+            }
+            return this.#advanceAppliedProjection({ sessionId: input.sessionId, ownerId: input.ownerId, projectorVersion: input.projectorVersion, seq: event.seq });
+          } catch (cause) {
+            failed = { seq: event.seq, reason: redactDiagnostic("projection-diagnostics", cause) };
+            throw cause;
+          }
+        });
+        if (!advanced) return applied;
+        applied++;
+      } catch {
+        if (!failed) throw new Error("Projection transaction failed");
+        this.transaction(() => {
+          const timestamp = now();
+          this.sqlite.query("INSERT OR REPLACE INTO projection_failures VALUES (?, ?, ?, ?, ?)").run(input.sessionId, input.projectorVersion, failed!.seq, redactDiagnostic("projection-diagnostics", failed!.reason), timestamp);
+        });
+        return applied;
+      }
+    }
+  }
+  listProjectionFailures(sessionId: string, projectorVersion: string): ProjectionFailure[] {
+    return (this.sqlite.query("SELECT * FROM projection_failures WHERE session_id = ? AND projector_version = ? ORDER BY seq").all(sessionId, projectorVersion) as Array<{session_id:string; projector_version:string; seq:number; reason:string; failed_at:string}>).map((r) => ({sessionId:r.session_id, projectorVersion:r.projector_version, seq:r.seq, reason:r.reason, failedAt:r.failed_at}));
+  }
+  unarchiveSessionForOwner(input: { id: string; ownerId: string; actorId?: "owner" | "system"; deviceId?: string | null; correlationId?: string }): Session | null {
+    if (!input.ownerId) throw new TypeError("Session owner is required");
+    this.validateTransitionAudit(input);
+    return this.transaction(() => {
+      const timestamp = now();
+      const changed = this.sqlite.query("UPDATE sessions SET archived_at = NULL, archive_reason = NULL, archive_cursor_seq = NULL, updated_at = ? WHERE id = ? AND owner_id = ? AND archived_at IS NOT NULL").run(timestamp, input.id, input.ownerId);
+      const session = this.getSessionForOwner(input.id, input.ownerId);
+      if (changed.changes === 1 && session) {
+        this.sqlite.query("UPDATE late_event_quarantine SET state = 'reopened', reopened_at = ?, updated_at = ? WHERE session_id = ? AND owner_id = ? AND state = 'quarantined'").run(timestamp, timestamp, input.id, input.ownerId);
+        this.writeTransitionAudit("session.unarchived", session, input);
+        this.enqueueMobileState(input.ownerId, input.id, "session.unarchived", session);
+      }
+      return session;
+    });
+  }
+  canArchiveSessionForOwner(id: string, ownerId: string, at = now()): { eligible: boolean; blockers: string[] } {
+    const blockers: string[] = [];
+    const session = this.getSessionForOwner(id, ownerId);
+    if (!session) blockers.push("session");
+    if (session && session.status !== "terminal") blockers.push("terminal");
+    if (session && !session.reconciled) blockers.push("reconciled");
+    if (session && new Date(session.updatedAt).getTime() > new Date(at).getTime() - 15 * 60 * 1_000) blockers.push("grace-period");
+    if (this.sqlite.query("SELECT 1 FROM pending_actions WHERE session_id = ? AND state IN ('pending','dispatching','unknown')").get(id)) blockers.push("pending-actions");
+    if (this.sqlite.query("SELECT 1 FROM commands WHERE session_id = ? AND state IN ('accepted','dispatching','remote-confirmed','unknown')").get(id)) blockers.push("commands");
+    const projectorVersion = session?.activeProjectorVersion ?? "legacy";
+    if (session && this.sqlite.query("SELECT 1 FROM work_items WHERE session_id = ? AND projector_version = ? AND state NOT IN ('closed','done','resolved')").get(id, projectorVersion)) blockers.push("work-items");
+    if (session && this.sqlite.query("SELECT 1 FROM session_projection_gaps WHERE session_id = ? AND projector_version = ? AND resolved_at IS NULL").get(id, projectorVersion)) blockers.push("projection-gaps");
+    if (session && this.sqlite.query("SELECT 1 FROM projection_failures WHERE session_id = ? AND projector_version = ?").get(id, projectorVersion)) blockers.push("projection-failures");
+    if (session) {
+      const maximum = this.sqlite.query("SELECT COALESCE(MAX(seq), 0) AS seq FROM events WHERE session_id = ?").get(id) as { seq: number };
+      const checkpoint = this.getProjectionCheckpoint(id, projectorVersion);
+      if (checkpoint.nextExpectedSeq !== maximum.seq + 1) blockers.push("active-projection-checkpoint");
+    }
+    return { eligible: blockers.length === 0, blockers };
+  }
+  createMobileSnapshot(input: { token: string; ownerId: string; expiresAt: string; authorizeSession: (session: Session) => boolean; maxRows?: number; maxTokens?: number; at?: string }): { watermark: number } {
+    if (!input.ownerId.trim() || !input.token || !input.expiresAt || typeof input.authorizeSession !== "function") throw new RangeError("Invalid snapshot");
+    const maxRows = input.maxRows ?? 5_000; const maxTokens = input.maxTokens ?? 3; const at = input.at ?? now();
+    if (!Number.isSafeInteger(maxRows) || maxRows < 1 || !Number.isSafeInteger(maxTokens) || maxTokens < 1) throw new RangeError("Invalid snapshot quota");
+    return this.transaction(() => {
+      this.sqlite.query("DELETE FROM snapshot_tokens WHERE expires_at <= ?").run(at);
+      const tokens = (this.sqlite.query("SELECT COUNT(*) AS count FROM snapshot_tokens WHERE owner_id = ?").get(input.ownerId) as { count: number }).count;
+      if (tokens >= maxTokens) this.sqlite.query("DELETE FROM snapshot_tokens WHERE token = (SELECT token FROM snapshot_tokens WHERE owner_id = ? ORDER BY created_at ASC, token ASC LIMIT 1)").run(input.ownerId);
+      const sessions = (this.sqlite.query("SELECT * FROM sessions WHERE owner_id = ? AND archived_at IS NULL ORDER BY updated_at DESC").all(input.ownerId) as SessionRow[])
+        .map(asSession)
+        .filter(input.authorizeSession);
+      const authorizedSessionIds = sessions.map(({ id }) => id);
+      const placeholders = authorizedSessionIds.map(() => "?").join(",");
+      const work = authorizedSessionIds.length === 0 ? [] : (this.sqlite.query(`SELECT work_items.* FROM work_items JOIN sessions ON sessions.id = work_items.session_id WHERE work_items.owner_id = ? AND sessions.owner_id = ? AND work_items.session_id IN (${placeholders}) AND sessions.archived_at IS NULL AND work_items.projector_version = COALESCE(sessions.active_projector_version, 'legacy') ORDER BY work_items.updated_at DESC`).all(input.ownerId, input.ownerId, ...authorizedSessionIds) as WorkItemRow[]).map((row) => this.workItem(row));
+      const actions = authorizedSessionIds.length === 0 ? [] : (this.sqlite.query(`SELECT pending_actions.* FROM pending_actions JOIN sessions ON sessions.id = pending_actions.session_id WHERE pending_actions.owner_id = ? AND pending_actions.session_id IN (${placeholders}) AND pending_actions.state = 'pending' AND pending_actions.expires_at > ? AND sessions.owner_id = ? AND sessions.archived_at IS NULL ORDER BY pending_actions.created_at ASC`).all(input.ownerId, ...authorizedSessionIds, at, input.ownerId) as PendingActionRow[]).map((row) => this.pendingAction(row));
+      const rows = [...sessions.map((value) => ({ key: `session:${value.id}`, payload: { kind: "session", value } })), ...work.map((value) => ({ key: `work:${value.id}`, payload: { kind: "work", value } })), ...actions.map((value) => ({ key: `action:${value.id}`, payload: { kind: "action", value } }))];
+      if (rows.length > maxRows) throw new RangeError("Snapshot row quota exceeded");
+      const watermark = (this.sqlite.query("SELECT COALESCE(MAX(id), 0) AS id FROM sse_outbox WHERE owner_id = ?").get(input.ownerId) as { id: number }).id;
+      this.sqlite.query("INSERT INTO snapshot_tokens VALUES (?, ?, ?, ?, ?)").run(input.token, input.ownerId, watermark, input.expiresAt, at);
+      for (const row of rows) this.sqlite.query("INSERT INTO snapshot_rows VALUES (?, ?, ?)").run(input.token, row.key, json("snapshots", row.payload));
+      return { watermark };
+    });
+  }
+  readSnapshot<T>(token: string, ownerId: string, at = now()): Array<{ key: string; payload: T }> | null {
+    const found = this.sqlite.query("SELECT 1 FROM snapshot_tokens WHERE token = ? AND owner_id = ? AND expires_at > ?").get(token, ownerId, at);
+    if (!found) return null;
+    return (this.sqlite.query("SELECT row_key, payload_json FROM snapshot_rows WHERE token = ? ORDER BY row_key").all(token) as Array<{row_key:string; payload_json:string}>).map((r) => ({ key: r.row_key, payload: decodeJson<T>(r.payload_json, `snapshot ${token}:${r.row_key}`) }));
+  }
+  enqueueSse(ownerId: string, event: unknown, sessionId?: string): number {
+    if (!ownerId.trim()) throw new TypeError("SSE owner is required");
+    if (!sessionId?.trim() || !this.getSessionForOwner(sessionId, ownerId)) throw new TypeError("SSE requires an owned session");
+    return this.transaction(() => {
+      const result = this.sqlite.query("INSERT INTO sse_outbox (owner_id, session_id, event_json, created_at) VALUES (?, ?, ?, ?)").run(ownerId, sessionId, json("sse-outbox", event), now());
+      this.pruneSseOutbox(ownerId);
+      return Number(result.lastInsertRowid);
+    });
+  }
+  minimumRetainedSseCursor(ownerId: string): number {
+    if (!ownerId.trim()) throw new TypeError("SSE owner is required");
+    const row = this.sqlite.query("SELECT MIN(id) AS id FROM sse_outbox WHERE owner_id = ?").get(ownerId) as { id: number | null };
+    return row.id === null ? 0 : row.id - 1;
+  }
+  listSseAfter<T>(ownerId: string, watermark: number, authorizedSessionIdsOrCap?: readonly string[] | number, cap = 100): Array<{ id: number; sessionId: string; event: T }> {
+    const authorizedSessionIds = authorizedSessionIdsOrCap === undefined || typeof authorizedSessionIdsOrCap === "number" ? null : [...new Set(authorizedSessionIdsOrCap)];
+    const effectiveCap = typeof authorizedSessionIdsOrCap === "number" ? authorizedSessionIdsOrCap : cap;
+    if (effectiveCap < 1 || effectiveCap > 1_000) throw new RangeError("Invalid SSE cap");
+    if (authorizedSessionIds?.some((id) => !id.trim())) throw new RangeError("Invalid authorized session");
+    const sessionFilter = authorizedSessionIds === null
+      ? { clause: "", parameters: [] as string[] }
+      : authorizedSessionIds.length === 0
+        ? { clause: " AND 0", parameters: [] as string[] }
+        : { clause: ` AND session_id IN (${authorizedSessionIds.map(() => "?").join(",")})`, parameters: authorizedSessionIds };
+    return (this.sqlite.query(`SELECT id, session_id, event_json FROM sse_outbox WHERE owner_id = ? AND id > ?${sessionFilter.clause} ORDER BY id LIMIT ?`).all(ownerId, watermark, ...sessionFilter.parameters, effectiveCap) as Array<{id:number;session_id:string;event_json:string}>).map((r) => ({ id:r.id, sessionId:r.session_id, event:decodeJson<T>(r.event_json, `sse ${r.id}`) }));
+  }
+  setSchemaFence(name: string, minVersion: number, active: boolean): void {
+    this.sqlite.query("INSERT INTO schema_fence VALUES (?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET min_version=excluded.min_version, active=excluded.active, updated_at=excluded.updated_at").run(name, minVersion, active ? 1 : 0, now());
+  }
+  activeSchemaFenceVersion(name = "min_binary_version"): number | null {
+    const row = this.sqlite.query("SELECT min_version FROM schema_fence WHERE name = ? AND active = 1").get(name) as { min_version: number } | null;
+    return row?.min_version ?? null;
+  }
+  getBackfillJob(name: string): BackfillJob | null {
+    const row = this.sqlite.query("SELECT * FROM backfill_jobs WHERE name = ?").get(name) as { name: string; cursor_json: string; state: BackfillJobState; attempts: number; started_at: string | null; paused_at: string | null; completed_at: string | null; failed_at: string | null; error: string | null; updated_at: string } | null;
+    return row && { name: row.name, cursor: decodeJson(row.cursor_json, `backfill ${name}`), state: row.state, attempts: row.attempts, startedAt: row.started_at, pausedAt: row.paused_at, completedAt: row.completed_at, failedAt: row.failed_at, error: row.error, updatedAt: row.updated_at };
+  }
+  saveBackfillJob(name: string, cursor: unknown, state: BackfillJobState): void {
+    this.sqlite.query("INSERT INTO backfill_jobs (name, cursor_json, state, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET cursor_json=excluded.cursor_json, state=excluded.state, updated_at=excluded.updated_at").run(name, json("projection-diagnostics", cursor), state, now());
+  }
+  runHistoricalProjectionBackfill(input: { projectorVersion?: string; fold: (event: SessionEvent) => void; effectKey?: string; limit?: number }): BackfillJob {
+    const limit = input.limit ?? 500;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) throw new RangeError("Historical projection batch must be between 1 and 500");
+    const name = "historical-projection-v1";
+    return this.transaction(() => {
+      let job = this.getBackfillJob(name)!;
+      if (job.state === "complete") return job;
+      if (job.state !== "running") job = this.startBackfillJob(name, job.cursor);
+      const cursor = (job.cursor && typeof job.cursor === "object" ? job.cursor : {}) as { sessionId?: string; seq?: number };
+      const events = this.sqlite.query(`
+        SELECT events.*, sessions.owner_id FROM events JOIN sessions ON sessions.id = events.session_id
+        WHERE sessions.owner_id IS NOT NULL AND (events.session_id > ? OR (events.session_id = ? AND events.seq > ?))
+        ORDER BY events.session_id, events.seq LIMIT ?
+      `).all(cursor.sessionId ?? "", cursor.sessionId ?? "", cursor.seq ?? 0, limit) as Array<EventRow & { owner_id: string }>;
+      let last = cursor;
+      const version = input.projectorVersion ?? "legacy";
+      const effectKey = input.effectKey ?? name;
+      for (const event of events) {
+        const checkpoint = this.getProjectionCheckpoint(event.session_id, version);
+        if (event.seq === checkpoint.nextExpectedSeq) {
+          const seen = this.sqlite.query("SELECT 1 FROM projection_effects WHERE session_id = ? AND projector_version = ? AND seq = ? AND effect_key = ?").get(event.session_id, version, event.seq, effectKey);
+          if (!seen) {
+            input.fold(asEvent(event));
+            this.sqlite.query("INSERT INTO projection_effects VALUES (?, ?, ?, ?, ?)").run(event.session_id, version, event.seq, effectKey, now());
+          }
+          this.#advanceAppliedProjection({ sessionId: event.session_id, ownerId: event.owner_id, projectorVersion: version, seq: event.seq });
+        }
+        last = { sessionId: event.session_id, seq: event.seq };
+      }
+      const complete = events.length < limit;
+      this.sqlite.query("UPDATE backfill_jobs SET cursor_json=?, state=?, completed_at=CASE WHEN ? THEN ? ELSE completed_at END, updated_at=? WHERE name=?").run(json("projection-diagnostics", last), complete ? "complete" : "running", complete ? 1 : 0, now(), now(), name);
+      return this.getBackfillJob(name)!;
+    });
+  }
+  runHistoricalArchiveBackfill(input: { at?: string; limit?: number } = {}): BackfillJob {
+    const limit = input.limit ?? 500;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) throw new RangeError("Historical archive batch must be between 1 and 500");
+    const name = "historical-archive-backfill-v1";
+    return this.transaction(() => {
+      if (this.getBackfillJob("historical-projection-v1")?.state !== "complete") throw new Error("historical-archive-backfill-v1 requires completed historical-projection-v1");
+      let job = this.getBackfillJob(name)!;
+      if (job.state === "complete") return job;
+      if (job.state !== "running") job = this.startBackfillJob(name, job.cursor);
+      const cursor = (job.cursor && typeof job.cursor === "object" ? job.cursor : {}) as { sessionId?: string };
+      const sessions = this.sqlite.query("SELECT id, owner_id FROM sessions WHERE id > ? AND owner_id IS NOT NULL ORDER BY id LIMIT ?").all(cursor.sessionId ?? "", limit) as Array<{ id: string; owner_id: string }>;
+      let last = cursor; const at = input.at ?? now();
+      for (const session of sessions) {
+        if (this.canArchiveSessionForOwner(session.id, session.owner_id, at).eligible) this.archiveSessionForOwner({ id: session.id, ownerId: session.owner_id, archivedAt: at, archiveReason: "retention", actorId: "system" });
+        last = { sessionId: session.id };
+      }
+      const complete = sessions.length < limit;
+      this.sqlite.query("UPDATE backfill_jobs SET cursor_json=?, state=?, completed_at=CASE WHEN ? THEN ? ELSE completed_at END, updated_at=? WHERE name=?").run(json("projection-diagnostics", last), complete ? "complete" : "running", complete ? 1 : 0, now(), now(), name);
+      return this.getBackfillJob(name)!;
+    });
+  }
+  startBackfillJob(name: string, cursor: unknown = {}): BackfillJob {
+    if (name === "historical-archive-backfill-v1" && this.getBackfillJob("historical-projection-v1")?.state !== "complete") throw new Error("historical-archive-backfill-v1 requires completed historical-projection-v1");
+    const timestamp = now();
+    this.sqlite.query("INSERT INTO backfill_jobs (name, cursor_json, state, attempts, started_at, updated_at) VALUES (?, ?, 'running', 1, ?, ?) ON CONFLICT(name) DO UPDATE SET cursor_json=excluded.cursor_json, state='running', attempts=backfill_jobs.attempts + 1, started_at=?, paused_at=NULL, error=NULL, updated_at=?").run(name, json("projection-diagnostics", cursor), timestamp, timestamp, timestamp, timestamp);
+    return this.getBackfillJob(name)!;
+  }
+  pauseBackfillJob(name: string): BackfillJob | null {
+    const timestamp = now();
+    this.sqlite.query("UPDATE backfill_jobs SET state='paused', paused_at=?, updated_at=? WHERE name=? AND state='running'").run(timestamp, timestamp, name);
+    return this.getBackfillJob(name);
+  }
+  advanceBackfillJob(name: string, cursor: unknown): BackfillJob | null {
+    const changed = this.sqlite.query("UPDATE backfill_jobs SET cursor_json=?, updated_at=? WHERE name=? AND state='running'").run(json("projection-diagnostics", cursor), now(), name);
+    return changed.changes ? this.getBackfillJob(name) : null;
+  }
+  failBackfillJob(name: string, error: string): BackfillJob | null {
+    const timestamp = now();
+    this.sqlite.query("UPDATE backfill_jobs SET state='failed', error=?, failed_at=?, updated_at=? WHERE name=? AND state IN ('running','paused')").run(redactDiagnostic("projection-diagnostics", error), timestamp, timestamp, name);
+    return this.getBackfillJob(name);
+  }
+  completeBackfillJob(name: string): BackfillJob | null {
+    const timestamp = now();
+    this.sqlite.query("UPDATE backfill_jobs SET state='complete', completed_at=?, error=NULL, updated_at=? WHERE name=? AND state='running'").run(timestamp, timestamp, name);
+    return this.getBackfillJob(name);
   }
 }
 

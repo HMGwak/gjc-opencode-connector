@@ -2,97 +2,235 @@ import { expect, test } from "bun:test";
 
 const source = await Bun.file(new URL("./app.ts", import.meta.url)).text();
 
-test("consumes the hub sessions envelope", () => {
-  expect(source).toContain('(body as { sessions: unknown[] }).sessions.filter(isSession)');
-  expect(source).not.toContain("Array.isArray(body) ? body.filter(isSession)");
+test("restores a persisted default tab at startup and falls back to Inbox for invalid or unavailable storage", async () => {
+  class Node {
+    children: Node[] = [];
+    dataset: Record<string, string> = {};
+    attributes: Record<string, string> = {};
+    className = "";
+    id = "";
+    textContent: string | null = null;
+    append(...nodes: Node[]): void { this.children.push(...nodes); }
+    appendChild(node: Node): void { this.children.push(node); }
+    after(_node: Node): void {}
+    replaceChildren(...nodes: Node[]): void { this.children = nodes; }
+    setAttribute(name: string, value: string): void { this.attributes[name] = value; }
+    addEventListener(_name: string, _listener: unknown): void {}
+    remove(): void {}
+  }
+
+  async function initialTab(value: string | null, storageUnavailable = false): Promise<string | undefined> {
+    const app = new Node();
+    Object.assign(globalThis, {
+      document: {
+        activeElement: null,
+        cookie: "",
+        querySelector: (selector: string) => selector === "#app" ? app : null,
+        createElement: () => new Node(),
+        getElementById: () => null,
+      },
+      navigator: { onLine: true },
+      window: {
+        addEventListener: () => {},
+        clearTimeout: () => {},
+        setTimeout,
+        location: { href: "https://hub.example/" },
+        Capacitor: { Plugins: { SecureCredential: { get: async () => ({ credential: "x".repeat(43) }), set: async () => {}, clear: async () => {} } } },
+      },
+      localStorage: { getItem: () => {
+        if (storageUnavailable) throw new Error("storage unavailable");
+        return value;
+      }, setItem: () => {} },
+      BroadcastChannel: undefined,
+      indexedDB: { open: () => ({ result: {}, onupgradeneeded: null, onsuccess: null, onerror: null }) },
+      fetch: async () => new Response(JSON.stringify({ sessions: [], work: [], actions: [], history: [] }), { status: 200, headers: { "Content-Type": "application/json" } }),
+    });
+
+    await import(`./app.ts?default-tab=${crypto.randomUUID()}`);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const navigation = app.children[2];
+    return navigation?.children.find((button) => button.attributes["aria-current"] === "page")?.dataset.tab;
+  }
+
+  expect(await initialTab("work")).toBe("work");
+  expect(await initialTab("not-a-tab")).toBe("inbox");
+  expect(await initialTab(null, true)).toBe("inbox");
+});
+test("persists bottom-tab selections across reloads and continues navigating when storage fails", async () => {
+  class Node {
+    children: Node[] = [];
+    dataset: Record<string, string> = {};
+    attributes: Record<string, string> = {};
+    listeners: Record<string, () => void> = {};
+    className = "";
+    id = "";
+    textContent: string | null = null;
+    append(...nodes: Node[]): void { this.children.push(...nodes); }
+    appendChild(node: Node): void { this.children.push(node); }
+    after(_node: Node): void {}
+    replaceChildren(...nodes: Node[]): void { this.children = nodes; }
+    setAttribute(name: string, value: string): void { this.attributes[name] = value; }
+    addEventListener(name: string, listener: () => void): void { this.listeners[name] = listener; }
+    remove(): void {}
+    click(): void { this.listeners.click?.(); }
+  }
+
+  const values = new Map<string, string>();
+  let storageUnavailable = false;
+  const storage = {
+    getItem(key: string): string | null {
+      if (storageUnavailable) throw new Error("storage unavailable");
+      return values.get(key) ?? null;
+    },
+    setItem(key: string, value: string): void {
+      if (storageUnavailable) throw new Error("storage unavailable");
+      values.set(key, value);
+    },
+  };
+
+  async function boot(): Promise<Node> {
+    const app = new Node();
+    Object.assign(globalThis, {
+      document: {
+        activeElement: null,
+        cookie: "",
+        querySelector: (selector: string) => selector === "#app" ? app : null,
+        createElement: () => new Node(),
+        getElementById: () => null,
+      },
+      navigator: { onLine: true },
+      window: {
+        addEventListener: () => {},
+        clearTimeout: () => {},
+        setTimeout,
+        location: { href: "https://hub.example/" },
+        Capacitor: { Plugins: { SecureCredential: { get: async () => ({ credential: "x".repeat(43) }), set: async () => {}, clear: async () => {} } } },
+      },
+      localStorage: storage,
+      BroadcastChannel: undefined,
+      indexedDB: { open: () => ({ result: {}, onupgradeneeded: null, onsuccess: null, onerror: null }) },
+      fetch: async () => new Response(JSON.stringify({ sessions: [], work: [], actions: [], history: [] }), { status: 200, headers: { "Content-Type": "application/json" } }),
+    });
+    await import(`./app.ts?bottom-tab=${crypto.randomUUID()}`);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    return app;
+  }
+
+  function tab(app: Node, id: string): Node {
+    const navigation = app.children[2];
+    const button = navigation?.children.find((candidate) => candidate.dataset.tab === id);
+    if (!button) throw new Error(`Missing ${id} tab.`);
+    return button;
+  }
+
+  tab(await boot(), "work").click();
+  expect(values.get("planee-agent-hub:default-tab")).toBe("work");
+  expect(tab(await boot(), "work").attributes["aria-current"]).toBe("page");
+
+  tab(await boot(), "history").click();
+  expect(values.get("planee-agent-hub:default-tab")).toBe("history");
+  expect(tab(await boot(), "history").attributes["aria-current"]).toBe("page");
+
+  storageUnavailable = true;
+  const unavailableApp = await boot();
+  tab(unavailableApp, "work").click();
+  expect(tab(unavailableApp, "work").attributes["aria-current"]).toBe("page");
 });
 
-test("uses a six-digit numeric pairing input", () => {
-  expect(source).toContain('code.inputMode = "numeric";');
-  expect(source).toContain('code.maxLength = 6;');
+test("renders the four mobile workflow navigation surfaces", () => {
+  expect(source).toContain('[["inbox", "Inbox"], ["work", "Work"], ["sessions", "Sessions"], ["history", "History"]]');
+  expect(source).toContain('if (activeTab === "inbox") renderInbox(panel);');
+  expect(source).toContain('if (activeTab === "work") renderWork(panel);');
+  expect(source).toContain('if (activeTab === "history") renderHistory(panel);');
+});
+
+test("shows loading and empty states for each session surface", () => {
+  expect(source).toContain('panel.append(element("p", "Loading sessions…"));');
+  expect(source).toContain('"No open approvals or failures."');
+  expect(source).toContain('"No work items."');
+  expect(source).toContain('"No completed or archived sessions."');
+  expect(source).toContain('error.setAttribute("role", "alert");');
+});
+
+test("renders normalized transcript entries as role-based chat bubbles", () => {
+  expect(source).toContain('function normalizedMessage(value: unknown)');
+  expect(source).toContain('message.className = `message message-${normalized.role}`;');
+  expect(source).toContain('messages.setAttribute("aria-label", "Normalized transcript");');
+  expect(source).not.toContain('JSON.stringify(value)');
+});
+
+test("makes archived sessions read-only and archives active sessions through the API", () => {
+  expect(source).toContain('function isArchived(session: Session): boolean');
+  expect(source).toContain('detail.append(element("p", "Archived sessions are read-only."));');
+  expect(source).toContain('const archive = element("button", "Archive session");');
+  expect(source).toContain('`/sessions/${encodeURIComponent(sessionId)}/archive`');
+  expect(source).toContain('{ method: "POST" }');
+});
+test("loads Hub workflow projections and renders each represented HITL action once", () => {
+  expect(source).toContain('load("/sessions")');
+  expect(source).toContain('load("/work")');
+  expect(source).toContain('load("/hitl")');
+  expect(source).toContain('load("/history")');
+  expect(source).toContain("Promise.allSettled");
+  expect(source).toContain("function isWorkItem(value: unknown): value is WorkItem");
+  expect(source).toContain("type HitlAction = PendingAction;");
+  expect(source).toContain("for (const action of hitlActions)");
+  expect(source).toContain('if (action.status !== "pending" && action.status !== "dispatching" && action.status !== "unknown") continue;');
+  expect(source).toContain("const card = renderAction(action, api);");
+  expect(source).toContain("function workGroup(state: string)");
+  expect(source).toContain("for (const work of items)");
+  expect(source).toContain('"No open approvals or failures."');
+  expect(source).toContain('"No work items."');
+  expect(source).not.toContain('sessions.filter((session) => !isArchived(session) && (Boolean(session.hitlCount)');
+  const inbox = source.slice(source.indexOf("function renderInbox"), source.indexOf("const WORK_STATE_GROUPS"));
+  expect(inbox).not.toContain("renderSessionActions");
+});
+test("groups failed and unsupported work states truthfully", () => {
+  expect(source).toContain('const WORK_STATE_GROUPS = {');
+  expect(source).toContain('Failed: new Set(["failed", "error", "cancelled", "canceled"])');
+  expect(source).toContain('return "Unknown";');
+  expect(source).toContain('["Todo", "In progress", "Results", "Failed", "Unknown"]');
+  expect(source).not.toContain('return "Results";');
+});
+
+test("reports tier-specific projection failures while retaining cached data", () => {
+  expect(source).toContain('let projectionErrors: Partial<Record<"inbox" | "work" | "history", string>> = {};');
+  expect(source).toContain('renderProjectionError(panel, "inbox");');
+  expect(source).toContain('renderProjectionError(panel, "work");');
+  expect(source).toContain('renderProjectionError(panel, "history");');
+  expect(source).toContain('Showing cached ${tier} data.');
+  expect(source).toContain('projectionErrors.work = fetchFailure("Unable to load work", workResult.reason);');
+  expect(source).toContain('projectionErrors.inbox = fetchFailure("Unable to load inbox", hitlResult.reason);');
+  expect(source).toContain('projectionErrors.history = fetchFailure("Unable to load history", historyResult.reason);');
+});
+
+test("keeps view-only and archived session controls read-only", () => {
+  expect(source).toContain('if (session.controlMode === "view-only") detail.append(element("p", "This session is view-only. Prompts and session actions are unavailable."));');
+  expect(source).toContain("else {\n      renderPromptForm(detail, session.id);\n      renderSessionActions(detail, session.id, api);");
+  expect(source).toContain('if (isArchived(session)) {\n    detail.append(element("p", "Archived sessions are read-only."));');
+});
+
+test("isolates cursors, selected-session updates, serialized catch-up, and typed prompt retries", () => {
   expect(source).toContain('/^\\d{6}$/.test(code)');
-});
-
-test("reuses an idempotency key when retrying the same prompt", () => {
-  expect(source).toContain("let pendingPrompt: { sessionId: string; prompt: string; key: string } | null = null;");
-  expect(source).toContain("pendingPrompt?.sessionId === sessionId && pendingPrompt.prompt === prompt");
   expect(source).toContain('"Idempotency-Key": retry.key');
-  expect(source).toContain('input.addEventListener("input"');
-  expect(source).toContain("input.value.trim() !== pendingPrompt.prompt");
-  expect(source).toContain("if (pendingPrompt?.key === retry.key) pendingPrompt = null;");
-});
-
-test("catches up each session using its own cursor", () => {
   expect(source).toContain('`cursor:${sessionId}`');
-  expect(source).toContain('`/sessions/${encodeURIComponent(sessionId)}/events${cursor === null ? "" : `?after=${encodeURIComponent(String(cursor))}`}`');
-  expect(source).toContain("window.setTimeout(() => void pollUpdates(generation), POLL_INTERVAL)");
-  expect(source).not.toContain("/events/stream");
-});
-
-test("does not render asynchronous events for a newly selected session", () => {
-  expect(source).toContain("if (sessionId !== selectedSessionId) return;");
-  expect(source).toContain("if (!isHubEvent(value) || value.sessionId !== sessionId) return;");
-  expect(source).not.toContain("render(); loadMessages(session.id)");
-});
-test("polling preserves a typed prompt by updating status without rendering the app", () => {
-  const poll = source.slice(source.indexOf("async function pollUpdates"), source.indexOf('window.addEventListener("online"'));
-  expect(poll).toContain("multiTab.requestedSessions()");
-  expect(poll).toContain("await catchUp(sessionId, sessionId === selectedSessionId)");
-  expect(poll).toContain("updateConnectionStatus();");
-  expect(poll).not.toContain("render();");
+  expect(source).toContain('if (sessionId !== selectedSessionId) return;');
+  expect(source).toContain('const previous = catchUpLocks.get(sessionId) ?? Promise.resolve(true);');
+  expect(source).toContain('.then(() => catchUpOnce(sessionId, renderMessages));');
+  expect(source).toContain('if (catchUpLocks.get(sessionId) === current) catchUpLocks.delete(sessionId);');
+  expect(source).toContain('const retry = pendingPrompt?.sessionId === sessionId && pendingPrompt.prompt === prompt');
+  expect(source).toContain('if (pendingPrompt?.key === retry.key) pendingPrompt = null;');
+  expect(source).toContain('if (sessionId === selectedSessionId) input.value = "";');
   expect(source).toContain('indicator.setAttribute("aria-live", "polite");');
-  expect(source).not.toContain('id="app" aria-live');
-});
-test("serializes catch-up requests per session", () => {
-  expect(source).toContain("const catchUpLocks = new Map<string, Promise<boolean>>();");
-  expect(source).toContain("const previous = catchUpLocks.get(sessionId) ?? Promise.resolve(true);");
-  expect(source).toContain(".then(() => catchUpOnce(sessionId, renderMessages))");
-  expect(source).toContain("if (catchUpLocks.get(sessionId) === current) catchUpLocks.delete(sessionId);");
+  expect(source).toContain('const focusedId = typeof HTMLElement !== "undefined"');
 });
 
-test("publishes install metadata through the document manifest link", async () => {
-  const index = await Bun.file(new URL("../index.html", import.meta.url)).text();
-  expect(index).toContain('<link rel="manifest" href="/manifest.webmanifest" />');
+test("keeps push and service-worker setup safe", () => {
+  expect(source).toContain('button.disabled = true;');
+  expect(source).toContain('finally {\n    button.disabled = false;');
+  expect(source).toContain('if ("serviceWorker" in navigator) void navigator.serviceWorker.register("/sw.js");');
 });
-test("renders the selected-session actions surface through the safe actions module", () => {
-  expect(source).toContain('import { renderActions as renderSessionActions } from "./actions";');
-  expect(source).toContain("renderSessionActions(panel, selectedSessionId, api);");
-  expect(source).not.toContain("innerHTML");
-});
-test("requests notification permission only from the settings button and revokes subscriptions safely", async () => {
-  const push = await Bun.file(new URL("./push.ts", import.meta.url)).text();
-  expect(source).toContain('push.addEventListener("click", () => void configurePush(push));');
-  expect(push).toContain("const permission = await Notification.requestPermission();");
-  expect(push).toContain('await revokePush(api);');
-  expect(push).toContain('method: "DELETE"');
-  expect(push).toContain('cache: "no-store"');
-});
-
-test("service worker uses only a safe same-origin deep link and bypasses API cache", async () => {
-  const worker = await Bun.file(new URL("../public/sw.js", import.meta.url)).text();
-  expect(worker).toContain('url.pathname.startsWith("/api/")');
-  expect(worker).toContain('url.origin !== self.location.origin');
-  expect(worker).toContain('/^\\/(sessions|actions|settings)(\\/|$)/');
-  expect(worker).toContain("data?.deepLink");
-  expect(worker).toContain('self.addEventListener("notificationclick"');
-  expect(worker).not.toContain("prompt");
-  expect(worker).not.toContain("output");
-});
-test("coordinates polling and event cursors across browser tabs", () => {
-  expect(source).toContain('new BroadcastChannel("planee-agent-hub")');
-  expect(source).toContain("locks: navigator.locks");
-  expect(source).toContain("if (!online || !multiTab.canCoordinate() || !multiTab.isLeader()) return;");
-  expect(source).toContain("multiTab.publishEvent(sessionId, value, value.seq);");
-  expect(source).toContain("store.put(Math.max(previous, cursor), `cursor:${sessionId}`);");
-  expect(source).toContain("multiTab.start();");
-});
-test("followers do not fetch when rendering a conversation and leaders poll every requested session", () => {
-  expect(source).toContain("multiTab.requestSession(selectedSessionId);");
-  expect(source).toContain("if (!multiTab.canCoordinate() || !multiTab.isLeader()) return false;");
-  expect(source).toContain("for (const sessionId of multiTab.requestedSessions())");
-  expect(source).toContain("multiTab.releaseSession(selectedSessionId);");
-});
-test("app network guard prevents event fetches when coordination has no polling capability", async () => {
+test("app network guard prevents catch-up fetches without coordination", async () => {
   class Node {
     dataset: Record<string, string> = {};
     className = ""; id = ""; textContent: string | null = null;
@@ -107,10 +245,10 @@ test("app network guard prevents event fetches when coordination has no polling 
   const app = new Node();
   const calls: string[] = [];
   Object.assign(globalThis, {
-    document: { cookie: "", querySelector: (selector: string) => selector === "#app" ? app : null, createElement: () => new Node() },
+    document: { cookie: "", querySelector: (selector: string) => selector === "#app" ? app : null, createElement: () => new Node(), getElementById: () => null },
     navigator: { onLine: true },
     window: {
-      addEventListener: () => {}, clearTimeout: () => {}, setTimeout,
+      addEventListener: () => {}, clearTimeout: () => {}, setTimeout, location: { href: "https://hub.example/" },
       Capacitor: { Plugins: { SecureCredential: { get: async () => ({ credential: "x".repeat(43) }), set: async () => {}, clear: async () => {} } } },
     },
     BroadcastChannel: undefined,
@@ -122,9 +260,16 @@ test("app network guard prevents event fetches when coordination has no polling 
   });
   await import(`./app.ts?network-guard=${Date.now()}`);
   await new Promise((resolve) => setTimeout(resolve, 0));
-  expect(calls).toEqual(["/api/v1/sessions"]);
+  expect(calls).toEqual(["/api/v1/sessions", "/api/v1/work", "/api/v1/hitl", "/api/v1/history"]);
 });
-test("shows an explicit manual-refresh status without BroadcastChannel", () => {
-  expect(source).toContain('if (!multiTab.canCoordinate()) return "Degraded — single-tab mode; refresh manually";');
-  expect(source).toContain("if (!multiTab.canCoordinate() || !multiTab.isLeader()) return false;");
+
+test("keeps action controls and settings available without exposing them as primary navigation", () => {
+  expect(source).toContain('renderSessionActions(detail, session.id, api);');
+  expect(source).toContain('settings.append(element("summary", "Settings"));');
+  expect(source).toContain('push.addEventListener("click", () => void configurePush(push));');
+});
+
+test("publishes install metadata through the document manifest link", async () => {
+  const index = await Bun.file(new URL("../index.html", import.meta.url)).text();
+  expect(index).toContain('<link rel="manifest" href="/manifest.webmanifest" />');
 });

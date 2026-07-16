@@ -1,6 +1,6 @@
 import { PendingActionError, PendingActionService as CorePendingActionService, type CoreDatabase, type PendingAction as CorePendingAction } from "@planee/core";
 
-export type PendingActionStatus = "pending" | "answered" | "cancelled" | "expired" | "unknown";
+export type PendingActionStatus = "pending" | "dispatching" | "answered" | "cancelled" | "expired" | "unknown";
 
 export interface PendingAction {
   readonly id: string;
@@ -11,6 +11,8 @@ export interface PendingAction {
   readonly status: PendingActionStatus;
   readonly type: string;
   readonly payload: unknown;
+  /** Exact canonical response choices; empty means no response controls are available. */
+  readonly allowedResponses: readonly AllowedResponse[];
   /** Canonical opaque artifact identifiers; never derive paths from these values. */
   readonly artifactIds: readonly string[];
 }
@@ -20,6 +22,7 @@ export interface ActionResponse {
   readonly duplicate: boolean;
 }
 
+export type AllowedResponse = string | { readonly value: string; readonly label?: string };
 export const hubPendingActionService = Symbol("HubPendingActionService");
 
 export interface HubPendingActionPayload {
@@ -29,16 +32,25 @@ export interface HubPendingActionPayload {
   readonly payload: unknown;
   readonly artifactIds: readonly string[];
 }
+const allowedResponses = (payload: unknown): readonly AllowedResponse[] => {
+  if (typeof payload !== "object" || payload === null || !("allowedResponses" in payload)) return [];
+  const choices = (payload as { allowedResponses?: unknown }).allowedResponses;
+  if (!Array.isArray(choices) || !choices.every((choice) => typeof choice === "string" || (typeof choice === "object" && choice !== null && typeof (choice as { value?: unknown }).value === "string" && (!("label" in choice) || typeof (choice as { label?: unknown }).label === "string")))) return [];
+  return choices as readonly AllowedResponse[];
+};
+
+const allowedResponseValues = (payload: unknown): readonly string[] => allowedResponses(payload).map((choice) => typeof choice === "string" ? choice : choice.value);
 
 const toAction = (action: CorePendingAction<HubPendingActionPayload>): PendingAction => ({
   id: action.id,
-  ownerId: action.payload.ownerId,
-  sessionId: action.payload.sessionId,
+  ownerId: action.ownerId,
+  sessionId: action.sessionId ?? undefined,
   version: action.version,
   expiresAt: action.expiresAt,
   status: action.state,
   type: action.payload.type,
   payload: action.payload.payload,
+  allowedResponses: allowedResponses(action.payload.payload),
   artifactIds: action.payload.artifactIds,
 });
 
@@ -49,17 +61,16 @@ export class HubPendingActionService {
   constructor(private readonly database: CoreDatabase, private readonly actions = new CorePendingActionService(database)) {}
 
   list(ownerId: string): readonly PendingAction[] {
-    return this.database.listPendingActions<HubPendingActionPayload>()
-      .filter((action) => action.payload.ownerId === ownerId)
-      .map(toAction);
+    return this.database.listPendingActionsForOwner<HubPendingActionPayload>(ownerId).map(toAction);
   }
 
   respondWithEvent(input: { readonly id: string; readonly ownerId: string; readonly version: number; readonly response: unknown; readonly idempotencyKey: string }): ActionResponse {
-    const existing = this.actions.get<HubPendingActionPayload>(input.id);
-    if (!existing) throw new ActionApiError("unknown");
-    if (existing.payload.ownerId !== input.ownerId) throw new ActionApiError("forbidden");
+    const existing = this.database.getPendingActionForOwner<HubPendingActionPayload>(input.id, input.ownerId);
+    if (!existing) throw new ActionApiError("forbidden");
+    const allowed = allowedResponseValues(existing.payload.payload);
+    if (allowed.length === 0 || typeof input.response !== "string" || !allowed.includes(input.response)) throw new ActionApiError("invalid");
     try {
-      const action = this.actions.respondWithEvent<HubPendingActionPayload, unknown>({
+      const action = this.actions.respondWithEvent<HubPendingActionPayload, string>({
         id: input.id,
         version: input.version,
         answer: input.response,

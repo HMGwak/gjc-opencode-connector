@@ -16,6 +16,8 @@ export interface HubServerOptions {
   readonly bodyLimitBytes?: number;
   readonly commandId?: () => string;
   readonly rateLimit?: { readonly maxRequests: number; readonly windowMs: number };
+  /** Supplies the current time for snapshot expiry and rate-limit calculations. */
+  readonly now?: () => number;
   readonly adapters?: Readonly<Record<string, AgentAdapter>>;
   readonly adapterHealth?: HubMetricsOptions["adapterHealth"];
   /** Access subject permitted to scrape operational metrics. */
@@ -24,6 +26,8 @@ export interface HubServerOptions {
   readonly actions?: HubPendingActionService;
   readonly artifacts?: ArtifactService;
   readonly push?: PushSubscriptionService;
+  /** Restricts the API to non-mutating inspection responses. */
+  readonly readOnly?: boolean;
 }
 export interface PushSubscriptionService {
   publicKey(): Promise<string> | string;
@@ -40,10 +44,18 @@ type PushSubscriptionJSON = {
 
 const json = (value: unknown, status = 200): Response => new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
 const error = (status: number, code: string, message: string): Response => json({ error: { code, message } }, status);
+const snapshotCreationError = (cause: unknown): Response => cause instanceof RangeError && cause.message === "Snapshot row quota exceeded"
+  ? error(413, "snapshot_too_large", "Snapshot exceeds size limit")
+  : error(503, "snapshot_unavailable", "Snapshot unavailable");
 const commandId = (): string => crypto.randomUUID();
 const safeFilename = (filename: string): string => filename.replace(/[^A-Za-z0-9._-]/g, "_") || "artifact";
 const decodeRouteId = (value: string): string | Response => {
   try { return decodeURIComponent(value); } catch { return error(400, "bad_request", "Invalid request"); }
+};
+const parseCursor = (value: string): number | Response => {
+  if (!/^\d+$/.test(value)) return error(400, "bad_request", "Invalid cursor");
+  const cursor = Number(value);
+  return Number.isSafeInteger(cursor) ? cursor : error(400, "bad_request", "Invalid cursor");
 };
 
 function sessionFromRow(row: Session): Session {
@@ -78,8 +90,13 @@ async function parsePairingRedemption(request: Request, limit: number): Promise<
     return { code: value.code, deviceName: value.deviceName };
   } catch { return error(400, "pairing_invalid", "Invalid JSON"); }
 }
-const actionWire = (action: PendingAction) => ({ id: action.id, sessionId: action.sessionId, version: action.version, expiresAt: action.expiresAt, status: action.status, type: action.type, payload: action.payload, artifactIds: action.artifactIds });
+const actionWire = (action: PendingAction) => ({ id: action.id, sessionId: action.sessionId, version: action.version, expiresAt: action.expiresAt, status: action.status, type: action.type, payload: action.payload, allowedResponses: action.allowedResponses, artifactIds: action.artifactIds });
 const artifactWire = (artifact: ArtifactMetadata) => ({ id: artifact.id, name: artifact.name, contentType: artifact.contentType, size: artifact.size, createdAt: artifact.createdAt });
+const requiresOwnerIntervention = (action: PendingAction): boolean => typeof action.payload === "object" && action.payload !== null && (action.payload as { requiresOwnerIntervention?: unknown }).requiresOwnerIntervention === true;
+const isActionableInboxAction = (action: PendingAction): boolean => action.status === "pending" || action.status === "dispatching" || (action.status === "unknown" && requiresOwnerIntervention(action) && action.allowedResponses.length > 0);
+export const DEFAULT_SNAPSHOT_TTL_MS = 10 * 60_000;
+export const DEFAULT_SNAPSHOT_MAX_ROWS = 5_000;
+const SNAPSHOT_PAGE_SIZE = 100;
 
 async function parseActionResponse(request: Request, limit: number): Promise<{ version: number; response: unknown } | Response> {
   const lengthError = contentLengthError(request, limit); if (lengthError) return lengthError;
@@ -139,13 +156,39 @@ const parseRange = (value: string | null): { start: number; end: number } | unde
   return Number.isSafeInteger(start) && Number.isSafeInteger(end) && start <= end ? { start, end } : error(416, "range_not_satisfiable", "Invalid range");
 };
 
+
 export function createHubServer(options: HubServerOptions): { fetch(request: Request): Promise<Response> } {
   const origin = options.publicOrigin ?? `http://${DEFAULT_HOST}:${DEFAULT_PORT}`;
   const limit = options.bodyLimitBytes ?? JSON_LIMIT;
+  const now = options.now ?? Date.now;
   const requests = new Map<string, { count: number; resetAt: number }>();
   const ownsSession = (sessionId: string, ownerId: string): boolean => {
     const session = options.database.getSessionForOwner(sessionId, ownerId);
     return session !== null && (options.authorizeSession?.(sessionId, ownerId) ?? true);
+  };
+  const canAccessActionSession = (action: PendingAction, ownerId: string): boolean => {
+    if (action.ownerId !== ownerId) return false;
+    if (!action.sessionId) return true;
+    const session = options.database.getSessionForOwner(action.sessionId, ownerId);
+    return session !== null && !session.archivedAt && (options.authorizeSession?.(session.id, ownerId) ?? true);
+  };
+  const isGenericOwnerSseEvent = (event: unknown): boolean => {
+    if (typeof event !== "object" || event === null || Array.isArray(event)) return false;
+    const entries = Object.entries(event);
+    return entries.length === 1 && entries[0]![0] === "type" && typeof entries[0]![1] === "string";
+  };
+  const createSnapshot = (ownerId: string) => {
+    const token = crypto.randomUUID();
+    const createdAt = now();
+    const snapshot = options.database.createMobileSnapshot({
+      token,
+      ownerId,
+      expiresAt: new Date(createdAt + DEFAULT_SNAPSHOT_TTL_MS).toISOString(),
+      authorizeSession: (session) => options.authorizeSession?.(session.id, ownerId) ?? true,
+      maxRows: DEFAULT_SNAPSHOT_MAX_ROWS,
+      at: new Date(createdAt).toISOString(),
+    });
+    return { token, watermark: snapshot.watermark };
   };
   const authenticate = async (request: Request): Promise<DeviceClaims | Response> => {
     const token = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
@@ -154,9 +197,9 @@ export function createHubServer(options: HubServerOptions): { fetch(request: Req
   };
   const rateLimit = (subject: string): Response | null => {
     const policy = options.rateLimit ?? { maxRequests: 120, windowMs: 60_000 };
-    const now = Date.now();
+    const at = now();
     const previous = requests.get(subject);
-    const entry = !previous || previous.resetAt <= now ? { count: 0, resetAt: now + policy.windowMs } : previous;
+    const entry = !previous || previous.resetAt <= at ? { count: 0, resetAt: at + policy.windowMs } : previous;
     entry.count++;
     requests.set(subject, entry);
     return entry.count > policy.maxRequests ? error(429, "rate_limited", "Rate limit exceeded") : null;
@@ -166,8 +209,8 @@ export function createHubServer(options: HubServerOptions): { fetch(request: Req
     return null;
   };
 
-  let recoveryState: RecoveryState = "recovering";
-  const recovery = Promise.resolve().then(async () => {
+  let recoveryState: RecoveryState = options.readOnly ? "ready" : "recovering";
+  const recovery = options.readOnly ? Promise.resolve() : Promise.resolve().then(async () => {
     const commands = options.database.listCommandsForRecovery<{ prompt: string }>();
     await Promise.all(commands.map(async (command) => {
       const session = options.database.getSession(command.sessionId);
@@ -193,6 +236,9 @@ export function createHubServer(options: HubServerOptions): { fetch(request: Req
   return { async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (!url.pathname.startsWith("/api/v1/")) return error(404, "not_found", "Not found");
+    if (options.readOnly && (request.method !== "GET" && request.method !== "HEAD" || url.pathname === "/api/v1/events" || /^\/api\/v1\/sessions\/[^/]+\/events$/.test(url.pathname) || url.pathname === "/api/v1/snapshot" || url.pathname === "/api/v1/snapshots")) {
+      return error(503, "readonly", "Hub is running in readonly mode");
+    }
     if (request.method === "POST" && url.pathname === "/api/v1/pairings/redeem") {
       const body = await parsePairingRedemption(request, limit); if (body instanceof Response) return body;
       try {
@@ -253,7 +299,7 @@ export function createHubServer(options: HubServerOptions): { fetch(request: Req
       if (!options.actions) return error(404, "not_found", "Not found");
       try {
         const actions = await options.actions.list(claims.sub);
-        return json({ actions: actions.filter((action) => action.ownerId === claims.sub).map(actionWire) });
+        return json({ actions: actions.filter((action) => canAccessActionSession(action, claims.sub)).map(actionWire) });
       } catch (cause) { return serviceError(cause); }
     }
     const actionMatch = /^\/api\/v1\/actions\/([^/]+)\/response$/.exec(url.pathname);
@@ -266,7 +312,8 @@ export function createHubServer(options: HubServerOptions): { fetch(request: Req
       const body = await parseActionResponse(request, limit); if (body instanceof Response) return body;
       try {
         const owned = await options.actions.list(claims.sub);
-        if (!owned.some((action) => action.id === id && action.ownerId === claims.sub)) return error(403, "action_forbidden", "Forbidden");
+        const action = owned.find((candidate) => candidate.id === id);
+        if (!action || !canAccessActionSession(action, claims.sub)) return error(403, "action_forbidden", "Forbidden");
         const result = await options.actions.respondWithEvent({ id, ownerId: claims.sub, version: body.version, response: body.response, idempotencyKey: key });
         return json({ action: actionWire(result.action), duplicate: result.duplicate }, result.duplicate ? 200 : 202);
       } catch (cause) { return serviceError(cause); }
@@ -296,8 +343,62 @@ export function createHubServer(options: HubServerOptions): { fetch(request: Req
         return new Response(content.content, { status: content.range ? 206 : 200, headers });
       } catch (cause) { return serviceError(cause); }
     }
+    if (request.method === "GET" && (url.pathname === "/api/v1/snapshot" || url.pathname === "/api/v1/snapshots")) {
+      try { return json(createSnapshot(claims.sub)); } catch (cause) { return snapshotCreationError(cause); }
+    }
+    const snapshotMatch = /^\/api\/v1\/snapshots?\/([^/]+)$/.exec(url.pathname);
+    if (request.method === "GET" && snapshotMatch) {
+      const token = decodeRouteId(snapshotMatch[1]!); if (token instanceof Response) return token;
+      const offset = Number(url.searchParams.get("offset") ?? "0"); const pageSize = Number(url.searchParams.get("limit") ?? String(SNAPSHOT_PAGE_SIZE));
+      if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > SNAPSHOT_PAGE_SIZE) return error(400, "bad_request", "Invalid snapshot page");
+      try {
+        const rows = options.database.readSnapshot<unknown>(token, claims.sub, new Date(now()).toISOString());
+        if (!rows) return error(410, "snapshot_expired", "Snapshot expired or unavailable");
+        return json({ token, offset, rows: rows.slice(offset, offset + pageSize), nextOffset: offset + pageSize < rows.length ? offset + pageSize : null });
+      } catch { return error(500, "internal_error", "Internal server error"); }
+    }
+    if (request.method === "POST" && (url.pathname === "/api/v1/snapshot/reset" || url.pathname === "/api/v1/snapshots/reset")) {
+      const csrfFailure = csrf(request); if (csrfFailure) return csrfFailure;
+      try { return json({ reset: true, ...createSnapshot(claims.sub) }); } catch (cause) { return snapshotCreationError(cause); }
+    }
     if (request.method === "GET" && url.pathname === "/api/v1/sessions") {
       return json({ sessions: options.database.listSessionsForOwner(claims.sub).filter((session) => options.authorizeSession?.(session.id, claims.sub) ?? true).map(sessionFromRow) });
+    }
+    if (request.method === "GET" && url.pathname === "/api/v1/work") {
+      return json({ work: options.database.listWorkItemsForOwner(claims.sub).filter((work) => options.authorizeSession?.(work.sessionId, claims.sub) ?? true) });
+    }
+    if (request.method === "GET" && (url.pathname === "/api/v1/hitl" || url.pathname === "/api/v1/inbox")) {
+      const actions = options.actions?.list(claims.sub) ?? [];
+      return json({
+        actions: actions
+          .filter((action) => isActionableInboxAction(action) && canAccessActionSession(action, claims.sub))
+          .map(actionWire),
+      });
+    }
+    if (request.method === "GET" && url.pathname === "/api/v1/history") {
+      return json({ sessions: options.database.listArchivedSessionsForOwner(claims.sub).filter((session) => options.authorizeSession?.(session.id, claims.sub) ?? true).map(sessionFromRow) });
+    }
+    const archiveMatch = /^\/api\/v1\/sessions\/([^/]+)\/archive$/.exec(url.pathname);
+    if (request.method === "POST" && archiveMatch) {
+      const sessionId = decodeRouteId(archiveMatch[1]!); if (sessionId instanceof Response) return sessionId;
+      const csrfFailure = csrf(request); if (csrfFailure) return csrfFailure;
+      if (!ownsSession(sessionId, claims.sub)) {
+        return options.database.getSession(sessionId) ? error(403, "forbidden", "Forbidden") : error(404, "not_found", "Session not found");
+      }
+      const existing = options.database.getSessionForOwner(sessionId, claims.sub);
+      if (existing?.archivedAt) return json({ session: sessionFromRow(existing) });
+      const archive = options.database.canArchiveSessionForOwner(sessionId, claims.sub);
+      if (!archive.eligible) return error(409, "archive_blocked", archive.blockers.join(",") || "Session cannot be archived");
+      const session = options.database.archiveSessionForOwner({ id: sessionId, ownerId: claims.sub, actorId: "owner", deviceId: claims.deviceId, correlationId: crypto.randomUUID() });
+      return session ? json({ session: sessionFromRow(session) }) : error(404, "not_found", "Session not found");
+    }
+    const unarchiveMatch = /^\/api\/v1\/sessions\/([^/]+)\/unarchive$/.exec(url.pathname);
+    if (request.method === "POST" && unarchiveMatch) {
+      const sessionId = decodeRouteId(unarchiveMatch[1]!); if (sessionId instanceof Response) return sessionId;
+      const csrfFailure = csrf(request); if (csrfFailure) return csrfFailure;
+      if (!ownsSession(sessionId, claims.sub)) return options.database.getSession(sessionId) ? error(403, "forbidden", "Forbidden") : error(404, "not_found", "Session not found");
+      const session = options.database.unarchiveSessionForOwner({ id: sessionId, ownerId: claims.sub, actorId: "owner", deviceId: claims.deviceId, correlationId: crypto.randomUUID() });
+      return session ? json({ session: sessionFromRow(session) }) : error(404, "not_found", "Session not found");
     }
     const promptMatch = /^\/api\/v1\/sessions\/([^/]+)\/prompt$/.exec(url.pathname);
     if (request.method === "POST" && promptMatch) {
@@ -311,6 +412,9 @@ export function createHubServer(options: HubServerOptions): { fetch(request: Req
       const session = options.database.getSessionForOwner(sessionId, claims.sub);
       if ((session as { controlMode?: string } | null)?.controlMode === "view-only") {
         return error(409, "view_only", "View-only sessions cannot be mutated");
+      }
+      if (session?.archivedAt) {
+        return error(409, "archived", "Archived sessions cannot be mutated");
       }
       const body = await parsePrompt(request, limit); if (body instanceof Response) return body;
       try {
@@ -343,18 +447,32 @@ export function createHubServer(options: HubServerOptions): { fetch(request: Req
         return options.database.getSession(sessionId) ? error(403, "forbidden", "Forbidden") : error(404, "not_found", "Session not found");
       }
       const cursorText = request.headers.get("last-event-id") ?? url.searchParams.get("after") ?? "0";
-      if (!/^\d+$/.test(cursorText)) return error(400, "bad_request", "Invalid cursor");
-      const after = Number(cursorText);
+      const after = parseCursor(cursorText); if (after instanceof Response) return after;
       const bounds = options.database.sqlite.query("SELECT MIN(seq) AS first, MAX(seq) AS last FROM events WHERE session_id = ?").get(sessionId) as { first: number | null; last: number | null };
       if (bounds.first !== null && after < bounds.first - 1) return json({ reset: "snapshot-required" }, 410);
       try {
         const events = options.database.listEvents<unknown>(sessionId, after);
         const wire = events.map((event) => `id: ${event.seq}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
-        return new Response(wire, { headers: { "content-type": "text/event-stream", "cache-control": "no-store", "connection": "keep-alive" } });
+        return new Response(wire, { headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-store", "x-stream-mode": "finite-catch-up" } });
       } catch (cause) {
         if (cause instanceof CorruptPersistentDataError) return error(500, "corrupt_data", "Session event data is corrupt");
         return error(500, "internal_error", "Internal server error");
       }
+    }
+    if (request.method === "GET" && url.pathname === "/api/v1/events") {
+      const cursorText = request.headers.get("last-event-id") ?? url.searchParams.get("after") ?? "0";
+      const after = parseCursor(cursorText); if (after instanceof Response) return after;
+      try {
+        const retentionFloor = options.database.minimumRetainedSseCursor(claims.sub);
+        if (after < retentionFloor) return json({ reset: "snapshot-required" }, 410);
+        const authorizedSessionIds = options.database.listSessionsForOwner(claims.sub)
+          .filter((session) => options.authorizeSession?.(session.id, claims.sub) ?? true)
+          .map((session) => session.id);
+        const events = options.database.listSseAfter<unknown>(claims.sub, after, authorizedSessionIds, SNAPSHOT_PAGE_SIZE)
+          .filter(({ sessionId, event }) => sessionId !== null || isGenericOwnerSseEvent(event));
+        const wire = events.map(({ id, event }) => `id: ${id}\nevent: update\ndata: ${JSON.stringify(event)}\n\n`).join("");
+        return new Response(wire, { headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-store", "x-stream-mode": "finite-catch-up" } });
+      } catch { return error(500, "internal_error", "Internal server error"); }
     }
     return error(404, "not_found", "Not found");
   } };

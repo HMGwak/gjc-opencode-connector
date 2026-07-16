@@ -6,12 +6,8 @@
   <string>com.planee.agent-hub</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/planee/.bun/bin/bun</string>
-    <string>run</string>
-    <string>src/index.ts</string>
+    <string>/Library/Application Support/planee-agent-hub/hub-guarded-launch.sh</string>
   </array>
-  <key>WorkingDirectory</key>
-  <string>/Users/planee/Automation/codeconnector/apps/hub</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>HUB_DATABASE_PATH</key>
@@ -22,12 +18,10 @@
     <string>/var/db/planee-agent-hub/pairing-root-secret</string>
     <key>HUB_PUBLIC_ORIGIN</key>
     <string>https://agents.myplanee.com</string>
-    <key>HUB_WEB_ROOT</key>
-    <string>/Users/planee/Automation/codeconnector/apps/web/dist</string>
     <key>GJC_CODING_AGENT_DIR</key>
     <string>/Users/planee/.gjc/agent</string>
     <key>PATH</key>
-    <string>/opt/homebrew/bin:/usr/bin:/bin</string>
+    <string>/usr/bin:/bin</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

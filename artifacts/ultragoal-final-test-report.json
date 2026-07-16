@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "goalId": "G001",
+  "plan": ".gjc/_session-019f6ae7-a212-7000-8b99-cbe5f6bbb38f/plans/ralplan/019f6ae7-a212-7000-8b99-cbe5f6bbb38f/pending-approval.md",
+  "commands": [
+    {
+      "command": "bun run typecheck",
+      "status": "passed"
+    },
+    {
+      "command": "bun test",
+      "status": "passed",
+      "summary": "193 passed, 0 failed, 2799 expectations across 20 files"
+    },
+    {
+      "command": "bun run build",
+      "status": "passed"
+    },
+    {
+      "command": "sh -n deploy/install-agent-hub.sh deploy/hub-guarded-launch.sh",
+      "status": "passed"
+    },
+    {
+      "command": "sh deploy/hub-guarded-launch.sh --self-test",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "browserEvidence": {
+    "kind": "web-gui-screenshot",
+    "path": "artifacts/ultragoal-mobile-inbox.png",
+    "viewport": "390x844",
+    "status": "verified"
+  },
+  "reviews": {
+    "cleanup": {
+      "ref": "agent://169-169-FinalCleanCleanup",
+      "status": "passed",
+      "blockers": []
+    },
+    "architecture": {
+      "ref": "agent://171-171-TerminalCleanArchitecture",
+      "architectureStatus": "CLEAR",
+      "productStatus": "CLEAR",
+      "codeStatus": "CLEAR",
+      "recommendation": "APPROVE",
+      "blockers": []
+    },
+    "executorQa": {
+      "ref": "agent://172-172-TerminalCleanQa",
+      "status": "passed",
+      "e2eStatus": "passed",
+      "redTeamStatus": "passed",
+      "blockers": []
+    }
+  }
+}

@@ -1,4 +1,11 @@
-export type ActionStatus = "pending" | "answered" | "cancelled" | "expired" | "unknown";
+export type ActionStatus = "pending" | "dispatching" | "answered" | "cancelled" | "expired" | "unknown";
+
+export type AllowedResponseWire = string | { readonly value: string; readonly label?: string };
+
+export type AllowedResponse = {
+  readonly value: string;
+  readonly label: string;
+};
 
 export type PendingAction = {
   readonly id: string;
@@ -9,10 +16,11 @@ export type PendingAction = {
   readonly expiresAt: string;
   readonly payload: unknown;
   readonly artifactIds: readonly string[];
+  readonly allowedResponses: readonly AllowedResponse[];
 };
 
 export type ActionsRequest = (path: string, init?: RequestInit) => Promise<Response>;
-export type ActionResponse = "approve" | "reject";
+export type ActionResponse = string;
 
 const terminalStates = new Set<ActionStatus>(["answered", "cancelled", "expired", "unknown"]);
 
@@ -40,12 +48,25 @@ export function isTerminalAction(action: Pick<PendingAction, "status" | "expires
 
 export function actionStateText(action: Pick<PendingAction, "status" | "expiresAt">, now = Date.now()): string {
   if (Number.isNaN(Date.parse(action.expiresAt)) || Date.parse(action.expiresAt) <= now) return "Expired";
+  if (action.status === "dispatching") return "Processing response…";
   if (terminalStates.has(action.status)) return action.status[0]!.toUpperCase() + action.status.slice(1);
   return "Pending";
 }
 
 function isActionStatus(value: unknown): value is ActionStatus {
-  return value === "pending" || value === "answered" || value === "cancelled" || value === "expired" || value === "unknown";
+  return value === "pending" || value === "dispatching" || value === "answered" || value === "cancelled" || value === "expired" || value === "unknown";
+}
+
+function parseAllowedResponses(value: unknown): AllowedResponse[] | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const responses = value.flatMap((item): AllowedResponse[] => {
+    if (typeof item === "string") return [{ value: item, label: item }];
+    if (typeof item !== "object" || item === null) return [];
+    const choice = item as Partial<Exclude<AllowedResponseWire, string>>;
+    if (typeof choice.value !== "string" || (choice.label !== undefined && typeof choice.label !== "string")) return [];
+    return [{ value: choice.value, label: choice.label ?? choice.value }];
+  });
+  return responses.length === value.length ? responses : null;
 }
 
 export function parseActions(value: unknown, sessionId: string): PendingAction[] {
@@ -54,9 +75,10 @@ export function parseActions(value: unknown, sessionId: string): PendingAction[]
     if (typeof item !== "object" || item === null) return [];
     const action = item as Record<string, unknown>;
     const version = action.version;
-    if (typeof action.id !== "string" || action.sessionId !== sessionId || typeof version !== "number" || !Number.isSafeInteger(version) || version < 0 || typeof action.type !== "string" || !isActionStatus(action.status) || typeof action.expiresAt !== "string" || !Object.prototype.hasOwnProperty.call(action, "payload")) return [];
+    const allowedResponses = parseAllowedResponses(action.allowedResponses);
+    if (typeof action.id !== "string" || action.sessionId !== sessionId || typeof version !== "number" || !Number.isSafeInteger(version) || version < 0 || typeof action.type !== "string" || !isActionStatus(action.status) || typeof action.expiresAt !== "string" || !Object.prototype.hasOwnProperty.call(action, "payload") || allowedResponses === null) return [];
     const artifactIds = Array.isArray(action.artifactIds) ? action.artifactIds.filter((id): id is string => typeof id === "string") : [];
-    return [{ id: action.id, sessionId, version, type: action.type, status: action.status, expiresAt: action.expiresAt, payload: action.payload, artifactIds }];
+    return [{ id: action.id, sessionId, version, type: action.type, status: action.status, expiresAt: action.expiresAt, payload: action.payload, artifactIds, allowedResponses }];
   });
 }
 
@@ -102,15 +124,17 @@ async function loadActions(panel: HTMLElement, sessionId: string, request: Actio
     const response = await request(actionPath());
     if (!response.ok) throw new Error(`request failed (${response.status})`);
     const actions = parseActions(await response.json(), sessionId);
+    if (!panel.isConnected) return;
     status.remove();
     if (actions.length === 0) panel.append(element("p", "No pending actions."));
     for (const action of actions) panel.append(renderAction(action, request));
   } catch (error) {
+    if (!panel.isConnected) return;
     status.textContent = `Unable to load actions: ${error instanceof Error ? error.message : "unexpected error."}`;
   }
 }
 
-function renderAction(action: PendingAction, request: ActionsRequest): HTMLElement {
+export function renderAction(action: PendingAction, request: ActionsRequest): HTMLElement {
   const card = element("article");
   card.className = "action-card";
   card.append(element("h3", action.type), element("p", actionSummary(action)));
@@ -134,20 +158,25 @@ function renderAction(action: PendingAction, request: ActionsRequest): HTMLEleme
   result.className = "action-result";
   result.setAttribute("aria-live", "polite");
   card.append(result);
-  if (isTerminalAction(action)) {
+  const canRespond = action.allowedResponses.length > 0 && (action.status === "pending" || action.status === "unknown") && !Number.isNaN(Date.parse(action.expiresAt)) && Date.parse(action.expiresAt) > Date.now();
+  if (action.status === "dispatching") {
     result.textContent = actionStateText(action);
+    return card;
+  }
+  if (!canRespond) {
+    result.textContent = action.status === "unknown" ? "Manual review required; action controls are unavailable." : isTerminalAction(action) ? actionStateText(action) : "Action controls are unavailable.";
     return card;
   }
   const controls = element("div");
   controls.className = "action-controls";
   let retry: { response: ActionResponse; key: string } | null = null;
-  for (const response of ["approve", "reject"] as const) {
-    const button = element("button", response === "approve" ? "Approve" : "Reject");
+  for (const allowed of action.allowedResponses) {
+    const button = element("button", allowed.label);
     button.type = "button";
     button.addEventListener("click", () => {
-      const key = retry?.response === response ? retry.key : crypto.randomUUID();
-      retry = { response, key };
-      void respond(action, response, key, request, controls, result);
+      const key = retry !== null && retry.response === allowed.value ? retry.key : crypto.randomUUID();
+      retry = { response: allowed.value, key };
+      void respond(action, allowed.value, key, request, controls, result);
     });
     controls.append(button);
   }

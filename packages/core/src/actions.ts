@@ -11,6 +11,7 @@ export class PendingActionError extends Error {
 
 export interface CreatePendingAction<T> {
   readonly id?: string;
+  readonly ownerId: string;
   readonly payload: T;
   readonly expiresAt: string;
 }
@@ -40,10 +41,11 @@ export class PendingActionService {
   create<T>(input: CreatePendingAction<T>): PendingAction<T> {
     const id = input.id ?? this.createId();
     if (!id) throw new Error("Pending action ID must not be empty");
+    if (!input.ownerId.trim()) throw new Error("Pending action owner must not be empty");
     const expiry = new Date(input.expiresAt);
     if (Number.isNaN(expiry.getTime())) throw new Error("Pending action expiry must be an ISO timestamp");
     return this.database.transaction(() => {
-      const action = this.database.createPendingAction({ id, payload: input.payload, expiresAt: expiry.toISOString() });
+      const action = this.database.createPendingAction({ id, ownerId: input.ownerId, payload: input.payload, expiresAt: expiry.toISOString() });
       this.database.writeAudit({ action: "pending-action.created", payload: { id: action.id, version: action.version, expiresAt: action.expiresAt } });
       return action;
     });

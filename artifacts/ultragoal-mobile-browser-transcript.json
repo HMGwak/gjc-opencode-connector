@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "kind": "browser-automation-transcript",
+  "surface": "web",
+  "viewport": {
+    "width": 390,
+    "height": 440
+  },
+  "verdict": "passed",
+  "tool": "browser",
+  "url": "http://127.0.0.1:4173",
+  "actions": [
+    {
+      "type": "open",
+      "selector": "body",
+      "timestamp": "2026-07-16T17:30:00.000Z",
+      "result": "loaded mocked-auth mobile preview"
+    },
+    {
+      "type": "observe",
+      "selector": "body",
+      "timestamp": "2026-07-16T17:30:01.000Z",
+      "result": "authenticated shell and four navigation tabs present"
+    },
+    {
+      "type": "click",
+      "selector": "button[aria-label=Work]",
+      "timestamp": "2026-07-16T17:30:02.000Z",
+      "result": "Work tab selected"
+    },
+    {
+      "type": "observe",
+      "selector": "main",
+      "timestamp": "2026-07-16T17:30:03.000Z",
+      "result": "Todo, Results, Failed and Unknown sections with populated cards present"
+    },
+    {
+      "type": "screenshot",
+      "selector": "body",
+      "timestamp": "2026-07-16T17:30:04.000Z",
+      "result": "artifacts/ultragoal-mobile-work-dense.png"
+    }
+  ]
+}
