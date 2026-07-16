@@ -3,7 +3,7 @@ import { DeviceCredentialVerifier } from "./auth";
 import { readPairingSecret } from "./pairing-secret";
 import { createHubServer, DEFAULT_HOST, DEFAULT_PORT } from "./server";
 import { acquireRuntimeLock, backupThenOpenDatabase } from "./startup";
-import { GjcCoordinatorClient, GjcSessionSynchronizer } from "./gjc-mcp-client";
+import { GjcOnDiskDiscovery } from "./gjc-ondisk-discovery";
 import { createHubWebHandler } from "./web";
 
 const ownerId = process.env.HUB_OWNER_ID;
@@ -22,19 +22,16 @@ try {
 }
 const auth = new DeviceCredentialVerifier({ database, ownerId, pairingSecret: await readPairingSecret(secretPath) });
 const api = createHubServer({ database, auth, publicOrigin: process.env.HUB_PUBLIC_ORIGIN });
-const coordinatorRoots = process.env.HUB_GJC_WORKDIR_ROOTS ?? process.env.GJC_COORDINATOR_MCP_WORKDIR_ROOTS;
-if (coordinatorRoots) {
-  const synchronizer = new GjcSessionSynchronizer(
-    database,
-    ownerId,
-    new GjcCoordinatorClient({ executable: process.env.HUB_GJC_EXECUTABLE ?? "gjc", workdirRoots: coordinatorRoots }),
-  );
-  const synchronize = () => void synchronizer.synchronize().catch(() => console.warn("GJC coordinator session synchronization failed"));
-  synchronize();
-  const intervalMs = Number.parseInt(process.env.HUB_GJC_SYNC_INTERVAL_MS ?? "30000", 10);
-  const interval = setInterval(synchronize, Number.isFinite(intervalMs) && intervalMs >= 1_000 ? intervalMs : 30_000);
-  interval.unref();
-}
+const discovery = new GjcOnDiskDiscovery({
+  database,
+  ownerId,
+  codingAgentDir: process.env.GJC_CODING_AGENT_DIR,
+});
+const synchronize = () => void discovery.synchronize().catch(() => console.warn("GJC on-disk session discovery failed"));
+synchronize();
+const intervalMs = Number.parseInt(process.env.HUB_GJC_SYNC_INTERVAL_MS ?? "15000", 10);
+const interval = setInterval(synchronize, Number.isFinite(intervalMs) && intervalMs >= 1_000 ? intervalMs : 15_000);
+interval.unref();
 const handler = createHubWebHandler({ api, webRoot });
 const server = Bun.serve({ hostname: DEFAULT_HOST, port: DEFAULT_PORT, fetch: handler.fetch });
 

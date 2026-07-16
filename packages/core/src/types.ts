@@ -1,4 +1,7 @@
 export type SessionStatus = "active" | "stale" | "unknown" | "terminal";
+export type SessionControlMode = "view-only" | "controlled";
+export type SessionOrigin = "ondisk-discovery" | "coordinator-start" | "coordinator-resume" | "coordinator-continuation" | "opencode-discovery";
+export type TranscriptStatus = "available" | "unreadable";
 export type CommandState =
   | "accepted"
   | "dispatching"
@@ -34,6 +37,9 @@ export interface Session {
   readonly reconciliationEpoch: number;
   readonly reconciled: boolean;
   readonly remoteRevision: string | null;
+  readonly controlMode: SessionControlMode;
+  readonly origin: SessionOrigin;
+  readonly transcriptStatus: TranscriptStatus;
   readonly createdAt: string;
   readonly updatedAt: string;
 }

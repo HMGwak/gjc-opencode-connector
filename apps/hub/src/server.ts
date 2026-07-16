@@ -308,6 +308,10 @@ export function createHubServer(options: HubServerOptions): { fetch(request: Req
       if (!ownsSession(sessionId, claims.sub)) {
         return options.database.getSession(sessionId) ? error(403, "forbidden", "Forbidden") : error(404, "not_found", "Session not found");
       }
+      const session = options.database.getSessionForOwner(sessionId, claims.sub);
+      if ((session as { controlMode?: string } | null)?.controlMode === "view-only") {
+        return error(409, "view_only", "View-only sessions cannot be mutated");
+      }
       const body = await parsePrompt(request, limit); if (body instanceof Response) return body;
       try {
         const id = (options.commandId ?? commandId)();

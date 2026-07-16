@@ -7,9 +7,12 @@ import type {
   PendingActionState,
   PushSubscription,
   Session,
+  SessionControlMode,
   SessionEvent,
+  SessionOrigin,
   SessionStatus,
   StoredPushSubscription,
+  TranscriptStatus,
 } from "./types";
 
 const SECRET_KEY = /(?:secret|password|token|api[_-]?key|authorization|credential|private[_-]?key|auth)/i;
@@ -287,6 +290,7 @@ const migratePhase0 = (database: Database): void => {
 interface SessionRow {
   id: string; owner_id: string | null; adapter: string; remote_id: string; status: SessionStatus;
   reconciliation_epoch: number; reconciled: number; remote_revision: string | null;
+  control_mode: SessionControlMode; origin: SessionOrigin; transcript_status: TranscriptStatus;
   created_at: string; updated_at: string;
 }
 interface EventRow { session_id: string; seq: number; type: string; payload_json: string; created_at: string; }
@@ -322,7 +326,12 @@ const decodeJson = <T>(value: string, record: string): T => {
 };
 const asSession = (row: SessionRow): Session => {
   if (row.owner_id === null) throw new Error("Session is quarantined pending owner claim");
-  return { id: row.id, ownerId: row.owner_id, adapter: row.adapter, remoteId: row.remote_id, status: row.status, reconciliationEpoch: row.reconciliation_epoch, reconciled: row.reconciled === 1, remoteRevision: row.remote_revision, createdAt: row.created_at, updatedAt: row.updated_at };
+  return {
+    id: row.id, ownerId: row.owner_id, adapter: row.adapter, remoteId: row.remote_id,
+    status: row.status, reconciliationEpoch: row.reconciliation_epoch, reconciled: row.reconciled === 1,
+    remoteRevision: row.remote_revision, controlMode: row.control_mode, origin: row.origin,
+    transcriptStatus: row.transcript_status, createdAt: row.created_at, updatedAt: row.updated_at,
+  };
 };
 const asEvent = <T>(row: EventRow): SessionEvent<T> => ({ sessionId: row.session_id, seq: row.seq, type: row.type, payload: decodeJson<T>(row.payload_json, `event ${row.session_id}:${row.seq}`), createdAt: row.created_at });
 const asCommand = <T>(row: CommandRow): Command<T> => ({ id: row.id, sessionId: row.session_id, idempotencyKey: row.idempotency_key, state: row.state, correlationId: row.correlation_id, attempt: row.attempt, leaseExpiresAt: row.lease_expires_at, payload: decodeJson<T>(row.payload_json, `command ${row.id}`), createdAt: row.created_at, updatedAt: row.updated_at });
@@ -394,8 +403,97 @@ export class CoreDatabase {
   createSession(input: Pick<Session, "id" | "ownerId" | "adapter" | "remoteId">): Session {
     if (!input.ownerId) throw new TypeError("Session owner is required");
     const timestamp = now();
-    this.sqlite.query("INSERT INTO sessions (id, owner_id, adapter, remote_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, 'active', ?, ?)").run(input.id, input.ownerId, input.adapter, input.remoteId, timestamp, timestamp);
+    this.sqlite.query("INSERT INTO sessions (id, owner_id, adapter, remote_id, status, control_mode, origin, created_at, updated_at) VALUES (?, ?, ?, ?, 'active', 'controlled', 'coordinator-start', ?, ?)").run(input.id, input.ownerId, input.adapter, input.remoteId, timestamp, timestamp);
     return this.getSession(input.id)!;
+  }
+
+  upsertDiscoveredSession(input: {
+    id: string; ownerId: string; adapter: "gjc"; remoteId: string; controlMode: "view-only";
+    origin: "ondisk-discovery"; transcriptStatus: TranscriptStatus; updatedAt: string;
+  }): Session {
+    if (!input.ownerId) throw new TypeError("Session owner is required");
+    const createdAt = now();
+    this.sqlite.query(`
+      INSERT INTO sessions (
+        id, owner_id, adapter, remote_id, status, control_mode, origin, transcript_status, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
+      ON CONFLICT(adapter, remote_id) DO UPDATE SET
+        updated_at = excluded.updated_at,
+        transcript_status = excluded.transcript_status
+    `).run(
+      input.id, input.ownerId, input.adapter, input.remoteId, input.controlMode, input.origin,
+      input.transcriptStatus, createdAt, input.updatedAt,
+    );
+    const row = this.sqlite.query("SELECT * FROM sessions WHERE adapter = ? AND remote_id = ? AND owner_id IS NOT NULL")
+      .get(input.adapter, input.remoteId) as SessionRow | null;
+    if (!row) throw new Error("Discovered session belongs to another owner or is quarantined");
+    return asSession(row);
+  }
+
+  claimView(input: { sessionId: string; owner: string; claimedAt: string; staleBefore: string }): boolean {
+    const result = this.sqlite.query(`
+      UPDATE sessions SET view_owner = ?, view_claimed_at = ?
+      WHERE id = ? AND control_mode = 'view-only'
+        AND (view_owner IS NULL OR view_owner = ? OR view_claimed_at < ?)
+    `).run(input.owner, input.claimedAt, input.sessionId, input.owner, input.staleBefore);
+    return result.changes === 1;
+  }
+
+  projectRemoteBatch(input: {
+    mode: "view"; sessionId: string; adapter: string; source: "gjc-ondisk";
+    cursorScope: string; owner: string; cursor: string;
+    events: ReadonlyArray<{
+      sourceEventId: string; sourceRevision: string; sourcePosition: number; contentHash: string;
+      type: string; payload: unknown; createdAt: string;
+    }>;
+  }): number {
+    return this.transaction(() => {
+      const lease = this.sqlite.query(
+        "SELECT 1 AS held FROM sessions WHERE id = ? AND control_mode = 'view-only' AND view_owner = ?",
+      ).get(input.sessionId, input.owner);
+      if (!lease) throw new Error("View projection lease is not held");
+
+      let nextSeq = (this.sqlite.query("SELECT COALESCE(MAX(seq), 0) AS seq FROM events WHERE session_id = ?")
+        .get(input.sessionId) as { seq: number }).seq;
+      let inserted = 0;
+      for (const event of input.events) {
+        const existing = this.sqlite.query(`
+          SELECT source_revision, source_position, content_hash FROM events
+          WHERE session_id = ? AND source = ? AND source_event_id = ?
+        `).get(input.sessionId, input.source, event.sourceEventId) as {
+          source_revision: string | null; source_position: number | null; content_hash: string | null;
+        } | null;
+        if (existing) {
+          if (existing.source_revision !== event.sourceRevision || existing.source_position !== event.sourcePosition || existing.content_hash !== event.contentHash) {
+            throw new Error("Remote event identity changed");
+          }
+          continue;
+        }
+        nextSeq++;
+        this.sqlite.query(`
+          INSERT INTO events (
+            session_id, seq, type, payload_json, created_at, source_event_id,
+            source_revision, source_position, content_hash, source
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          input.sessionId, nextSeq, event.type, json(event.payload), event.createdAt, event.sourceEventId,
+          event.sourceRevision, event.sourcePosition, event.contentHash, input.source,
+        );
+        inserted++;
+      }
+      this.sqlite.query(`
+        INSERT INTO remote_cursors (session_id, adapter, source, cursor_scope, cursor_value, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(session_id, adapter, source, cursor_scope) DO UPDATE SET
+          cursor_value = excluded.cursor_value,
+          updated_at = excluded.updated_at
+      `).run(input.sessionId, input.adapter, input.source, input.cursorScope, input.cursor, now());
+      const leaseStillHeld = this.sqlite.query(
+        "SELECT 1 AS held FROM sessions WHERE id = ? AND control_mode = 'view-only' AND view_owner = ?",
+      ).get(input.sessionId, input.owner);
+      if (!leaseStillHeld) throw new Error("View projection lease was lost");
+      return inserted;
+    });
   }
 
   getSession(id: string): Session | null {
