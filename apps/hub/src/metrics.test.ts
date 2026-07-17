@@ -93,6 +93,11 @@ describe("operational metrics", () => {
     expect(metrics).toContain("snapshot_tokens_active_count 1");
     expect(metrics).toContain("backfill_jobs_running_count 1");
     expect(metrics).toContain("cutover_pending_sessions_count 0");
+    expect(metrics).toContain("session_hierarchy_roots_count 0");
+    expect(metrics).toContain("session_hierarchy_internal_count 0");
+    expect(metrics).toContain("session_hierarchy_unknown_count 0");
+    expect(metrics).toContain("session_hierarchy_backfill_incomplete_count 0");
+    expect(metrics).toContain("session_hierarchy_generation_leases_count 0");
     const lagLines = metrics.match(/^projection_checkpoint_lag_events\{session_id="[^"]+"\} \d+$/gm) ?? [];
     expect(lagLines).toHaveLength(20);
     expect(lagLines[0]).toContain('session_id="lag-00"');

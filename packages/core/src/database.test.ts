@@ -440,6 +440,7 @@ describe("CoreDatabase", () => {
     })).toBeFalse();
     expect(db.sqlite.query("SELECT COUNT(*) AS count FROM work_items WHERE projector_version = 'v2'").get()).toEqual({ count: 0 });
     expect(db.listWorkItemsForOwner("owner-1").map(({ id }) => id)).toEqual(["v1-a"]);
+    expect(db.getSessionForOwner("session-1", "owner-1")?.activeProjectorVersion).toBe("v1");
 
     expect(db.cutoverProjectorVersion({
       sessionId: "session-1", ownerId: "owner-1", projectorVersion: "v2",
@@ -469,6 +470,76 @@ describe("CoreDatabase", () => {
     db.archiveSessionForOwner({ id: "session-1", ownerId: "owner-1" });
     expect(db.cutoverProjectorVersion({ ...input, ownerId: "owner-1" })).toBeFalse();
     expect(db.sqlite.query("SELECT COUNT(*) AS count FROM work_items WHERE id = 'shadow'").get()).toEqual({ count: 0 });
+  });
+  test("aggregates continuation identity from the origin and lifecycle state from the head", () => {
+    const db = database();
+    const origin = db.createSession({ id: "origin", ownerId: "owner-1", adapter: "adapter", remoteId: "remote-origin" });
+    const head = db.createSession({ id: "head", ownerId: "owner-1", adapter: "adapter", remoteId: "remote-head", continuationParentId: origin.id });
+    db.sqlite.query("UPDATE sessions SET title = 'Origin title' WHERE id = ?").run(origin.id);
+    db.setReconciliation(head.id, "terminal", 1, true, "head-revision");
+
+    expect(db.getSessionForOwner(head.id, "owner-1")).toMatchObject({
+      continuationParentId: origin.id,
+      origin: "coordinator-continuation",
+    });
+    expect(db.getContinuationAggregateForOwner(head.id, "owner-1")).toMatchObject({
+      id: origin.id,
+      remoteId: "remote-origin",
+      title: "Origin title",
+      status: "terminal",
+      reconciliationEpoch: 1,
+      remoteRevision: "head-revision",
+    });
+  });
+
+  test("keeps single-segment event cursors compatible with local sequence numbers", () => {
+    const db = database();
+    db.createSession({ id: "origin", ownerId: "owner-1", adapter: "adapter", remoteId: "remote-origin" });
+    db.appendEvent("origin", "first", { value: 1 });
+    db.appendEvent("origin", "second", { value: 2 });
+
+    expect(db.listEvents("origin").map(({ seq }) => seq)).toEqual([1, 2]);
+    expect(db.listEvents("origin", 1).map(({ seq }) => seq)).toEqual([2]);
+  });
+
+  test("maps multi-segment local sequences to strictly increasing safe global cursors", () => {
+    const db = database();
+    db.createSession({ id: "origin", ownerId: "owner-1", adapter: "adapter", remoteId: "remote-origin" });
+    db.createSession({ id: "middle", ownerId: "owner-1", adapter: "adapter", remoteId: "remote-middle", continuationParentId: "origin" });
+    db.createSession({ id: "head", ownerId: "owner-1", adapter: "adapter", remoteId: "remote-head", continuationParentId: "middle" });
+    db.appendEvent("origin", "origin", {});
+    db.appendEvent("middle", "middle", {});
+    db.appendEvent("head", "head", {});
+
+    const events = db.listEvents("middle");
+    expect(events.map(({ seq }) => seq)).toEqual([1, 10_000_001, 20_000_001]);
+    expect(events.every(({ seq }) => Number.isSafeInteger(seq))).toBeTrue();
+    expect(events.every((event, index) => index === 0 || events[index - 1]!.seq < event.seq)).toBeTrue();
+    expect(db.listEvents("origin", 10_000_001).map(({ type }) => type)).toEqual(["head"]);
+  });
+
+  test("rejects continuation local sequences outside the global cursor domain", () => {
+    const db = database();
+    db.createSession({ id: "origin", ownerId: "owner-1", adapter: "adapter", remoteId: "remote-origin" });
+    db.sqlite.query("INSERT INTO events (session_id, seq, type, payload_json, created_at) VALUES (?, ?, ?, '{}', ?)").run("origin", 10_000_000, "invalid", "2026-01-01T00:00:00.000Z");
+
+    expect(() => db.listEvents("origin")).toThrow("Invalid continuation event sequence");
+    expect(() => db.listEvents("origin", Number.MAX_SAFE_INTEGER + 1)).toThrow("Invalid continuation event sequence");
+  });
+
+  test("rejects missing, cross-owner, ambiguous, and cyclic continuation lineages", () => {
+    const db = database();
+    db.createSession({ id: "origin", ownerId: "owner-1", adapter: "adapter", remoteId: "remote-origin" });
+    db.createSession({ id: "foreign", ownerId: "owner-2", adapter: "adapter", remoteId: "remote-foreign" });
+    expect(() => db.createSession({ id: "missing-child", ownerId: "owner-1", adapter: "adapter", remoteId: "missing-child", continuationParentId: "missing" })).toThrow("Continuation parent must belong");
+    expect(() => db.createSession({ id: "foreign-child", ownerId: "owner-1", adapter: "adapter", remoteId: "foreign-child", continuationParentId: "foreign" })).toThrow("Continuation parent must belong");
+
+    db.createSession({ id: "child-a", ownerId: "owner-1", adapter: "adapter", remoteId: "child-a", continuationParentId: "origin" });
+    db.createSession({ id: "child-b", ownerId: "owner-1", adapter: "adapter", remoteId: "child-b", continuationParentId: "origin" });
+    expect(() => db.listEvents("origin")).toThrow("Ambiguous continuation lineage");
+
+    db.sqlite.query("UPDATE sessions SET continuation_parent_id = ? WHERE id = ?").run("child-a", "origin");
+    expect(() => db.listEvents("child-a")).toThrow("Invalid continuation lineage");
   });
   test("enforces owned non-null outbox sessions and bounded redaction", () => {
     const db = database();
@@ -1070,4 +1141,71 @@ test("preflight rebuilds malformed work items, quarantines bad ownership, and pr
     expect(project()).toBe(3);
     expect(applied).toEqual([1, 2, 3]);
     expect(db.listProjectionGaps("high-seq")[0]?.resolvedAt).toEqual(expect.any(String));
+  });
+  test("fails closed for required adapters without a run and accepts terminal evidence", () => {
+    const db = database();
+    db.createHierarchyBackfillSnapshot("owner-h", 1, 1, ["gjc"]);
+    expect(db.hierarchyCoverageGapCount("owner-h", 1, 1)).toBe(1);
+    db.upsertHierarchyBackfillRun({ ownerId: "owner-h", adapter: "gjc", epoch: 1, cycle: 1, state: "enumerating", expectedSourceKeys: 1, observedSourceKeys: 0, frozenAt: null });
+    db.addHierarchyBackfillManifestEntry("owner-h", "gjc", 1, 1, "broken");
+    db.upsertHierarchyBackfillRun({ ownerId: "owner-h", adapter: "gjc", epoch: 1, cycle: 1, state: "complete", expectedSourceKeys: 1, observedSourceKeys: 1, frozenAt: "2026-01-01T00:00:00.000Z" });
+    db.upsertSessionHierarchyEvidence({ ownerId: "owner-h", adapter: "gjc", sourceKey: "broken", sessionId: "hidden", identityNamespace: "gjc", observedParentSessionId: null, observedParentOwnerId: null, directHumanEvidence: false, structuralKind: "subagent", observationState: "unreadable", capturedEpoch: 1, deletedAt: null });
+    db.freezeHierarchyBackfillSnapshot("owner-h", 1, 1);
+    expect(db.hierarchyCoverageGapCount("owner-h", 1, 1)).toBe(0);
+  });
+  test("keeps frozen cycles and runs immutable", () => {
+    const db = database();
+    db.createHierarchyBackfillSnapshot("owner-frozen", 1, 1, ["gjc"]);
+    db.upsertHierarchyBackfillRun({ ownerId: "owner-frozen", adapter: "gjc", epoch: 1, cycle: 1, state: "complete", expectedSourceKeys: 0, observedSourceKeys: 0, frozenAt: "2026-01-01T00:00:00.000Z" });
+    expect(() => db.upsertHierarchyBackfillRun({ ownerId: "owner-frozen", adapter: "gjc", epoch: 1, cycle: 1, state: "complete", expectedSourceKeys: 1, observedSourceKeys: 1, frozenAt: "2026-01-01T00:00:00.000Z" })).toThrow("immutable");
+    db.freezeHierarchyBackfillSnapshot("owner-frozen", 1, 1);
+    expect(() => db.upsertHierarchyBackfillRun({ ownerId: "owner-frozen", adapter: "late", epoch: 1, cycle: 1, state: "enumerating", expectedSourceKeys: 0, observedSourceKeys: 0, frozenAt: null })).toThrow("immutable");
+    expect(() => db.upsertHierarchyBackfillRun({ ownerId: "owner-frozen", adapter: "gjc", epoch: 1, cycle: 1, state: "complete", expectedSourceKeys: 1, observedSourceKeys: 1, frozenAt: "2026-01-01T00:00:00.000Z" })).toThrow("immutable");
+  });
+  test("refuses to freeze a snapshot missing a required run", () => {
+    const db = database();
+    db.createHierarchyBackfillSnapshot("owner-missing", 1, 1, ["gjc"]);
+    expect(() => db.freezeHierarchyBackfillSnapshot("owner-missing", 1, 1)).toThrow("required backfill run");
+  });
+  test("counts only non-continuation internal failure statuses in hierarchy rollups", () => {
+    const db = database();
+    db.createSession({ id: "rollup-root", ownerId: "owner-rollup", adapter: "adapter", remoteId: "root" });
+    db.createSession({ id: "rollup-internal", ownerId: "owner-rollup", adapter: "adapter", remoteId: "internal" });
+    db.createSession({ id: "rollup-continuation", ownerId: "owner-rollup", adapter: "adapter", remoteId: "continuation", continuationParentId: "rollup-root" });
+    db.sqlite.query("UPDATE sessions SET status='stale' WHERE id='rollup-root'").run();
+    db.sqlite.query("UPDATE sessions SET status='unknown' WHERE id='rollup-internal'").run();
+    db.sqlite.query("UPDATE sessions SET status='stale' WHERE id='rollup-continuation'").run();
+    db.projectSessionHierarchy("owner-rollup", 1, [
+      { ownerId: "owner-rollup", generation: 1, sessionId: "rollup-root", kind: "root", rootSessionId: "rollup-root", parentSessionId: null, unknownReason: null, lineageKind: "direct", internalKind: null, subagentIdentity: null },
+      { ownerId: "owner-rollup", generation: 1, sessionId: "rollup-internal", kind: "internal", rootSessionId: "rollup-root", parentSessionId: "rollup-root", unknownReason: null, lineageKind: "direct", internalKind: null, subagentIdentity: null },
+      { ownerId: "owner-rollup", generation: 1, sessionId: "rollup-continuation", kind: "internal", rootSessionId: "rollup-root", parentSessionId: "rollup-root", unknownReason: null, lineageKind: "continuation", internalKind: null, subagentIdentity: null },
+    ]);
+    expect(db.hierarchyRollups("owner-rollup", 1)).toMatchObject([{ rootSessionId: "rollup-root", failureCount: 1 }]);
+  });
+  test("retains generations held by an in-process lease", () => {
+    const db = database();
+    db.projectSessionHierarchy("owner-h", 1, [{ ownerId: "owner-h", generation: 1, sessionId: "root", kind: "root", rootSessionId: "root", parentSessionId: null, unknownReason: null, lineageKind: "direct", internalKind: null, subagentIdentity: null }]);
+    const lease = db.acquireGenerationLease("owner-h");
+    db.projectSessionHierarchy("owner-h", 2, [{ ownerId: "owner-h", generation: 2, sessionId: "root-2", kind: "root", rootSessionId: "root-2", parentSessionId: null, unknownReason: null, lineageKind: "direct", internalKind: null, subagentIdentity: null }]);
+    expect(db.pruneOldGenerations("owner-h")).toBe(0);
+    db.releaseGenerationLease("owner-h", lease);
+    expect(db.pruneOldGenerations("owner-h")).toBe(1);
+  });
+  test("coordinates frozen cycles, readiness, and boot lease reset without Hub SQL", () => {
+    const db = database();
+    const empty = db.beginHierarchyBackfillCycle("owner-cycle", { epoch: 1, requiredAdapters: [] });
+    expect(db.getHierarchyReadiness("owner-cycle", 1, empty.cycle)).toMatchObject({ ready: false, coverageGapCount: 1 });
+    db.freezeHierarchyBackfillSnapshot("owner-cycle", 1, empty.cycle);
+    expect(db.hierarchyCoverageGapCount("owner-cycle", 1, empty.cycle)).toBe(0);
+    const next = db.beginHierarchyBackfillCycle("owner-cycle", { epoch: 1, requiredAdapters: ["gjc"] });
+    expect(next.cycle).toBe(empty.cycle + 1);
+    db.upsertHierarchyBackfillRun({ ownerId: "owner-cycle", adapter: "gjc", epoch: 1, cycle: next.cycle, state: "enumerating", expectedSourceKeys: 0, observedSourceKeys: 0, frozenAt: null });
+    db.addHierarchyBackfillManifestEntry("owner-cycle", "gjc", 1, next.cycle, "late-source");
+    db.upsertHierarchyBackfillRun({ ownerId: "owner-cycle", adapter: "gjc", epoch: 1, cycle: next.cycle, state: "complete", expectedSourceKeys: 0, observedSourceKeys: 0, frozenAt: "2026-01-01T00:00:00.000Z" });
+    expect(() => db.addHierarchyBackfillManifestEntry("owner-cycle", "gjc", 1, next.cycle, "after-freeze")).toThrow("immutable");
+    const following = db.beginHierarchyBackfillCycle("owner-cycle", { epoch: 1, requiredAdapters: ["gjc"] });
+    expect(following.cycle).toBe(next.cycle + 1);
+    const lease = db.acquireGenerationLease("owner-cycle");
+    db.resetHierarchyGenerationLeases();
+    expect(() => db.releaseGenerationLease("owner-cycle", lease)).toThrow("not acquired");
   });

@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "observedAt": "2026-07-17T01:40:00Z",
+  "commands": [
+    {"command": "bun run typecheck", "status": "passed"},
+    {"command": "bun test", "status": "passed", "tests": 226, "failures": 0, "expectations": 2916},
+    {"command": "bun run build", "status": "passed"},
+    {"command": "git diff --check", "status": "passed"}
+  ],
+  "browser": {
+    "viewport": "390x844",
+    "status": "passed",
+    "artifact": "artifacts/session-hierarchy-linear-mobile.png",
+    "observations": ["Persistent bottom navigation", "Root-only session row with internal rollups", "Stable session detail", "Collapsed internal activity disclosure"]
+  }
+}

@@ -62,6 +62,7 @@ export interface Session {
   readonly sourceCreatedAt: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
+  readonly continuationParentId?: string | null;
 }
 export interface WorkItem<T = unknown> {
   readonly id: string;
@@ -181,4 +182,69 @@ export interface AgentAdapter {
   readonly reconciliationCapabilities: ReconciliationCapabilities;
   reconcile(session: Session, epoch: number): Promise<ReconciliationSnapshot | null>;
   prompt?(sessionId: string, prompt: string): Promise<void>;
+}
+export type SessionHierarchyKind = "root" | "internal" | "unknown";
+export type SessionHierarchyUnknownReason =
+  | "missing-human-evidence" | "self-parent" | "cycle" | "cross-owner-parent"
+  | "duplicate-header-id" | "missing-parent" | "depth-limit" | "invalid-evidence";
+export type SessionHierarchyObservationState = "valid" | "unreadable" | "missing-parent" | "conflict";
+export type SessionHierarchyLineageKind = "direct" | "continuation" | "subagent" | "tool" | "review" | null;
+
+export interface SessionHierarchyEvidence {
+  readonly ownerId: string;
+  readonly adapter: string;
+  readonly sourceKey: string;
+  readonly sessionId: string;
+  readonly identityNamespace: string;
+  readonly observedParentSessionId: string | null;
+  readonly observedParentOwnerId: string | null;
+  readonly directHumanEvidence: boolean;
+  readonly structuralKind: Exclude<SessionHierarchyLineageKind, null>;
+  readonly observationState: SessionHierarchyObservationState;
+  readonly capturedEpoch: number;
+  readonly deletedAt: string | null;
+}
+
+export interface SessionHierarchyProjection {
+  readonly ownerId: string;
+  readonly generation: number;
+  readonly sessionId: string;
+  readonly kind: SessionHierarchyKind;
+  readonly rootSessionId: string | null;
+  readonly parentSessionId: string | null;
+  readonly unknownReason: SessionHierarchyUnknownReason | null;
+  readonly lineageKind: SessionHierarchyLineageKind;
+  readonly internalKind: string | null;
+  readonly subagentIdentity: string | null;
+}
+
+export interface SessionHierarchyRollup {
+  readonly rootSessionId: string;
+  readonly internalCount: number;
+  readonly actionableCount: number;
+  readonly failureCount: number;
+  readonly lastActivityAt: string | null;
+}
+export interface HierarchyGeneration {
+  readonly ownerId: string;
+  readonly activeGeneration: number;
+  readonly evidenceRevision: number;
+  readonly evidenceSchemaEpoch: number;
+  readonly updatedAt: string;
+}
+
+export interface HierarchyBackfillCycle {
+  readonly ownerId: string;
+  readonly epoch: number;
+  readonly cycle: number;
+  readonly requiredAdapters: readonly string[];
+  readonly frozenAt: string | null;
+}
+
+export interface HierarchyReadiness {
+  readonly ownerId: string;
+  readonly evidenceSchemaEpoch: number;
+  readonly requiredEpoch: number;
+  readonly coverageGapCount: number;
+  readonly ready: boolean;
 }

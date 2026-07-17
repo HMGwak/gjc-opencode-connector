@@ -14,6 +14,7 @@ const prepareArchiveCandidate = (database: ReturnType<typeof openCoreDatabase>, 
 async function fixture(adapters?: Readonly<Record<string, AgentAdapter>>, setup?: (database: ReturnType<typeof openCoreDatabase>) => void) {
   const now = 1_700_000_000_000;
   const database = openCoreDatabase(); database.createSession({ id: "s1", ownerId: "u1", adapter: "test", remoteId: "r1" }); database.setReconciliation("s1", "active", 1, true, "revision-1"); setup?.(database);
+  database.projectSessionHierarchy("u1", 0, [{ ownerId: "u1", generation: 0, sessionId: "s1", kind: "root", rootSessionId: "s1", parentSessionId: null, unknownReason: null, lineageKind: "direct", internalKind: null, subagentIdentity: null }]);
   const auth = new DeviceCredentialVerifier({ database, ownerId: "u1", pairingSecret: randomSecret(), now: () => now });
   const server = createHubServer({ database, auth, publicOrigin: "https://hub.example", commandId: () => "c1", adapters, authorizeSession: (_sessionId, ownerId) => ownerId === "u1" });
   const pairing = await auth.createPairing({ expiresInMs: 60_000 });
@@ -28,6 +29,37 @@ describe("hub origin API", () => {
     expect(DEFAULT_HOST).toBe("127.0.0.1"); expect(DEFAULT_PORT).toBe(8787);
     expect((await server.fetch(request("/api/v1/health"))).status).toBe(401);
     expect(await (await server.fetch(request("/api/v1/health", token))).json()).toEqual({ ok: true, readiness: { ok: true, database: "ready", adapters: {}, recovery: "ready" } }); database.close();
+  });
+  test("lists only human roots and exposes paginated internal summaries", async () => {
+    const { database, server, token } = await fixture(undefined, (db) => {
+      db.createSession({ id: "internal", ownerId: "u1", adapter: "test", remoteId: "internal" });
+    });
+    database.sqlite.query("INSERT INTO session_hierarchy_projection VALUES ('u1', 0, 'internal', 'internal', 's1', 's1', NULL, 'subagent', 'subagent', NULL)").run();
+    expect((await (await server.fetch(request("/api/v1/sessions", token))).json() as { sessions: Array<{ id: string; internalCount: number }> }).sessions).toEqual([expect.objectContaining({ id: "s1", internalCount: 1 })]);
+    expect(await (await server.fetch(request("/api/v1/sessions/s1/internal?limit=1", token))).json()).toEqual({ internal: [expect.objectContaining({ id: "internal", rootSessionId: "s1" })], nextCursor: null });
+    expect((await server.fetch(request("/api/v1/sessions/internal/internal", token))).status).toBe(404);
+    expect((await server.fetch(request("/api/v1/sessions/s1/internal?cursor=9007199254740991", token))).status).toBe(400);
+    database.close();
+  });
+  test("renders continuation roots with origin identity and head lifecycle state", async () => {
+    const { database, server, token } = await fixture(undefined, (db) => {
+      db.sqlite.query("UPDATE sessions SET title = ? WHERE id = ?").run("Original conversation", "s1");
+      db.createSession({ id: "s1-head", ownerId: "u1", adapter: "test", remoteId: "r1-head", continuationParentId: "s1" });
+      db.setReconciliation("s1-head", "terminal", 1, true, "head-revision");
+    });
+
+    const body = await (await server.fetch(request("/api/v1/sessions", token))).json() as {
+      sessions: Array<{ id: string; title: string | null; status: string; reconciliationEpoch: number }>;
+    };
+    expect(body.sessions).toEqual([
+      expect.objectContaining({
+        id: "s1",
+        title: "Original conversation",
+        status: "terminal",
+        reconciliationEpoch: 1,
+      }),
+    ]);
+    database.close();
   });
 
   test("exchanges one valid pairing code for a device credential", async () => {

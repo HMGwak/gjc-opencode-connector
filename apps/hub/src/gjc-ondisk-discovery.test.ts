@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { openCoreDatabase } from "@planee/core";
-import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GjcOnDiskDiscovery, type OnDiskDiscoveryDatabase } from "./gjc-ondisk-discovery";
@@ -13,6 +13,10 @@ function fakeDatabase() {
   const projected: unknown[] = [];
   const work: unknown[] = [];
   const events = new Map<string, Array<{ type: string; payload: unknown }>>();
+  const evidence: unknown[] = [];
+  let hierarchyGeneration = { activeGeneration: 0, evidenceRevision: 0, evidenceSchemaEpoch: 0 };
+  let hierarchyCycle = 0;
+  let frozenSnapshots = 0;
   const database: OnDiskDiscoveryDatabase = {
     upsertDiscoveredSession(input) {
       const existing = sessions.get(input.remoteId);
@@ -50,8 +54,17 @@ function fakeDatabase() {
       session.reconciliationEpoch = (session.reconciliationEpoch ?? 0) + 1;
       return true;
     },
+    upsertSessionHierarchyEvidence(input) { evidence.push(input); },
+    listSessionHierarchyEvidence: () => evidence as never[],
+    beginHierarchyBackfillCycle(_ownerId, input) { hierarchyCycle++; return { ownerId: "owner", epoch: input.epoch, cycle: hierarchyCycle, requiredAdapters: [...input.requiredAdapters], frozenAt: null }; },
+    upsertHierarchyBackfillRun: () => {},
+    addHierarchyBackfillManifestEntry: () => {},
+    freezeHierarchyBackfillSnapshot: () => { frozenSnapshots++; },
+    hierarchyCoverageGapCount: () => 0,
+    getHierarchyGeneration: () => hierarchyGeneration,
+    classifyAndProjectSessionHierarchy(_ownerId, generation, backfill) { hierarchyGeneration = { activeGeneration: generation, evidenceRevision: hierarchyGeneration.evidenceRevision, evidenceSchemaEpoch: backfill?.epoch ?? hierarchyGeneration.evidenceSchemaEpoch }; },
   };
-  return { database, sessions, projected, work };
+  return { database, sessions, projected, work, evidence, get frozenSnapshots() { return frozenSnapshots; } };
 }
 
 async function storeFile(content: string): Promise<{ root: string; id: string }> {
@@ -159,6 +172,15 @@ describe("GjcOnDiskDiscovery", () => {
       upsertWorkItem: () => { throw new Error("work fold failed"); },
       listProjectionFailures: core.listProjectionFailures.bind(core),
       cutoverProjectorVersion: core.cutoverProjectorVersion.bind(core),
+      upsertSessionHierarchyEvidence: core.upsertSessionHierarchyEvidence.bind(core),
+      listSessionHierarchyEvidence: core.listSessionHierarchyEvidence.bind(core),
+      beginHierarchyBackfillCycle: core.beginHierarchyBackfillCycle.bind(core),
+      upsertHierarchyBackfillRun: core.upsertHierarchyBackfillRun.bind(core),
+      addHierarchyBackfillManifestEntry: core.addHierarchyBackfillManifestEntry.bind(core),
+      freezeHierarchyBackfillSnapshot: core.freezeHierarchyBackfillSnapshot.bind(core),
+      hierarchyCoverageGapCount: core.hierarchyCoverageGapCount.bind(core),
+      getHierarchyGeneration: core.getHierarchyGeneration.bind(core),
+      classifyAndProjectSessionHierarchy: core.classifyAndProjectSessionHierarchy.bind(core),
     };
     try {
       await new GjcOnDiskDiscovery({ database, ownerId: "owner", codingAgentDir: root }).synchronize();
@@ -274,5 +296,63 @@ describe("GjcOnDiskDiscovery", () => {
       transcriptStatus: "available",
     });
     database.close();
+  });
+  test("captures direct-root and nested-child hierarchy evidence without using the mtime cache", async () => {
+    const { root, id } = await storeFile(JSON.stringify({ type: "session", version: 3, id: "12345678-1234-1234-1234-123456789abc", timestamp: "2026-07-16T10:00:00.000Z", cwd: "/repo" }) + "\n");
+    const childFilenameId = "87654321-1234-1234-1234-123456789abc";
+    const childId = "abcdef12-1234-1234-1234-123456789abc";
+    const nested = join(root, "sessions", "-repo", `2026-07-16T10:00:00.000Z_${id}`);
+    await mkdir(nested, { recursive: true });
+    await writeFile(join(nested, `2026-07-16T10:01:00.000Z_${childFilenameId}.jsonl`), JSON.stringify({ type: "session", version: 3, id: childId, timestamp: "2026-07-16T10:01:00.000Z", cwd: "/repo" }) + "\n");
+
+    const state = fakeDatabase();
+    const discovery = new GjcOnDiskDiscovery({ database: state.database, ownerId: "owner", codingAgentDir: root });
+    await discovery.synchronize();
+    await discovery.captureHierarchyEvidence(4);
+    await discovery.captureHierarchyEvidence(5);
+
+    expect(state.evidence).toHaveLength(4);
+    expect(state.evidence).toEqual(expect.arrayContaining([
+      expect.objectContaining({ sessionId: id, directHumanEvidence: true, observedParentSessionId: null, observationState: "valid", capturedEpoch: 5 }),
+      expect.objectContaining({ sessionId: childId, directHumanEvidence: false, observedParentSessionId: id, observedParentOwnerId: "owner", observationState: "valid", capturedEpoch: 5 }),
+    ]));
+    expect(state.sessions.get(childId)).toMatchObject({ transcriptStatus: "available", title: "repo · abcdef12" });
+  });
+  test("records unreadable transcripts as terminal hierarchy evidence", async () => {
+    const { root, id } = await storeFile("{not-json}\n");
+    const state = fakeDatabase();
+    await new GjcOnDiskDiscovery({ database: state.database, ownerId: "owner", codingAgentDir: root }).captureHierarchyEvidence(2);
+    expect(state.evidence).toEqual([expect.objectContaining({ sessionId: id, observationState: "unreadable", capturedEpoch: 2 })]);
+  });
+  test("records duplicate transcript identities as terminal conflict evidence", async () => {
+    const content = JSON.stringify({ type: "session", version: 3, id: "12345678-1234-1234-1234-123456789abc", timestamp: "2026-07-16T10:00:00.000Z", cwd: "/repo" }) + "\n";
+    const { root, id } = await storeFile(content);
+    const secondDirectory = join(root, "sessions", "-other");
+    await mkdir(secondDirectory, { recursive: true });
+    await writeFile(join(secondDirectory, `2026-07-16T10:00:00.000Z_${id}.jsonl`), content);
+    const state = fakeDatabase();
+    await new GjcOnDiskDiscovery({ database: state.database, ownerId: "owner", codingAgentDir: root }).captureHierarchyEvidence(2);
+    expect(state.evidence).toEqual(expect.arrayContaining([expect.objectContaining({ observationState: "conflict", capturedEpoch: 2 })]));
+  });
+  test("does not freeze a hierarchy snapshot after recursive enumeration fails", async () => {
+    const { root, id } = await storeFile(JSON.stringify({ type: "session", version: 3, id: "12345678-1234-1234-1234-123456789abc", timestamp: "2026-07-16T10:00:00.000Z", cwd: "/repo" }) + "\n");
+    const inaccessible = join(root, "sessions", "-repo", `2026-07-16T10:00:00.000Z_${id}`);
+    await mkdir(inaccessible);
+    await chmod(inaccessible, 0o000);
+    const state = fakeDatabase();
+    try {
+      await expect(new GjcOnDiskDiscovery({ database: state.database, ownerId: "owner", codingAgentDir: root }).synchronizeHierarchy()).rejects.toThrow();
+      expect(state.frozenSnapshots).toBe(0);
+    } finally {
+      await chmod(inaccessible, 0o755);
+    }
+  });
+  test("freezes an empty GJC universe and advances to a new cycle after freeze", async () => {
+    const root = await mkdtemp(join(tmpdir(), "gjc-discovery-"));
+    roots.push(root);
+    const state = fakeDatabase();
+    const discovery = new GjcOnDiskDiscovery({ database: state.database, ownerId: "owner", codingAgentDir: root });
+    expect(await discovery.synchronizeHierarchy()).toMatchObject({ epoch: 1, cycle: 1, projected: true });
+    expect(await discovery.synchronizeHierarchy()).toMatchObject({ epoch: 2, cycle: 2, projected: true });
   });
 });

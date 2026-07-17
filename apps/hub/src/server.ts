@@ -57,10 +57,23 @@ const parseCursor = (value: string): number | Response => {
   const cursor = Number(value);
   return Number.isSafeInteger(cursor) ? cursor : error(400, "bad_request", "Invalid cursor");
 };
+const parsePageCursor = (value: string | null, limit: number): number | Response => {
+  const cursor = parseCursor(value ?? "0");
+  return cursor instanceof Response || cursor > Number.MAX_SAFE_INTEGER - limit ? error(400, "bad_request", "Invalid cursor") : cursor;
+};
 
 function sessionFromRow(row: Session): Session {
   return row;
 }
+
+const hierarchyRollups = (database: CoreDatabase, ownerId: string, generation: number): Map<string, import("@planee/core").SessionHierarchyRollup> =>
+  new Map(database.hierarchyRollups(ownerId, generation).map((rollup) => [rollup.rootSessionId, rollup]));
+
+const rootSessionIdFor = (database: CoreDatabase, ownerId: string, generation: number, sessionId: string): string | null =>
+  (database.sqlite.query(`SELECT root_session_id AS rootSessionId FROM session_hierarchy_projection WHERE owner_id = ? AND generation = ? AND session_id = ? AND kind IN ('root', 'internal')`).get(ownerId, generation, sessionId) as { rootSessionId: string } | null)?.rootSessionId ?? null;
+const rootSessionIdsFor = (database: CoreDatabase, ownerId: string, generation: number): Set<string> =>
+  new Set((database.sqlite.query(`SELECT session_id AS id FROM session_hierarchy_projection WHERE owner_id = ? AND generation = ? AND kind = 'root'`).all(ownerId, generation) as Array<{ id: string }>).map(({ id }) => id));
+const sessionRootWire = (session: Session, rollup: import("@planee/core").SessionHierarchyRollup | undefined) => ({ ...sessionFromRow(session), rootSessionId: session.id, internalCount: rollup?.internalCount ?? 0, actionableCount: rollup?.actionableCount ?? 0, failureCount: rollup?.failureCount ?? 0, lastActivityAt: rollup?.lastActivityAt ?? session.updatedAt });
 
 
 const contentLengthError = (request: Request, limit: number): Response | null => {
@@ -91,6 +104,7 @@ async function parsePairingRedemption(request: Request, limit: number): Promise<
   } catch { return error(400, "pairing_invalid", "Invalid JSON"); }
 }
 const actionWire = (action: PendingAction) => ({ id: action.id, sessionId: action.sessionId, version: action.version, expiresAt: action.expiresAt, status: action.status, type: action.type, payload: action.payload, allowedResponses: action.allowedResponses, artifactIds: action.artifactIds });
+type InboxActionWire = ReturnType<typeof actionWire> & { rootSessionId: string | null };
 const artifactWire = (artifact: ArtifactMetadata) => ({ id: artifact.id, name: artifact.name, contentType: artifact.contentType, size: artifact.size, createdAt: artifact.createdAt });
 const requiresOwnerIntervention = (action: PendingAction): boolean => typeof action.payload === "object" && action.payload !== null && (action.payload as { requiresOwnerIntervention?: unknown }).requiresOwnerIntervention === true;
 const isActionableInboxAction = (action: PendingAction): boolean => action.status === "pending" || action.status === "dispatching" || (action.status === "unknown" && requiresOwnerIntervention(action) && action.allowedResponses.length > 0);
@@ -172,11 +186,6 @@ export function createHubServer(options: HubServerOptions): { fetch(request: Req
     const session = options.database.getSessionForOwner(action.sessionId, ownerId);
     return session !== null && !session.archivedAt && (options.authorizeSession?.(session.id, ownerId) ?? true);
   };
-  const isGenericOwnerSseEvent = (event: unknown): boolean => {
-    if (typeof event !== "object" || event === null || Array.isArray(event)) return false;
-    const entries = Object.entries(event);
-    return entries.length === 1 && entries[0]![0] === "type" && typeof entries[0]![1] === "string";
-  };
   const createSnapshot = (ownerId: string) => {
     const token = crypto.randomUUID();
     const createdAt = now();
@@ -253,6 +262,8 @@ export function createHubServer(options: HubServerOptions): { fetch(request: Req
     if (claims instanceof Response) return claims;
     const limited = rateLimit(claims.sub);
     if (limited) return limited;
+    const generation = options.database.acquireGenerationLease(claims.sub);
+    try {
     if (request.method === "GET" && url.pathname === "/api/v1/health") {
       const status = await readiness({ database: options.database, adapters: options.adapters, adapterHealth: options.adapterHealth }, recoveryState);
       return json({ ok: status.ok, readiness: status }, status.ok ? 200 : 503);
@@ -362,21 +373,50 @@ export function createHubServer(options: HubServerOptions): { fetch(request: Req
       try { return json({ reset: true, ...createSnapshot(claims.sub) }); } catch (cause) { return snapshotCreationError(cause); }
     }
     if (request.method === "GET" && url.pathname === "/api/v1/sessions") {
-      return json({ sessions: options.database.listSessionsForOwner(claims.sub).filter((session) => options.authorizeSession?.(session.id, claims.sub) ?? true).map(sessionFromRow) });
+      const roots = rootSessionIdsFor(options.database, claims.sub, generation);
+      const rollups = hierarchyRollups(options.database, claims.sub, generation);
+      return json({ sessions: options.database.listSessionsForOwner(claims.sub).filter((session) => roots.has(session.id) && (options.authorizeSession?.(session.id, claims.sub) ?? true)).map((session) => sessionRootWire(options.database.getContinuationAggregateForOwner(session.id, claims.sub), rollups.get(session.id))) });
     }
     if (request.method === "GET" && url.pathname === "/api/v1/work") {
-      return json({ work: options.database.listWorkItemsForOwner(claims.sub).filter((work) => options.authorizeSession?.(work.sessionId, claims.sub) ?? true) });
+      const roots = rootSessionIdsFor(options.database, claims.sub, generation);
+      return json({ work: options.database.listWorkItemsForOwner(claims.sub).filter((work) => roots.has(work.sessionId) && (options.authorizeSession?.(work.sessionId, claims.sub) ?? true)).map((work) => ({ ...work, rootSessionId: work.sessionId })) });
     }
     if (request.method === "GET" && (url.pathname === "/api/v1/hitl" || url.pathname === "/api/v1/inbox")) {
       const actions = options.actions?.list(claims.sub) ?? [];
       return json({
         actions: actions
-          .filter((action) => isActionableInboxAction(action) && canAccessActionSession(action, claims.sub))
-          .map(actionWire),
+          .filter((action) => isActionableInboxAction(action) && action.ownerId === claims.sub)
+          .flatMap<InboxActionWire>((action) => {
+            if (!action.sessionId) return [{ ...actionWire(action), rootSessionId: null }];
+            const session = options.database.getSessionForOwner(action.sessionId, claims.sub);
+            const rootSessionId = session && !session.archivedAt ? rootSessionIdFor(options.database, claims.sub, generation, action.sessionId) : null;
+            return rootSessionId && (options.authorizeSession?.(rootSessionId, claims.sub) ?? true) ? [{ ...actionWire(action), rootSessionId }] : [];
+          }),
       });
     }
     if (request.method === "GET" && url.pathname === "/api/v1/history") {
-      return json({ sessions: options.database.listArchivedSessionsForOwner(claims.sub).filter((session) => options.authorizeSession?.(session.id, claims.sub) ?? true).map(sessionFromRow) });
+      const roots = rootSessionIdsFor(options.database, claims.sub, generation);
+      const rollups = hierarchyRollups(options.database, claims.sub, generation);
+      return json({ sessions: options.database.listArchivedSessionsForOwner(claims.sub).filter((session) => roots.has(session.id) && (options.authorizeSession?.(session.id, claims.sub) ?? true)).map((session) => sessionRootWire(options.database.getContinuationAggregateForOwner(session.id, claims.sub), rollups.get(session.id))) });
+    }
+    const internalMatch = /^\/api\/v1\/sessions\/([^/]+)\/internal$/.exec(url.pathname);
+    if (request.method === "GET" && internalMatch) {
+      const sessionId = decodeRouteId(internalMatch[1]!); if (sessionId instanceof Response) return sessionId;
+      const limitText = url.searchParams.get("limit") ?? "50";
+      const pageSize = parseCursor(limitText);
+      if (pageSize instanceof Response || pageSize < 1 || pageSize > SNAPSHOT_PAGE_SIZE) return error(400, "bad_request", "Invalid page size");
+      const cursor = parsePageCursor(url.searchParams.get("cursor"), pageSize); if (cursor instanceof Response) return cursor;
+      if (!rootSessionIdsFor(options.database, claims.sub, generation).has(sessionId) || !(options.authorizeSession?.(sessionId, claims.sub) ?? true)) return error(404, "not_found", "Session not found");
+      const rows = options.database.sqlite.query(`
+        SELECT sessions.id, projection.parent_session_id AS parentSessionId, projection.internal_kind AS internalKind,
+          projection.subagent_identity AS subagentIdentity, sessions.status, sessions.updated_at AS lastActivityAt
+        FROM session_hierarchy_projection projection
+        JOIN sessions ON sessions.id = projection.session_id AND sessions.owner_id = projection.owner_id
+        WHERE projection.owner_id = ? AND projection.generation = ? AND projection.root_session_id = ? AND projection.kind = 'internal'
+        ORDER BY sessions.updated_at DESC, sessions.id ASC LIMIT ? OFFSET ?
+      `).all(claims.sub, generation, sessionId, pageSize + 1, cursor) as Array<{ id: string; parentSessionId: string; internalKind: string | null; subagentIdentity: string | null; status: string; lastActivityAt: string }>;
+      const internal = rows.slice(0, pageSize).map(({ id, parentSessionId, internalKind, subagentIdentity, status, lastActivityAt }) => ({ id, rootSessionId: sessionId, parentSessionId, internalKind, subagentIdentity, status, lastActivityAt }));
+      return json({ internal, nextCursor: rows.length > pageSize ? cursor + pageSize : null });
     }
     const archiveMatch = /^\/api\/v1\/sessions\/([^/]+)\/archive$/.exec(url.pathname);
     if (request.method === "POST" && archiveMatch) {
@@ -446,11 +486,12 @@ export function createHubServer(options: HubServerOptions): { fetch(request: Req
       if (!ownsSession(sessionId, claims.sub)) {
         return options.database.getSession(sessionId) ? error(403, "forbidden", "Forbidden") : error(404, "not_found", "Session not found");
       }
+      if (!rootSessionIdsFor(options.database, claims.sub, generation).has(sessionId)) return error(404, "not_found", "Session not found");
       const cursorText = request.headers.get("last-event-id") ?? url.searchParams.get("after") ?? "0";
       const after = parseCursor(cursorText); if (after instanceof Response) return after;
-      const bounds = options.database.sqlite.query("SELECT MIN(seq) AS first, MAX(seq) AS last FROM events WHERE session_id = ?").get(sessionId) as { first: number | null; last: number | null };
-      if (bounds.first !== null && after < bounds.first - 1) return json({ reset: "snapshot-required" }, 410);
       try {
+        const bounds = options.database.eventSequenceBounds(sessionId);
+        if (bounds.first !== null && after < bounds.first - 1) return json({ reset: "snapshot-required" }, 410);
         const events = options.database.listEvents<unknown>(sessionId, after);
         const wire = events.map((event) => `id: ${event.seq}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
         return new Response(wire, { headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-store", "x-stream-mode": "finite-catch-up" } });
@@ -469,12 +510,21 @@ export function createHubServer(options: HubServerOptions): { fetch(request: Req
           .filter((session) => options.authorizeSession?.(session.id, claims.sub) ?? true)
           .map((session) => session.id);
         const events = options.database.listSseAfter<unknown>(claims.sub, after, authorizedSessionIds, SNAPSHOT_PAGE_SIZE)
-          .filter(({ sessionId, event }) => sessionId !== null || isGenericOwnerSseEvent(event));
+          .flatMap(({ id, sessionId, event }) => {
+            const rootSessionId = rootSessionIdFor(options.database, claims.sub, generation, sessionId);
+            if (!rootSessionId || !(options.authorizeSession?.(rootSessionId, claims.sub) ?? true)) return [];
+            return rootSessionId === sessionId
+              ? [{ id, event }]
+              : [{ id, event: { type: "session.hierarchy.updated", sessionId: rootSessionId, rootSessionId } }];
+          });
         const wire = events.map(({ id, event }) => `id: ${id}\nevent: update\ndata: ${JSON.stringify(event)}\n\n`).join("");
         return new Response(wire, { headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-store", "x-stream-mode": "finite-catch-up" } });
       } catch { return error(500, "internal_error", "Internal server error"); }
     }
     return error(404, "not_found", "Not found");
+    } finally {
+      options.database.releaseGenerationLease(claims.sub, generation);
+    }
   } };
 }
 

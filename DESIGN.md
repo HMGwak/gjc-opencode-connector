@@ -2,34 +2,35 @@
 
 ## 1. Direction
 
-The existing interface is a compact, dark, single-column personal control surface. This migration preserves that calm operational layout: pairing is a short blocking state, not a redesign or a new navigation model.
+The authenticated interface is a calm, Linear-inspired single-column control surface. Sessions, History, and navigational Work use dense semantic rows; Inbox remains a distinct action surface for approvals and failures.
 
 ## 2. Color
 
 | Token | Value | Use |
 |---|---|---|
-| `--color-page` | `#101826` | Page and input surface |
-| `--color-surface` | `#1d2a40` | Buttons and message cards |
-| `--color-border` | `#71809a` | Interactive borders |
-| `--color-divider` | `#33425b` | Structural dividers |
-| `--color-text` | `#eef3fa` | Primary text |
-| `--color-muted` | `#b5c1d5` | Supporting text |
-| `--color-focus` | `#74b9ff` dark / `#2f6eb2` light | Keyboard focus |
-| `--color-live` | `#78dba9` | Connected state |
-| `--color-warning` | `#ffd27a` | Degraded state |
-| `--color-selected` | `#3267a8` | Active navigation |
+| `--color-page` | `#111216` | App shell and input background |
+| `--color-surface` | `#181a20` | Action and control surfaces |
+| `--color-elevated` | `#20232b` | Badges and messages |
+| `--color-border` | `#2a2d36` | Restrained row separators |
+| `--color-text` | `#f2f3f5` | Primary text |
+| `--color-muted` | `#9399a8` | State, time, and metadata |
+| `--color-focus` | `#8da2fb` | Keyboard focus |
+| `--color-live` | `#6dc89b` | Connected state |
+| `--color-warning` | `#d7b46a` | Degraded state |
+| `--color-selected` | `#242b46` | Active navigation |
 
 ## 3. Typography
 
-- Primary: `system-ui, sans-serif`
-- Heading: 19px (`h1`), 18px (`h2`), 16px body, 14px supporting text, 12px captions.
-- Body copy never falls below 14px except compact navigation labels.
+- Primary: Inter, with `ui-sans-serif` and `system-ui` fallbacks.
+- Headings use 600 weight and tight tracking; row titles use 500 weight; supporting metadata uses 11–12px at high contrast.
+- State and time are subordinate to the session/work title. Section labels are compact uppercase labels; user-facing page headings retain natural case.
 
 ## 4. Spacing and Layout
 
 - Base unit: 4px.
-- The mobile-first shell uses a 16px panel and top-bar inset, a 48rem maximum width, and a fixed bottom navigation only after a credential is available.
-- Pairing uses the same 16px panel rhythm and one-column form layout as prompt entry.
+- The mobile-first shell uses a 16px panel and top-bar inset, a 48rem maximum width, and persistent bottom navigation after a credential is available.
+- The central panel is the only scrolling region. Top bar and bottom navigation remain stable, with top and bottom safe-area insets.
+- Dense rows are at least 58px high and separated by one-pixel rules rather than individual borders or cards.
 
 ## 5. Components
 
@@ -51,6 +52,24 @@ The existing interface is a compact, dark, single-column personal control surfac
 - States: ready, submitting, invalid/expired code, network error.
 - Accessibility: the initial pairing-code field receives focus and error/status text is announced.
 
+### Dense row
+
+- Used only for Sessions, History, and Work navigation.
+- Structure: one native button inside one list item, with title, state, timestamp, and optional compact rollup badges.
+- Internal executions never appear as peer rows. `internalCount`, `actionableCount`, and `failureCount` appear as compact badges on the human-root row.
+- The row has no nested interactive controls and retains a minimum 44px target.
+
+### Inbox action surface
+
+- Inbox keeps the action card supplied by the HITL renderer. A session navigation control is a sibling of that card, never nested inside it.
+- Internal-origin actions resolve navigation through `rootSessionId`, falling back to `sessionId` during staged API rollout.
+
+### Internal activity disclosure
+
+- Session detail conditionally shows a native, collapsed `details` disclosure when `internalCount` is non-zero.
+- Opening it lazily requests the capped, paginated summary endpoint. Loading, empty, and error states are explicit.
+- Drill-down items are summaries, not interactive peer sessions.
+
 ## 6. Motion and Interaction
 
 - No decorative motion is introduced for this security flow.
@@ -59,10 +78,12 @@ The existing interface is a compact, dark, single-column personal control surfac
 
 ## 7. Depth and Surface
 
-- Strategy: borders plus tonal surface shift.
-- Buttons and message cards use `--color-surface`; structural boundaries use a one-pixel divider. No shadows are used.
+- Strategy: separators and small tonal shifts, with surfaces reserved for controls, Inbox actions, and messages.
+- Dense navigation rows have no per-row border, radius, shadow, or card background. Structural boundaries use a one-pixel divider.
 
 ## 8. Accessibility Constraints and Accepted Debt
 
 - WCAG 2.2 AA target: visible focus, keyboard-complete pairing, explicit labels, status announcements, and a 44px minimum interactive target.
 - Accepted debt: browser/PWA mode does not retain the device credential. This personal connector flow is Android-only and requires the Keystore-backed bridge.
+- Session hierarchy wire fields are additive and optional during staged integration: `rootSessionId`, `internalCount`, `actionableCount`, `failureCount`, and `lastActivityAt`. Missing values preserve legacy navigation and omit rollup UI.
+- Human-root sessions are the only listable Sessions/History peers. Internal execution summaries are available only through rollups and explicit drill-down.

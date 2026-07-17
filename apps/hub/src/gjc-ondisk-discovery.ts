@@ -1,9 +1,10 @@
-import type { Session } from "@planee/core";
+import type { Session, SessionHierarchyEvidence } from "@planee/core";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 const SESSION_FILE = /^(\d{4}-\d{2}-\d{2}T[^_]+)_([0-9a-f]{8}-[0-9a-f-]{27,})\.jsonl$/i;
+const SESSION_DIRECTORY = /_([0-9a-f]{8}-[0-9a-f-]{27,})$/i;
 const VIEW_LEASE_MS = 45_000;
 const GJC_PROJECTOR_VERSION = "gjc-ondisk-v1";
 
@@ -73,6 +74,15 @@ export type OnDiskDiscoveryDatabase = {
       readonly payload: unknown;
     }>;
   }): boolean;
+  upsertSessionHierarchyEvidence(evidence: SessionHierarchyEvidence): void;
+  listSessionHierarchyEvidence(ownerId: string): SessionHierarchyEvidence[];
+  beginHierarchyBackfillCycle(ownerId: string, input: { readonly epoch: number; readonly requiredAdapters: readonly string[] }): { readonly ownerId: string; readonly epoch: number; readonly cycle: number; readonly requiredAdapters: readonly string[]; readonly frozenAt: string | null };
+  upsertHierarchyBackfillRun(input: { readonly ownerId: string; readonly adapter: string; readonly epoch: number; readonly cycle: number; readonly state: "enumerating" | "reconciling" | "complete"; readonly expectedSourceKeys: number; readonly observedSourceKeys: number; readonly frozenAt: string | null }): void;
+  addHierarchyBackfillManifestEntry(ownerId: string, adapter: string, epoch: number, cycle: number, sourceKey: string): void;
+  freezeHierarchyBackfillSnapshot(ownerId: string, epoch: number, cycle: number): void;
+  hierarchyCoverageGapCount(ownerId: string, epoch: number, cycle: number): number;
+  getHierarchyGeneration(ownerId: string): { readonly activeGeneration: number; readonly evidenceRevision: number; readonly evidenceSchemaEpoch: number } | null;
+  classifyAndProjectSessionHierarchy(ownerId: string, generation: number, backfill: { readonly epoch: number; readonly cycle: number }): void;
 };
 
 export type GjcOnDiskDiscoveryOptions = {
@@ -159,14 +169,14 @@ function workItemForEvent(sessionId: string, event: { type: string; payload: unk
   return { id: sha256(`${sessionId}:${remoteId}`), remoteId, state: "done", payload: { result: text.trim() } };
 }
 
-function parseTranscript(text: string, filenameId: string, fallbackUpdatedAt: string): ParsedTranscript {
+function parseTranscript(text: string, filenameId: string, fallbackUpdatedAt: string, requireFilenameId = true): ParsedTranscript {
   const lines = text.split(/\r?\n/);
   if (lines.at(-1) === "") lines.pop();
   if (lines.length === 0) throw new Error("Empty GJC transcript");
 
   const parsed = lines.map((line) => JSON.parse(line) as unknown);
   const header = record(parsed[0]);
-  if (!header || header.type !== "session" || typeof header.id !== "string" || header.id !== filenameId) {
+  if (!header || header.type !== "session" || typeof header.id !== "string" || (requireFilenameId && header.id !== filenameId)) {
     throw new Error("Unrecognized GJC session header");
   }
   const version = header.version === undefined ? 1 : header.version;
@@ -196,11 +206,11 @@ payload: sanitizeEntry(entry, nativeId, parentId),
   }
   const lastTimestamp = events.at(-1)?.createdAt;
   return {
-    remoteId: filenameId,
+    remoteId: requireFilenameId ? filenameId : header.id,
     updatedAt: lastTimestamp ?? fallbackUpdatedAt,
     sourceRevision: String(version),
     events,
-    title: sessionTitle(header, header.cwd, filenameId),
+    title: sessionTitle(header, header.cwd, header.id),
     workdir: header.cwd,
     sourceCreatedAt: sourceCreatedAt.toISOString(),
   };
@@ -230,47 +240,133 @@ export class GjcOnDiskDiscovery {
     }
 
     let discovered = 0;
-    for (const cwdDirectory of cwdDirectories) {
-      if (!cwdDirectory.isDirectory()) continue;
-      const cwdPath = join(this.root, cwdDirectory.name);
-      let files;
-      try { files = await readdir(cwdPath, { withFileTypes: true }); } catch { continue; }
-      for (const file of files) {
-        if (!file.isFile()) continue;
-        const match = SESSION_FILE.exec(file.name);
+    const walk = async (directory: string, nested: boolean): Promise<void> => {
+      const entries = await readdir(directory, { withFileTypes: true });
+      for (const entry of entries) {
+        const path = join(directory, entry.name);
+        if (entry.isDirectory()) {
+          await walk(path, true);
+          continue;
+        }
+        const match = entry.isFile() ? SESSION_FILE.exec(entry.name) : null;
         if (!match) continue;
-        await this.discoverFile(join(cwdPath, file.name), match[2]!);
+        await this.discoverFile(path, match[2]!, nested);
         discovered++;
       }
+    };
+    for (const cwdDirectory of cwdDirectories) {
+      if (cwdDirectory.isDirectory()) await walk(join(this.root, cwdDirectory.name), false);
     }
     return discovered;
   }
+  /**
+   * Captures a fresh hierarchy observation for every transcript independently of
+   * the projection mtime cache. Backfill orchestration owns the epoch/cycle and
+   * calls this only while its manifest is still mutable.
+   */
+  async captureHierarchyEvidence(capturedEpoch: number): Promise<readonly string[]> {
+    const sourceKeys: string[] = [];
+    const seenSessionIds = new Set<string>();
+    const walk = async (directory: string, relative: readonly string[]): Promise<void> => {
+      const entries = await readdir(directory, { withFileTypes: true });
+      for (const entry of entries) {
+        const path = join(directory, entry.name);
+        if (entry.isDirectory()) {
+          await walk(path, [...relative, entry.name]);
+          continue;
+        }
+        const match = entry.isFile() ? SESSION_FILE.exec(entry.name) : null;
+        if (!match) continue;
+        const parentDirectory = relative.find((name) => SESSION_DIRECTORY.exec(name));
+        const parentId = parentDirectory ? SESSION_DIRECTORY.exec(parentDirectory)?.[1] ?? null : null;
+        const nested = relative.length > 0;
+        let sessionId = match[2]!;
+        let state: SessionHierarchyEvidence["observationState"] = nested && parentId === null ? "missing-parent" : "valid";
+        try { sessionId = parseTranscript(await readFile(path, "utf8"), sessionId, this.now().toISOString(), !nested).remoteId; }
+        catch { state = "unreadable"; }
+        if (state === "valid" && seenSessionIds.has(sessionId)) state = "conflict";
+        seenSessionIds.add(sessionId);
+        await this.discoverFile(path, match[2]!, nested);
+        this.options.database.upsertSessionHierarchyEvidence({
+          ownerId: this.options.ownerId,
+          adapter: "gjc",
+          sourceKey: path,
+          sessionId,
+          identityNamespace: "gjc-transcript",
+          observedParentSessionId: parentId,
+          observedParentOwnerId: parentId === null ? null : this.options.ownerId,
+          directHumanEvidence: !nested,
+          structuralKind: nested ? "subagent" : "direct",
+          observationState: state,
+          capturedEpoch,
+          deletedAt: null,
+        });
+        sourceKeys.push(path);
+      }
+    };
+    let directories;
+    try { directories = await readdir(this.root, { withFileTypes: true }); }
+    catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code === "ENOENT") return sourceKeys;
+      throw cause;
+    }
+    for (const directory of directories) if (directory.isDirectory()) await walk(join(this.root, directory.name), []);
+    return sourceKeys.sort();
+  }
+  /**
+   * Executes one immutable GJC enumeration cycle. Callers supply the canonical
+   * enabled-adapter snapshot; this discovery source can only complete its own
+   * `gjc` run and refuses to manufacture completeness for another adapter.
+   */
+  async synchronizeHierarchy(requiredAdapters: readonly string[] = ["gjc"]): Promise<{ readonly epoch: number; readonly cycle: number; readonly projected: boolean }> {
+    const adapters = [...new Set(requiredAdapters)].sort();
+    if (adapters.length !== 1 || adapters[0] !== "gjc") throw new Error("GJC discovery cannot enumerate a non-GJC hierarchy adapter");
+    const current = this.options.database.getHierarchyGeneration(this.options.ownerId);
+    const epoch = (current?.evidenceSchemaEpoch ?? 0) + 1;
+    const cycle = this.options.database.beginHierarchyBackfillCycle(this.options.ownerId, { epoch, requiredAdapters: adapters });
+    this.options.database.upsertHierarchyBackfillRun({
+      ownerId: this.options.ownerId, adapter: "gjc", epoch, cycle: cycle.cycle,
+      state: "enumerating", expectedSourceKeys: 0, observedSourceKeys: 0, frozenAt: null,
+    });
+    const sourceKeys = await this.captureHierarchyEvidence(epoch);
+    for (const sourceKey of sourceKeys) this.options.database.addHierarchyBackfillManifestEntry(this.options.ownerId, "gjc", epoch, cycle.cycle, sourceKey);
+    this.options.database.upsertHierarchyBackfillRun({
+      ownerId: this.options.ownerId, adapter: "gjc", epoch, cycle: cycle.cycle,
+      state: "complete", expectedSourceKeys: sourceKeys.length, observedSourceKeys: sourceKeys.length, frozenAt: this.now().toISOString(),
+    });
+    this.options.database.freezeHierarchyBackfillSnapshot(this.options.ownerId, epoch, cycle.cycle);
+    if (this.options.database.hierarchyCoverageGapCount(this.options.ownerId, epoch, cycle.cycle) !== 0) return { epoch, cycle: cycle.cycle, projected: false };
+    this.options.database.classifyAndProjectSessionHierarchy(this.options.ownerId, (current?.activeGeneration ?? 0) + 1, { epoch, cycle: cycle.cycle });
+    return { epoch, cycle: cycle.cycle, projected: true };
+  }
 
-  private async discoverFile(path: string, filenameId: string): Promise<void> {
-    const existing = this.options.database.getSessionByRemoteIdForOwner(this.options.ownerId, "gjc", filenameId);
-    if (existing?.archivedAt) return;
+  private async discoverFile(path: string, filenameId: string, nested = false): Promise<void> {
+    if (!nested) {
+      const existing = this.options.database.getSessionByRemoteIdForOwner(this.options.ownerId, "gjc", filenameId);
+      if (existing?.archivedAt) return;
+    }
     let mtimeMs: number | null = null;
     let parsed: ParsedTranscript | null = null;
     let updatedAt = this.now().toISOString();
     try {
       const metadata = await stat(path);
       mtimeMs = metadata.mtimeMs;
-      if (this.lastMtimeMs.get(filenameId) === mtimeMs) return;
+      if (this.lastMtimeMs.get(path) === mtimeMs) return;
       updatedAt = metadata.mtime.toISOString();
-      parsed = parseTranscript(await readFile(path, "utf8"), filenameId, updatedAt);
+      parsed = parseTranscript(await readFile(path, "utf8"), filenameId, updatedAt, !nested);
       updatedAt = parsed.updatedAt;
     } catch {
       // Fail closed: retain the listing but never project a partially parsed transcript.
     }
 
     const session = this.options.database.upsertDiscoveredSession({
-      id: crypto.randomUUID(), ownerId: this.options.ownerId, adapter: "gjc", remoteId: filenameId,
+      id: crypto.randomUUID(), ownerId: this.options.ownerId, adapter: "gjc", remoteId: parsed?.remoteId ?? filenameId,
       controlMode: "view-only", origin: "ondisk-discovery",
       transcriptStatus: parsed ? "available" : "unreadable", updatedAt,
       ...(parsed ? { title: parsed.title, workdir: parsed.workdir, sourceCreatedAt: parsed.sourceCreatedAt } : {}),
     });
     if (!parsed) {
-      if (mtimeMs !== null) this.lastMtimeMs.set(filenameId, mtimeMs);
+      if (mtimeMs !== null) this.lastMtimeMs.set(path, mtimeMs);
       return;
     }
 
@@ -321,10 +417,10 @@ export class GjcOnDiskDiscovery {
           workItems: [...workItems.values()],
         })) return;
       }
-      if (mtimeMs !== null) this.lastMtimeMs.set(filenameId, mtimeMs);
+      if (mtimeMs !== null) this.lastMtimeMs.set(path, mtimeMs);
     } catch {
       this.options.database.upsertDiscoveredSession({
-        id: crypto.randomUUID(), ownerId: this.options.ownerId, adapter: "gjc", remoteId: filenameId,
+        id: crypto.randomUUID(), ownerId: this.options.ownerId, adapter: "gjc", remoteId: parsed?.remoteId ?? filenameId,
         controlMode: "view-only", origin: "ondisk-discovery", transcriptStatus: "unreadable", updatedAt,
       });
     }

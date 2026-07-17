@@ -1,0 +1,48 @@
+{
+  "architectReview": {
+    "architectureStatus": "CLEAR",
+    "productStatus": "CLEAR",
+    "codeStatus": "CLEAR",
+    "recommendation": "APPROVE",
+    "evidence": "Agent 211 re-reviewed frozen backfill immutability and rollup semantics after fixes; all architecture, product, and code lanes CLEAR with zero blockers. Cleanup agent 207 reported PASS with zero blockers.",
+    "commands": ["agent://211-HierarchyArchitectureReapproval", "agent://207-HierarchyZeroBlockerCertification"],
+    "blockers": []
+  },
+  "executorQa": {
+    "status": "passed",
+    "e2eStatus": "passed",
+    "redTeamStatus": "passed",
+    "evidence": "Agent 209 completed plan-first API/Core/mobile red-team coverage; parent reran typecheck, 226 tests with 2916 expectations, production build, diff check, and a live 390x844 browser flow.",
+    "e2eCommands": ["bun test", "bun run build"],
+    "redTeamCommands": ["bun test", "browser automation at http://127.0.0.1:4175"],
+    "artifactRefs": [
+      {"id":"api-report","kind":"api-package-test-report","path":"artifacts/session-hierarchy-test-report.json","description":"Fresh typecheck/test/build and API package evidence"},
+      {"id":"mobile-browser","kind":"browser-automation-transcript","path":"artifacts/session-hierarchy-browser-automation.json","description":"Authenticated 390x844 browser interaction transcript"},
+      {"id":"mobile-shot","kind":"web-gui-screenshot","path":"artifacts/session-hierarchy-linear-mobile-active.png","description":"Live cropped 390x500 active Linear hierarchy controls"}
+    ],
+    "contractCoverage": [
+      {"id":"classification","contractRef":"approved-plan/classification","obligation":"Only direct-human roots are peer sessions; internal and unknown executions stay hidden or aggregated","status":"covered","surfaceEvidenceRefs":["api-core"],"adversarialCaseRefs":["cross-owner","internal-leak"]},
+      {"id":"backfill","contractRef":"approved-plan/backfill","obligation":"Fixed snapshots, required-adapter completeness and atomic cutover fail closed","status":"covered","surfaceEvidenceRefs":["api-core"],"adversarialCaseRefs":["missing-run","frozen-mutation"]},
+      {"id":"mobile","contractRef":"approved-plan/mobile-ux","obligation":"Linear dense hierarchy, persistent navigation and stable detail","status":"covered","surfaceEvidenceRefs":["web-mobile"],"adversarialCaseRefs":["nested-controls"]}
+    ],
+    "surfaceEvidence": [
+      {"id":"api-core","contractRef":"Core and Hub API","surface":"api","invocation":"bun test plus typecheck","verdict":"passed","artifactRefs":["api-report"]},
+      {"id":"web-mobile","contractRef":"Mobile web UI","surface":"web","invocation":"Chromium 390x844 mocked authenticated Hub flow","verdict":"passed","artifactRefs":["mobile-browser","mobile-shot"]}
+    ],
+    "adversarialCases": [
+      {"id":"cross-owner","contractRef":"owner isolation","scenario":"Cross-owner parent/root and drilldown lookup","expectedBehavior":"Fail closed without data disclosure","verdict":"passed","artifactRefs":["api-report"]},
+      {"id":"internal-leak","contractRef":"root-only lists","scenario":"Internal subagent appears in Sessions, History or Work","expectedBehavior":"Internal row is hidden and represented only by root rollup/drilldown","verdict":"passed","artifactRefs":["api-report"]},
+      {"id":"missing-run","contractRef":"backfill completeness","scenario":"Required adapter has no run","expectedBehavior":"Snapshot cannot freeze or publish","verdict":"passed","artifactRefs":["api-report"]},
+      {"id":"frozen-mutation","contractRef":"fixed snapshot","scenario":"Insert or mutate run/manifest after freeze","expectedBehavior":"Transaction rejects mutation","verdict":"passed","artifactRefs":["api-report"]},
+      {"id":"nested-controls","contractRef":"mobile accessibility","scenario":"Inbox or DenseRow nests interactive controls","expectedBehavior":"Controls remain siblings with semantic list structure","verdict":"passed","artifactRefs":["mobile-browser","mobile-shot","api-report"]}
+    ],
+    "blockers": []
+  },
+  "iteration": {
+    "status": "passed",
+    "evidence": "Cleanup blockers and architecture blockers were fixed, then the full typecheck/test/build/diff loop was rerun cleanly and architecture reapproval returned CLEAR/APPROVE.",
+    "fullRerun": true,
+    "rerunCommands": ["bun run typecheck", "bun test", "bun run build", "git diff --check"],
+    "blockers": []
+  }
+}

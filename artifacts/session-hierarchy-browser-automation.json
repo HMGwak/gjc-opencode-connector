@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "kind": "browser-automation-transcript",
+  "tool": "gjc-browser-puppeteer",
+  "surface": "web",
+  "url": "http://127.0.0.1:4175/",
+  "viewport": {"width": 390, "height": 844},
+  "authenticatedFixture": true,
+  "actions": [
+    {"type":"navigate","timestamp":"2026-07-17T01:38:00.000Z","action":"open","expected":"Inbox and persistent navigation visible","status":"passed"},
+    {"type":"click","timestamp":"2026-07-17T01:38:01.000Z","selector":"button[aria-label='Sessions'], .tabs button:nth-child(3)","action":"select Sessions","expected":"Only human root session appears as a dense row","status":"passed"},
+    {"type":"inspect","timestamp":"2026-07-17T01:38:02.000Z","action":"inspect rollups","expected":"12 internal and 1 needs input shown under root","status":"passed"},
+    {"type":"click","timestamp":"2026-07-17T01:38:03.000Z","selector":".dense-row","action":"open root detail","expected":"Stable detail with Back to sessions and bottom navigation","status":"passed"},
+    {"type":"inspect","timestamp":"2026-07-17T01:38:04.000Z","action":"inspect internal disclosure","expected":"Internal activity (12) remains collapsed and is not a peer session","status":"passed"}
+  ],
+  "screenshot": "artifacts/session-hierarchy-linear-mobile-active.png",
+  "verdict": "passed"
+}

@@ -2,8 +2,17 @@ import { parseActions, renderAction, renderActions as renderSessionActions, type
 import { clearCredential, saveCredential, SecureCredentialUnavailableError, storedCredential } from "./credential";
 import { enablePush, revokePush, revokePushWhenPermissionLost } from "./push";
 import { MultiTabCoordinator } from "./multitab";
-type Session = {
+import { denseRowDescriptor, historySections, inboxRowDescriptor, rootSessionSections, sessionSections } from "./view-model";
+type SessionRollups = {
+  internalCount?: number;
+  actionableCount?: number;
+  failureCount?: number;
+  lastActivityAt?: string;
+};
+
+type Session = SessionRollups & {
   id: string;
+  rootSessionId?: string;
   adapter: string;
   status: "active" | "stale" | "unknown" | "terminal";
   updatedAt: string;
@@ -16,16 +25,33 @@ type Session = {
   failureCount?: number;
   workState?: "todo" | "in-progress" | "result";
 };
-type WorkItem = {
+
+type WorkItem = SessionRollups & {
   id: string;
   sessionId: string;
+  rootSessionId?: string;
   remoteId: string;
   state: string;
   payload: unknown;
   updatedAt: string;
 };
 
-type HitlAction = PendingAction;
+type HitlAction = PendingAction & { rootSessionId?: string };
+type InternalSessionSummary = {
+  id: string;
+  adapter?: string;
+  kind?: string;
+  status?: string;
+  title?: string;
+  updatedAt?: string;
+};
+
+type InternalDisclosureState = {
+  status: "idle" | "loading" | "loaded" | "error";
+  items: InternalSessionSummary[];
+  error?: string;
+};
+
 
 type HubEvent = {
   seq: number;
@@ -68,6 +94,8 @@ let streamConnected = false;
 let loadingSessions = false;
 let fetchError: string | null = null;
 let projectionErrors: Partial<Record<"inbox" | "work" | "history", string>> = {};
+const internalDisclosures = new Map<string, InternalDisclosureState>();
+const openInternalDisclosures = new Set<string>();
 
 function isTab(value: string | null): value is TabId {
   return value !== null && tabOptions.some((option) => option.id === value);
@@ -384,33 +412,71 @@ function clearSelectedSession(): void {
   pendingPrompt = null;
 }
 
-function renderSessionList(panel: HTMLElement, items: Session[], empty: string, origin: SessionOrigin = "sessions"): void {
-  if (loadingSessions) {
-    panel.append(element("p", "Loading sessions…"));
-    return;
+function appendRollupBadges(container: HTMLElement, rollups: SessionRollups): void {
+  const badges = element("span");
+  badges.className = "dense-row-badges";
+  const values: [number | undefined, string][] = [
+    [rollups.internalCount, "internal"],
+    [rollups.actionableCount, "needs input"],
+    [rollups.failureCount, "failed"],
+  ];
+  for (const [count, label] of values) {
+    if (!count) continue;
+    const badge = element("span", `${count} ${label}`);
+    badge.className = label === "failed" ? "badge badge-failure" : "badge";
+    badges.append(badge);
   }
-  if (items.length === 0) {
-    panel.append(element("p", empty));
-    return;
-  }
+  if (badges.children.length) container.append(badges);
+}
+
+function denseRow(title: string, state: string, updatedAt: string, rollups: SessionRollups, pressed?: boolean): HTMLButtonElement {
+  const descriptor = denseRowDescriptor(state, pressed);
+  const button = element(descriptor.element);
+  button.type = descriptor.type;
+  button.className = "dense-row";
+  if (descriptor.pressed !== undefined) button.setAttribute("aria-pressed", String(descriptor.pressed));
+  const copy = element("span");
+  copy.className = "dense-row-copy";
+  copy.append(element("strong", title), element("small", `Updated ${new Date(rollups.lastActivityAt ?? updatedAt).toLocaleString()}`));
+  const status = element("span", descriptor.statusText);
+  status.className = "dense-row-state";
+  button.append(copy, status);
+  appendRollupBadges(button, rollups);
+  return button;
+}
+
+function appendSessionGroup(panel: HTMLElement, heading: string, items: Session[], origin: SessionOrigin): void {
+  if (items.length === 0) return;
+  const headingId = `${origin}-section-${panel.children.length}`;
+  const title = element("h3", `${heading} (${items.length})`);
+  title.id = headingId;
   const list = element("ul");
-  list.className = "session-list";
+  list.className = "dense-list";
+  list.setAttribute("aria-labelledby", headingId);
   for (const session of items) {
     const item = element("li");
-    const button = element("button");
-    button.type = "button";
-    button.className = "session";
-    button.setAttribute("aria-pressed", String(session.id === selectedSessionId));
-    const title = session.title || session.adapter;
-    const stale = session.status === "stale" ? "Stale" : session.status;
-    button.append(element("strong", title), element("span", stale), element("small", `Updated ${new Date(session.updatedAt).toLocaleString()}`));
-    if (session.hitlCount) button.append(element("span", `${session.hitlCount} needs input`));
-    if (session.failureCount) button.append(element("span", `${session.failureCount} failed`));
+    const button = denseRow(session.title || session.adapter, session.status, session.updatedAt, session, session.id === selectedSessionId);
     button.addEventListener("click", () => selectSession(session, origin));
     item.append(button);
     list.append(item);
   }
-  panel.append(list);
+  panel.append(title, list);
+}
+
+function renderSessionList(panel: HTMLElement, items: Session[], empty: string, origin: SessionOrigin = "sessions"): void {
+  if (loadingSessions) {
+    const status = element("p", "Loading sessions…");
+    status.className = "surface-state";
+    panel.append(status);
+    return;
+  }
+  if (items.length === 0) {
+    const status = element("p", empty);
+    status.className = "surface-state";
+    panel.append(status);
+    return;
+  }
+  for (const section of sessionSections(items)) appendSessionGroup(panel, section.heading, section.items, origin);
 }
 
 function renderInbox(panel: HTMLElement): void {
@@ -421,19 +487,25 @@ function renderInbox(panel: HTMLElement): void {
   else if (pendingActions.length === 0) panel.append(element("p", "No open approvals or failures."));
   else {
     const list = element("ul");
-    list.className = "session-list";
+    list.className = "inbox-list";
     for (const action of pendingActions) {
-      const item = element("li");
+      const rootId = action.rootSessionId ?? action.sessionId;
+      const session = sessions.find((candidate) => candidate.id === rootId);
+      const descriptor = inboxRowDescriptor(Boolean(session));
+      const item = element(descriptor.element);
       item.className = "inbox-action";
       const card = renderAction(action, api);
-      const session = sessions.find((candidate) => candidate.id === action.sessionId);
-      if (session) {
-        const open = element("button", "View session");
-        open.type = "button";
-        open.addEventListener("click", () => selectSession(session));
-        card.append(open);
-      } else card.append(element("p", "The authorized session is unavailable."));
       item.append(card);
+      if (session) {
+        const control = descriptor.children[1];
+        if (control?.element !== "button") throw new Error("Inbox session control descriptor is invalid.");
+        const open = element(control.element, control.label);
+        open.type = control.type;
+        open.addEventListener("click", () => selectSession(session));
+        item.append(open);
+      } else {
+        card.append(element("p", "The authorized session is unavailable."));
+      }
       list.append(item);
     }
     panel.append(list);
@@ -485,14 +557,12 @@ function renderWork(panel: HTMLElement): void {
       renderedGroups++;
       panel.append(element("h3", `${heading} (${items.length})`));
       const list = element("ul");
-      list.className = "session-list";
+      list.className = "dense-list";
       for (const work of items) {
         const item = element("li");
-        const button = element("button");
-        button.type = "button";
-        button.className = "session";
-        button.append(element("strong", workTitle(work)), element("span", work.state), element("small", `Updated ${new Date(work.updatedAt).toLocaleString()}`));
-        const session = sessions.find((candidate) => candidate.id === work.sessionId);
+        const button = denseRow(workTitle(work), work.state, work.updatedAt, work);
+        const rootId = work.rootSessionId ?? work.sessionId;
+        const session = sessions.find((candidate) => candidate.id === rootId);
         if (session) button.addEventListener("click", () => selectSession(session));
         else button.disabled = true;
         item.append(button);
@@ -504,10 +574,20 @@ function renderWork(panel: HTMLElement): void {
   }
 }
 
+function rootSessions(items: Session[]): Session[] {
+  return items.filter((session) => session.rootSessionId === session.id);
+}
+
 function renderSessions(panel: HTMLElement): void {
   const activeSessions = sessions.filter((session) => !isArchived(session));
-  panel.append(element("h2", `Sessions (${activeSessions.length})`));
-  renderSessionList(panel, activeSessions, "No active runtime sessions.");
+  const sections = rootSessionSections(activeSessions);
+  const activeCount = sections.reduce((count, section) => count + section.items.length, 0);
+  panel.append(element("h2", `Sessions (${activeCount})`));
+  if (loadingSessions || activeCount === 0) {
+    renderSessionList(panel, [], "No active runtime sessions.");
+  } else {
+    for (const section of sections) appendSessionGroup(panel, section.heading, section.items, "sessions");
+  }
   const settings = element("details");
   settings.append(element("summary", "Settings"));
   const defaultViewLabel = element("label", "Default view");
@@ -533,11 +613,85 @@ function renderSessions(panel: HTMLElement): void {
   panel.append(settings);
 }
 
+function localDateHeading(updatedAt: string): string {
+  return new Intl.DateTimeFormat(undefined, { dateStyle: "full" }).format(new Date(updatedAt));
+}
+
 function renderHistory(panel: HTMLElement): void {
-  const archivedSessions = sessions.filter(isArchived);
+  const archivedSessions = rootSessions(sessions.filter(isArchived));
   panel.append(element("h2", `History (${archivedSessions.length})`));
   renderProjectionError(panel, "history");
-  renderSessionList(panel, archivedSessions, "No completed or archived sessions.", "history");
+  if (loadingSessions) {
+    const status = element("p", "Loading sessions…");
+    status.className = "surface-state";
+    panel.append(status);
+    return;
+  }
+  if (archivedSessions.length === 0) {
+    const status = element("p", "No completed or archived sessions.");
+    status.className = "surface-state";
+    panel.append(status);
+    return;
+  }
+  for (const section of historySections(archivedSessions, localDateHeading)) {
+    appendSessionGroup(panel, section.heading, section.items, "history");
+  }
+}
+
+function renderInternalDisclosure(session: Session): HTMLDetailsElement {
+  const disclosure = element("details");
+  disclosure.className = "internal-disclosure";
+  disclosure.open = openInternalDisclosures.has(session.id);
+  const summary = element("summary", `Internal activity (${session.internalCount ?? 0})`);
+  disclosure.append(summary);
+  const content = element("div");
+  content.className = "internal-disclosure-content";
+  const current = internalDisclosures.get(session.id) ?? { status: "idle", items: [] };
+  if (current.status === "loading" || current.status === "idle") content.append(element("p", "Loading internal activity…"));
+  else if (current.status === "error") {
+    const error = element("p", current.error ?? "Internal activity is unavailable.");
+    error.setAttribute("role", "alert");
+    content.append(error);
+  } else if (current.items.length === 0) content.append(element("p", "No internal activity details are available."));
+  else {
+    const list = element("ul");
+    list.className = "internal-list";
+    for (const internal of current.items) {
+      const item = element("li");
+      item.append(element("strong", internal.title || internal.kind || internal.adapter || "Internal execution"));
+      if (internal.status || internal.updatedAt) item.append(element("small", [internal.status, internal.updatedAt ? new Date(internal.updatedAt).toLocaleString() : ""].filter(Boolean).join(" · ")));
+      list.append(item);
+    }
+    content.append(list);
+  }
+  disclosure.append(content);
+  disclosure.addEventListener("toggle", () => {
+    if (disclosure.open) {
+      openInternalDisclosures.add(session.id);
+      if (current.status === "idle") void loadInternalSessions(session.id);
+    } else openInternalDisclosures.delete(session.id);
+  });
+  return disclosure;
+}
+
+async function loadInternalSessions(sessionId: string): Promise<void> {
+  internalDisclosures.set(sessionId, { status: "loading", items: [] });
+  render();
+  try {
+    const response = await api(`/sessions/${encodeURIComponent(sessionId)}/internal`);
+    if (!response.ok) throw new Error(`request failed (${response.status})`);
+    const body: unknown = await response.json();
+    const candidates = typeof body === "object" && body !== null
+      ? ((body as { sessions?: unknown; internal?: unknown }).sessions ?? (body as { internal?: unknown }).internal)
+      : undefined;
+    if (!Array.isArray(candidates)) throw new Error("invalid response");
+    const items = candidates.filter((item): item is InternalSessionSummary =>
+      typeof item === "object" && item !== null && typeof (item as InternalSessionSummary).id === "string");
+    internalDisclosures.set(sessionId, { status: "loaded", items });
+  } catch (error) {
+    internalDisclosures.set(sessionId, { status: "error", items: [], error: fetchFailure("Unable to load internal activity", error) });
+  }
+  render();
 }
 
 function renderSelectedSession(panel: HTMLElement): void {
@@ -571,6 +725,7 @@ function renderSelectedSession(panel: HTMLElement): void {
   messages.setAttribute("aria-label", "Normalized transcript");
   activity.append(messages);
   detail.append(activity);
+  if (session.internalCount) detail.append(renderInternalDisclosure(session));
   if (isArchived(session)) {
     detail.append(element("p", "Archived sessions are read-only."));
   } else {
@@ -740,7 +895,11 @@ async function loadSessions(): Promise<void> {
       if (typeof body === "object" && body !== null && Array.isArray((body as { actions?: unknown }).actions)) {
         hitlActions = (body as { actions: unknown[] }).actions.flatMap((action) => {
           if (typeof action !== "object" || action === null || typeof (action as { sessionId?: unknown }).sessionId !== "string") return [];
-          return parseActions({ actions: [action] }, (action as { sessionId: string }).sessionId);
+          const parsed = parseActions({ actions: [action] }, (action as { sessionId: string }).sessionId);
+          const rootSessionId = typeof (action as { rootSessionId?: unknown }).rootSessionId === "string"
+            ? (action as { rootSessionId: string }).rootSessionId
+            : undefined;
+          return parsed.map((item) => ({ ...item, rootSessionId }));
         });
       } else projectionErrors.inbox = "Unable to load inbox: invalid response.";
     } else projectionErrors.inbox = fetchFailure("Unable to load inbox", hitlResult.reason);

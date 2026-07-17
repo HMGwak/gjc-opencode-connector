@@ -19,7 +19,14 @@ import type {
   StoredPushSubscription,
   TranscriptStatus,
   WorkItem,
+  SessionHierarchyEvidence,
+  SessionHierarchyProjection,
+  SessionHierarchyRollup,
+  HierarchyBackfillCycle,
+  HierarchyGeneration,
+  HierarchyReadiness,
 } from "./types";
+import { classifyOwnerGraph } from "./session-hierarchy";
 import { SecretDataError, assertSecretFree as assertRedactedSecretFree, redactDiagnostic, redactForCommand, redactForSink, type SinkKind } from "./redact";
 
 
@@ -312,6 +319,58 @@ CREATE TABLE IF NOT EXISTS device_credentials (
   revoked_at TEXT
 );
 CREATE INDEX IF NOT EXISTS device_credentials_owner_created_idx ON device_credentials(owner_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS owner_hierarchy_generation (
+  owner_id TEXT PRIMARY KEY CHECK (length(trim(owner_id)) > 0),
+  active_generation INTEGER NOT NULL DEFAULT 0 CHECK (active_generation >= 0),
+  evidence_revision INTEGER NOT NULL DEFAULT 0 CHECK (evidence_revision >= 0),
+  evidence_schema_epoch INTEGER NOT NULL DEFAULT 0 CHECK (evidence_schema_epoch >= 0),
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS session_hierarchy_evidence (
+  owner_id TEXT NOT NULL, adapter TEXT NOT NULL, source_key TEXT NOT NULL,
+  session_id TEXT NOT NULL, identity_namespace TEXT NOT NULL,
+  observed_parent_session_id TEXT, observed_parent_owner_id TEXT,
+  direct_human_evidence INTEGER NOT NULL CHECK (direct_human_evidence IN (0, 1)),
+  structural_kind TEXT NOT NULL CHECK (structural_kind IN ('direct', 'continuation', 'subagent', 'tool', 'review')),
+  observation_state TEXT NOT NULL CHECK (observation_state IN ('valid', 'unreadable', 'missing-parent', 'conflict')),
+  captured_epoch INTEGER NOT NULL CHECK (captured_epoch >= 0), deleted_at TEXT, updated_at TEXT NOT NULL,
+  PRIMARY KEY (owner_id, adapter, source_key)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS session_hierarchy_evidence_owner_session_idx ON session_hierarchy_evidence(owner_id, session_id);
+CREATE TABLE IF NOT EXISTS session_hierarchy_backfill_snapshot (
+  owner_id TEXT NOT NULL, epoch INTEGER NOT NULL, cycle INTEGER NOT NULL,
+  required_adapters_json TEXT NOT NULL CHECK (json_valid(required_adapters_json)),
+  frozen_at TEXT, created_at TEXT NOT NULL,
+  PRIMARY KEY (owner_id, epoch, cycle)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS session_hierarchy_backfill_run (
+  owner_id TEXT NOT NULL, adapter TEXT NOT NULL, epoch INTEGER NOT NULL, cycle INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('enumerating', 'reconciling', 'complete')),
+  expected_source_keys INTEGER NOT NULL DEFAULT 0 CHECK (expected_source_keys >= 0),
+  observed_source_keys INTEGER NOT NULL DEFAULT 0 CHECK (observed_source_keys >= 0),
+  frozen_at TEXT, updated_at TEXT NOT NULL,
+  PRIMARY KEY (owner_id, adapter, epoch, cycle),
+  FOREIGN KEY (owner_id, epoch, cycle) REFERENCES session_hierarchy_backfill_snapshot(owner_id, epoch, cycle) DEFERRABLE INITIALLY DEFERRED
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS session_hierarchy_backfill_manifest (
+  owner_id TEXT NOT NULL, adapter TEXT NOT NULL, epoch INTEGER NOT NULL, cycle INTEGER NOT NULL, source_key TEXT NOT NULL,
+  PRIMARY KEY (owner_id, adapter, epoch, cycle, source_key),
+  FOREIGN KEY (owner_id, adapter, epoch, cycle) REFERENCES session_hierarchy_backfill_run(owner_id, adapter, epoch, cycle) DEFERRABLE INITIALLY DEFERRED
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS session_hierarchy_projection (
+  owner_id TEXT NOT NULL, generation INTEGER NOT NULL, session_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('root', 'internal', 'unknown')),
+  root_session_id TEXT, parent_session_id TEXT, unknown_reason TEXT,
+  lineage_kind TEXT, internal_kind TEXT, subagent_identity TEXT,
+  PRIMARY KEY (owner_id, generation, session_id),
+  FOREIGN KEY (owner_id, generation, root_session_id) REFERENCES session_hierarchy_projection(owner_id, generation, session_id) DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (owner_id, generation, parent_session_id) REFERENCES session_hierarchy_projection(owner_id, generation, session_id) DEFERRABLE INITIALLY DEFERRED
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS session_hierarchy_projection_owner_generation_root_idx ON session_hierarchy_projection(owner_id, generation, root_session_id);
+CREATE TABLE IF NOT EXISTS session_hierarchy_generation_lease (
+  owner_id TEXT NOT NULL, generation INTEGER NOT NULL, ref_count INTEGER NOT NULL DEFAULT 0 CHECK (ref_count >= 0), updated_at TEXT NOT NULL,
+  PRIMARY KEY (owner_id, generation)
+) WITHOUT ROWID;
 `;
 const migrationBootstrap = `
 CREATE TABLE IF NOT EXISTS sessions (
@@ -750,7 +809,7 @@ const migratePhase0 = (database: Database): void => {
 interface SessionRow {
   id: string; owner_id: string | null; adapter: string; remote_id: string; status: SessionStatus;
   reconciliation_epoch: number; reconciled: number; remote_revision: string | null;
-  control_mode: SessionControlMode; origin: SessionOrigin; transcript_status: TranscriptStatus; active_projector_version: string | null; archived_at: string | null;
+  control_mode: SessionControlMode; origin: SessionOrigin; transcript_status: TranscriptStatus; active_projector_version: string | null; archived_at: string | null; continuation_parent_id: string | null;
   title: string | null; workdir: string | null; source_created_at: string | null; created_at: string; updated_at: string;
 }
 interface EventRow { session_id: string; seq: number; type: string; payload_json: string; created_at: string; }
@@ -773,6 +832,13 @@ export type DeviceCredential = {
 
 const now = (): string => new Date().toISOString();
 const SSE_OUTBOX_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
+export const CONTINUATION_EVENT_SEQ_STRIDE = 10_000_000;
+const continuationGlobalSeq = (segmentIndex: number, localSeq: number): number => {
+  if (!Number.isSafeInteger(segmentIndex) || segmentIndex < 0 || !Number.isSafeInteger(localSeq) || localSeq < 1 || localSeq >= CONTINUATION_EVENT_SEQ_STRIDE) throw new Error("Invalid continuation event sequence");
+  const globalSeq = segmentIndex * CONTINUATION_EVENT_SEQ_STRIDE + localSeq;
+  if (!Number.isSafeInteger(globalSeq)) throw new Error("Continuation event sequence exceeds safe integer range");
+  return globalSeq;
+};
 const SSE_OUTBOX_MAX_ROWS_PER_OWNER = 10_000;
 const json = (sink: SinkKind, value: unknown): string => JSON.stringify(redactForSink(sink, value));
 /** Commands are durable but intentionally not an authoritative §3 sink. */
@@ -792,7 +858,7 @@ const asSession = (row: SessionRow): Session => {
     status: row.status, reconciliationEpoch: row.reconciliation_epoch, reconciled: row.reconciled === 1,
     remoteRevision: row.remote_revision, controlMode: row.control_mode, origin: row.origin,
     transcriptStatus: row.transcript_status, activeProjectorVersion: row.active_projector_version, archivedAt: row.archived_at, title: row.title, workdir: row.workdir,
-    sourceCreatedAt: row.source_created_at, createdAt: row.created_at, updatedAt: row.updated_at,
+    sourceCreatedAt: row.source_created_at, createdAt: row.created_at, updatedAt: row.updated_at, continuationParentId: row.continuation_parent_id,
   };
 };
 const asEvent = <T>(row: EventRow): SessionEvent<T> => ({ sessionId: row.session_id, seq: row.seq, type: row.type, payload: decodeJson<T>(row.payload_json, `event ${row.session_id}:${row.seq}`), createdAt: row.created_at });
@@ -806,6 +872,135 @@ export class CoreDatabase {
   readonly filename: string;
   private transactionDepth = 0;
   private readonly readOnly: boolean;
+  private readonly generationRefs = new Map<string, number>();
+  private generationRefKey(ownerId: string, generation: number): string { return `${ownerId}\u0000${generation}`; }
+  getHierarchyGeneration(ownerId: string): HierarchyGeneration | null {
+    const row = this.sqlite.query(`SELECT owner_id, active_generation, evidence_revision, evidence_schema_epoch, updated_at FROM owner_hierarchy_generation WHERE owner_id=?`).get(ownerId) as { owner_id: string; active_generation: number; evidence_revision: number; evidence_schema_epoch: number; updated_at: string } | null;
+    return row === null ? null : { ownerId: row.owner_id, activeGeneration: row.active_generation, evidenceRevision: row.evidence_revision, evidenceSchemaEpoch: row.evidence_schema_epoch, updatedAt: row.updated_at };
+  }
+
+  listSessionHierarchyEvidence(ownerId: string): SessionHierarchyEvidence[] {
+    return (this.sqlite.query(`SELECT owner_id, adapter, source_key, session_id, identity_namespace, observed_parent_session_id, observed_parent_owner_id, direct_human_evidence, structural_kind, observation_state, captured_epoch, deleted_at FROM session_hierarchy_evidence WHERE owner_id=? ORDER BY adapter, source_key`).all(ownerId) as Array<{ owner_id: string; adapter: string; source_key: string; session_id: string; identity_namespace: string; observed_parent_session_id: string | null; observed_parent_owner_id: string | null; direct_human_evidence: number; structural_kind: SessionHierarchyEvidence["structuralKind"]; observation_state: SessionHierarchyEvidence["observationState"]; captured_epoch: number; deleted_at: string | null }>).map((row) => ({ ownerId: row.owner_id, adapter: row.adapter, sourceKey: row.source_key, sessionId: row.session_id, identityNamespace: row.identity_namespace, observedParentSessionId: row.observed_parent_session_id, observedParentOwnerId: row.observed_parent_owner_id, directHumanEvidence: row.direct_human_evidence === 1, structuralKind: row.structural_kind, observationState: row.observation_state, capturedEpoch: row.captured_epoch, deletedAt: row.deleted_at }));
+  }
+
+  resetHierarchyGenerationLeases(): void {
+    this.generationRefs.clear();
+    this.sqlite.query(`UPDATE session_hierarchy_generation_lease SET ref_count=0, updated_at=?`).run(now());
+  }
+
+  beginHierarchyBackfillCycle(ownerId: string, input: { epoch: number; requiredAdapters: readonly string[] }): HierarchyBackfillCycle {
+    return this.transaction(() => {
+      const requiredAdapters = [...new Set(input.requiredAdapters)].sort();
+      const row = this.sqlite.query(`SELECT COALESCE(MAX(cycle), 0) + 1 cycle FROM session_hierarchy_backfill_snapshot WHERE owner_id=? AND epoch=?`).get(ownerId, input.epoch) as { cycle: number };
+      this.createHierarchyBackfillSnapshot(ownerId, input.epoch, row.cycle, requiredAdapters);
+      return { ownerId, epoch: input.epoch, cycle: row.cycle, requiredAdapters, frozenAt: null };
+    });
+  }
+
+  getHierarchyReadiness(ownerId: string, requiredEpoch: number, cycle: number): HierarchyReadiness {
+    const generation = this.getHierarchyGeneration(ownerId);
+    const coverageGapCount = this.hierarchyCoverageGapCount(ownerId, requiredEpoch, cycle);
+    const evidenceSchemaEpoch = generation?.evidenceSchemaEpoch ?? 0;
+    return { ownerId, evidenceSchemaEpoch, requiredEpoch, coverageGapCount, ready: evidenceSchemaEpoch >= requiredEpoch && coverageGapCount === 0 };
+  }
+  classifyAndProjectSessionHierarchy(ownerId: string, generation: number, backfill: { epoch: number; cycle: number } | null = null): void {
+    this.transaction(() => {
+      const projections = classifyOwnerGraph(ownerId, this.listSessionHierarchyEvidence(ownerId)).map((row) => ({ ...row, generation }));
+      this.projectSessionHierarchy(ownerId, generation, projections, backfill);
+    });
+  }
+
+  upsertSessionHierarchyEvidence(evidence: SessionHierarchyEvidence): void {
+    this.transaction(() => {
+      const timestamp = now();
+      this.sqlite.query(`INSERT INTO session_hierarchy_evidence (owner_id, adapter, source_key, session_id, identity_namespace, observed_parent_session_id, observed_parent_owner_id, direct_human_evidence, structural_kind, observation_state, captured_epoch, deleted_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(owner_id, adapter, source_key) DO UPDATE SET session_id=excluded.session_id, identity_namespace=excluded.identity_namespace, observed_parent_session_id=excluded.observed_parent_session_id, observed_parent_owner_id=excluded.observed_parent_owner_id, direct_human_evidence=excluded.direct_human_evidence, structural_kind=excluded.structural_kind, observation_state=excluded.observation_state, captured_epoch=excluded.captured_epoch, deleted_at=excluded.deleted_at, updated_at=excluded.updated_at`).run(evidence.ownerId, evidence.adapter, evidence.sourceKey, evidence.sessionId, evidence.identityNamespace, evidence.observedParentSessionId, evidence.observedParentOwnerId, evidence.directHumanEvidence ? 1 : 0, evidence.structuralKind, evidence.observationState, evidence.capturedEpoch, evidence.deletedAt, timestamp);
+      this.sqlite.query(`INSERT INTO owner_hierarchy_generation (owner_id, updated_at) VALUES (?, ?) ON CONFLICT(owner_id) DO UPDATE SET evidence_revision=evidence_revision+1, updated_at=excluded.updated_at`).run(evidence.ownerId, timestamp);
+    });
+  }
+
+  createHierarchyBackfillSnapshot(ownerId: string, epoch: number, cycle: number, requiredAdapters: readonly string[]): void {
+    this.sqlite.query(`INSERT INTO session_hierarchy_backfill_snapshot (owner_id, epoch, cycle, required_adapters_json, created_at) VALUES (?, ?, ?, ?, ?)`).run(ownerId, epoch, cycle, JSON.stringify([...new Set(requiredAdapters)].sort()), now());
+  }
+  upsertHierarchyBackfillRun(input: { ownerId: string; adapter: string; epoch: number; cycle: number; state: "enumerating" | "reconciling" | "complete"; expectedSourceKeys: number; observedSourceKeys: number; frozenAt: string | null }): void {
+    this.transaction(() => {
+      const snapshot = this.sqlite.query(`SELECT frozen_at FROM session_hierarchy_backfill_snapshot WHERE owner_id=? AND epoch=? AND cycle=?`).get(input.ownerId, input.epoch, input.cycle) as { frozen_at: string | null } | null;
+      if (!snapshot) throw new Error("Backfill snapshot does not exist");
+      if (snapshot.frozen_at !== null) throw new Error("Frozen backfill snapshot is immutable");
+      const run = this.sqlite.query(`SELECT state, expected_source_keys, observed_source_keys, frozen_at FROM session_hierarchy_backfill_run WHERE owner_id=? AND adapter=? AND epoch=? AND cycle=?`).get(input.ownerId, input.adapter, input.epoch, input.cycle) as { state: string; expected_source_keys: number; observed_source_keys: number; frozen_at: string | null } | null;
+      if (run !== null && run.frozen_at !== null) {
+        if (run.state !== input.state || run.expected_source_keys !== input.expectedSourceKeys || run.observed_source_keys !== input.observedSourceKeys || run.frozen_at !== input.frozenAt) throw new Error("Frozen backfill run is immutable");
+        return;
+      }
+      this.sqlite.query(`INSERT INTO session_hierarchy_backfill_run (owner_id, adapter, epoch, cycle, state, expected_source_keys, observed_source_keys, frozen_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(owner_id, adapter, epoch, cycle) DO UPDATE SET state=excluded.state, expected_source_keys=excluded.expected_source_keys, observed_source_keys=excluded.observed_source_keys, frozen_at=excluded.frozen_at, updated_at=excluded.updated_at`).run(input.ownerId, input.adapter, input.epoch, input.cycle, input.state, input.expectedSourceKeys, input.observedSourceKeys, input.frozenAt, now());
+    });
+  }
+  addHierarchyBackfillManifestEntry(ownerId: string, adapter: string, epoch: number, cycle: number, sourceKey: string): void {
+    const run = this.sqlite.query(`SELECT frozen_at FROM session_hierarchy_backfill_run WHERE owner_id=? AND adapter=? AND epoch=? AND cycle=?`).get(ownerId, adapter, epoch, cycle) as { frozen_at: string | null } | null;
+    if (!run) throw new Error("Backfill run does not exist");
+    if (run.frozen_at !== null) throw new Error("Frozen backfill manifest is immutable");
+    this.sqlite.query(`INSERT OR IGNORE INTO session_hierarchy_backfill_manifest (owner_id, adapter, epoch, cycle, source_key) VALUES (?, ?, ?, ?, ?)`).run(ownerId, adapter, epoch, cycle, sourceKey);
+  }
+  freezeHierarchyBackfillSnapshot(ownerId: string, epoch: number, cycle: number): void {
+    this.transaction(() => {
+      const snapshot = this.sqlite.query(`SELECT required_adapters_json, frozen_at FROM session_hierarchy_backfill_snapshot WHERE owner_id=? AND epoch=? AND cycle=?`).get(ownerId, epoch, cycle) as { required_adapters_json: string; frozen_at: string | null } | null;
+      if (!snapshot) throw new Error("Backfill snapshot does not exist");
+      if (snapshot.frozen_at !== null) return;
+      const incomplete = this.sqlite.query(`SELECT 1 FROM json_each(?) required LEFT JOIN session_hierarchy_backfill_run run ON run.owner_id=? AND run.epoch=? AND run.cycle=? AND run.adapter=required.value WHERE run.adapter IS NULL OR run.state<>'complete' OR run.frozen_at IS NULL OR run.expected_source_keys<>run.observed_source_keys LIMIT 1`).get(snapshot.required_adapters_json, ownerId, epoch, cycle);
+      if (incomplete) throw new Error("Every required backfill run must complete, match counts, and freeze before its snapshot");
+      this.sqlite.query(`UPDATE session_hierarchy_backfill_snapshot SET frozen_at=? WHERE owner_id=? AND epoch=? AND cycle=?`).run(now(), ownerId, epoch, cycle);
+    });
+  }
+  hierarchyCoverageGapCount(ownerId: string, epoch: number, cycle: number): number {
+    const row = this.sqlite.query(`SELECT CASE WHEN s.frozen_at IS NULL THEN 1 ELSE (SELECT count(*) FROM json_each(s.required_adapters_json) a LEFT JOIN session_hierarchy_backfill_run r ON r.owner_id=s.owner_id AND r.epoch=s.epoch AND r.cycle=s.cycle AND r.adapter=a.value WHERE r.adapter IS NULL OR r.state <> 'complete' OR r.frozen_at IS NULL OR r.expected_source_keys <> r.observed_source_keys) + (SELECT count(*) FROM session_hierarchy_backfill_manifest m LEFT JOIN session_hierarchy_evidence e ON e.owner_id=m.owner_id AND e.adapter=m.adapter AND e.source_key=m.source_key AND e.captured_epoch=m.epoch WHERE m.owner_id=s.owner_id AND m.epoch=s.epoch AND m.cycle=s.cycle AND (e.source_key IS NULL OR e.observation_state NOT IN ('valid','unreadable','missing-parent','conflict'))) END gaps FROM session_hierarchy_backfill_snapshot s WHERE s.owner_id=? AND s.epoch=? AND s.cycle=?`).get(ownerId, epoch, cycle) as { gaps: number } | null;
+    return row?.gaps ?? Number.MAX_SAFE_INTEGER;
+  }
+  projectSessionHierarchy(ownerId: string, generation: number, rows: readonly SessionHierarchyProjection[], backfill: { epoch: number; cycle: number } | null = null): void {
+    this.transaction(() => {
+      if (rows.some((row) => row.ownerId !== ownerId || row.generation !== generation)) throw new Error("Projection owner or generation mismatch");
+      for (const row of rows) this.sqlite.query(`INSERT INTO session_hierarchy_projection (owner_id, generation, session_id, kind, root_session_id, parent_session_id, unknown_reason, lineage_kind, internal_kind, subagent_identity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(row.ownerId, row.generation, row.sessionId, row.kind, row.rootSessionId, row.parentSessionId, row.unknownReason, row.lineageKind, row.internalKind, row.subagentIdentity);
+      const nodeCount = (this.sqlite.query(`SELECT count(*) AS count FROM session_hierarchy_projection WHERE owner_id=? AND generation=?`).get(ownerId, generation) as { count: number }).count;
+      if (nodeCount !== rows.length) throw new Error("Incomplete hierarchy projection node count");
+      const invalid = this.sqlite.query(`SELECT 1 FROM session_hierarchy_projection p LEFT JOIN session_hierarchy_projection r ON r.owner_id=p.owner_id AND r.generation=p.generation AND r.session_id=p.root_session_id LEFT JOIN session_hierarchy_projection parent ON parent.owner_id=p.owner_id AND parent.generation=p.generation AND parent.session_id=p.parent_session_id WHERE p.owner_id=? AND p.generation=? AND ((p.kind='root' AND (p.root_session_id<>p.session_id OR p.parent_session_id IS NOT NULL)) OR (p.kind='internal' AND (r.kind<>'root' OR p.parent_session_id IS NULL OR parent.kind NOT IN ('root','internal'))) OR (p.kind='unknown' AND p.root_session_id IS NOT NULL)) LIMIT 1`).get(ownerId, generation);
+      if (invalid) throw new Error("Invalid hierarchy projection graph");
+      const continuationRows = this.sqlite.query("SELECT id, continuation_parent_id FROM sessions WHERE owner_id=?").all(ownerId) as Array<{ id: string; continuation_parent_id: string | null }>;
+      const parents = new Map(continuationRows.map((row) => [row.id, row.continuation_parent_id]));
+      for (const id of parents.keys()) {
+        const seen = new Set<string>();
+        for (let current: string | null = id; current !== null; current = parents.get(current) ?? null) {
+          if (seen.has(current) || !parents.has(current)) throw new Error("Invalid continuation lineage");
+          seen.add(current);
+        }
+      }
+      const gaps = backfill ? this.hierarchyCoverageGapCount(ownerId, backfill.epoch, backfill.cycle) : 0;
+      if (gaps) throw new Error(`Hierarchy backfill incomplete: ${gaps} gap(s)`);
+      this.sqlite.query(`INSERT INTO owner_hierarchy_generation (owner_id, active_generation, evidence_schema_epoch, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(owner_id) DO UPDATE SET active_generation=excluded.active_generation, evidence_schema_epoch=CASE WHEN ?=0 THEN excluded.evidence_schema_epoch ELSE owner_hierarchy_generation.evidence_schema_epoch END, updated_at=excluded.updated_at`).run(ownerId, generation, backfill?.epoch ?? 0, now(), gaps);
+    });
+  }
+  acquireGenerationLease(ownerId: string): number {
+    return this.transaction(() => {
+      const state = this.sqlite.query(`SELECT active_generation FROM owner_hierarchy_generation WHERE owner_id=?`).get(ownerId) as { active_generation: number } | null;
+      const generation = state?.active_generation ?? 0, key = this.generationRefKey(ownerId, generation);
+      this.generationRefs.set(key, (this.generationRefs.get(key) ?? 0) + 1);
+      this.sqlite.query(`INSERT INTO session_hierarchy_generation_lease (owner_id, generation, ref_count, updated_at) VALUES (?, ?, 1, ?) ON CONFLICT(owner_id, generation) DO UPDATE SET ref_count=ref_count+1, updated_at=excluded.updated_at`).run(ownerId, generation, now());
+      return generation;
+    });
+  }
+  releaseGenerationLease(ownerId: string, generation: number): void {
+    const key = this.generationRefKey(ownerId, generation), refs = this.generationRefs.get(key) ?? 0;
+    if (refs <= 0) throw new Error("Generation lease was not acquired");
+    if (refs === 1) this.generationRefs.delete(key); else this.generationRefs.set(key, refs - 1);
+    this.sqlite.query(`UPDATE session_hierarchy_generation_lease SET ref_count=MAX(0, ref_count-1), updated_at=? WHERE owner_id=? AND generation=?`).run(now(), ownerId, generation);
+  }
+  pruneOldGenerations(ownerId: string): number {
+    const active = (this.sqlite.query(`SELECT active_generation FROM owner_hierarchy_generation WHERE owner_id=?`).get(ownerId) as { active_generation: number } | null)?.active_generation;
+    if (active === undefined) return 0;
+    let deleted = 0;
+    for (const { generation } of this.sqlite.query(`SELECT DISTINCT generation FROM session_hierarchy_projection WHERE owner_id=? AND generation<>?`).all(ownerId, active) as Array<{ generation: number }>) if ((this.generationRefs.get(this.generationRefKey(ownerId, generation)) ?? 0) === 0) deleted += this.sqlite.query(`DELETE FROM session_hierarchy_projection WHERE owner_id=? AND generation=?`).run(ownerId, generation).changes;
+    return deleted;
+  }
+  hierarchyRollups(ownerId: string, generation = (this.sqlite.query(`SELECT active_generation FROM owner_hierarchy_generation WHERE owner_id=?`).get(ownerId) as { active_generation: number } | null)?.active_generation ?? 0): SessionHierarchyRollup[] {
+    return this.sqlite.query(`SELECT p.root_session_id AS rootSessionId, SUM(CASE WHEN p.kind='internal' AND s.continuation_parent_id IS NULL THEN 1 ELSE 0 END) AS internalCount, COALESCE(a.actionableCount,0) AS actionableCount, SUM(CASE WHEN p.kind='internal' AND p.lineage_kind<>'continuation' AND s.status IN ('stale','unknown') THEN 1 ELSE 0 END) AS failureCount, MAX(s.updated_at) AS lastActivityAt FROM session_hierarchy_projection p LEFT JOIN sessions s ON s.id=p.session_id AND s.owner_id=p.owner_id LEFT JOIN (SELECT hierarchy.root_session_id, count(*) actionableCount FROM pending_actions pa JOIN session_hierarchy_projection hierarchy ON hierarchy.owner_id=pa.owner_id AND hierarchy.session_id=pa.session_id WHERE pa.owner_id=? AND pa.state IN ('pending','dispatching','unknown') AND hierarchy.generation=? AND hierarchy.kind IN ('root','internal') GROUP BY hierarchy.root_session_id) a ON a.root_session_id=p.root_session_id WHERE p.owner_id=? AND p.generation=? AND p.kind IN ('root','internal') GROUP BY p.root_session_id`).all(ownerId, generation, ownerId, generation) as SessionHierarchyRollup[];
+  }
 
   constructor(filename = ":memory:", options: { readonly?: boolean } = {}) {
     this.filename = filename;
@@ -898,11 +1093,14 @@ export class CoreDatabase {
     }
   }
 
-  createSession(input: Pick<Session, "id" | "ownerId" | "adapter" | "remoteId">): Session {
+  createSession(input: Pick<Session, "id" | "ownerId" | "adapter" | "remoteId"> & { continuationParentId?: string | null }): Session {
     if (!input.ownerId) throw new TypeError("Session owner is required");
     return this.transaction(() => {
+      if (input.continuationParentId !== undefined && input.continuationParentId !== null && !this.getSessionForOwner(input.continuationParentId, input.ownerId)) {
+        throw new Error("Continuation parent must belong to the session owner");
+      }
       const timestamp = now();
-      this.sqlite.query("INSERT INTO sessions (id, owner_id, adapter, remote_id, status, control_mode, origin, created_at, updated_at) VALUES (?, ?, ?, ?, 'active', 'controlled', 'coordinator-start', ?, ?)").run(input.id, input.ownerId, input.adapter, input.remoteId, timestamp, timestamp);
+      this.sqlite.query("INSERT INTO sessions (id, owner_id, adapter, remote_id, status, control_mode, origin, continuation_parent_id, created_at, updated_at) VALUES (?, ?, ?, ?, 'active', 'controlled', ?, ?, ?, ?)").run(input.id, input.ownerId, input.adapter, input.remoteId, input.continuationParentId ? "coordinator-continuation" : "coordinator-start", input.continuationParentId ?? null, timestamp, timestamp);
       const session = this.getSession(input.id)!;
       this.enqueueMobileState(input.ownerId, session.id, "session.created", session);
       return session;
@@ -1104,17 +1302,43 @@ export class CoreDatabase {
       return appended;
     });
   }
+  private continuationSegments(sessionId: string): SessionRow[] {
+    const requested = this.sqlite.query("SELECT * FROM sessions WHERE id=? AND owner_id IS NOT NULL").get(sessionId) as SessionRow | null;
+    if (!requested) throw new Error("Session does not exist");
+    const segments: SessionRow[] = [requested], visited = new Set([requested.id]);
+    let current = requested;
+    while (current.continuation_parent_id !== null) {
+      const parent = this.sqlite.query("SELECT * FROM sessions WHERE id=? AND owner_id=?").get(current.continuation_parent_id, requested.owner_id) as SessionRow | null;
+      if (!parent || visited.has(parent.id)) throw new Error("Invalid continuation lineage");
+      segments.unshift(parent); visited.add(parent.id); current = parent;
+    }
+    while (true) {
+      const children = this.sqlite.query("SELECT * FROM sessions WHERE continuation_parent_id=? AND owner_id=? ORDER BY id").all(segments.at(-1)!.id, requested.owner_id) as SessionRow[];
+      if (children.length > 1) throw new Error("Ambiguous continuation lineage");
+      if (children.length === 0) return segments;
+      if (visited.has(children[0]!.id)) throw new Error("Invalid continuation lineage");
+      segments.push(children[0]!); visited.add(children[0]!.id);
+    }
+  }
+  getContinuationAggregateForOwner(sessionId: string, ownerId: string): Session {
+    const segments = this.continuationSegments(sessionId);
+    if (segments[0]!.owner_id !== ownerId) throw new Error("Session does not exist");
+    const origin = asSession(segments[0]!), head = asSession(segments.at(-1)!);
+    return { ...origin, status: head.status, reconciliationEpoch: head.reconciliationEpoch, reconciled: head.reconciled, remoteRevision: head.remoteRevision, transcriptStatus: head.transcriptStatus, activeProjectorVersion: head.activeProjectorVersion, archivedAt: head.archivedAt, updatedAt: head.updatedAt };
+  }
   listEvents<T>(sessionId: string, after = 0): SessionEvent<T>[] {
-    if (!this.getSession(sessionId)) throw new Error("Session does not exist");
-    const rows = this.sqlite.query("SELECT * FROM events WHERE session_id = ? AND seq > ? ORDER BY seq ASC").all(sessionId, after) as EventRow[];
+    if (!Number.isSafeInteger(after) || after < 0) throw new Error("Invalid continuation event sequence");
+    const segments = this.continuationSegments(sessionId);
     try {
-      return rows.map((row) => this.corrupt("event", `${row.session_id}:${row.seq}`, "payload_json", row.payload_json, () => asEvent<T>(row)));
+      return segments.flatMap((segment, index) => (this.sqlite.query("SELECT * FROM events WHERE session_id=? ORDER BY seq ASC").all(segment.id) as EventRow[]).map((row) => ({ ...this.corrupt("event", `${row.session_id}:${row.seq}`, "payload_json", row.payload_json, () => asEvent<T>(row)), seq: continuationGlobalSeq(index, row.seq) }))).filter((event) => event.seq > after);
     } catch (cause) {
-      if (cause instanceof CorruptPersistentDataError) {
-        this.sqlite.query("UPDATE sessions SET status = 'unknown', reconciled = 0, updated_at = ? WHERE id = ?").run(now(), sessionId);
-      }
+      if (cause instanceof CorruptPersistentDataError) this.sqlite.query("UPDATE sessions SET status='unknown', reconciled=0, updated_at=? WHERE id=?").run(now(), sessionId);
       throw cause;
     }
+  }
+  eventSequenceBounds(sessionId: string): { first: number | null; last: number | null } {
+    const events = this.listEvents(sessionId);
+    return { first: events[0]?.seq ?? null, last: events.at(-1)?.seq ?? null };
   }
 
   acceptCommand<T>(input: { id: string; sessionId: string; idempotencyKey: string; payload: T }): { command: Command<T>; duplicate: boolean } {

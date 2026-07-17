@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { backupThenOpenDatabase } from "./startup";
+import { backupThenOpenDatabase, initializeHierarchy } from "./startup";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -46,5 +46,17 @@ describe("hub database startup", () => {
     const result = await backupThenOpenDatabase(join(root, "hub.sqlite"), join(root, "backups"));
     try { expect(result.backupPath).toBeNull(); }
     finally { result.database.close(); }
+  });
+  test("resets hierarchy generation leases before hierarchy initialization", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hub-startup-hierarchy-"));
+    roots.push(root);
+    const result = await backupThenOpenDatabase(join(root, "hub.sqlite"));
+    try {
+      const generation = result.database.acquireGenerationLease("owner");
+      await initializeHierarchy(result.database, { synchronizeHierarchy: async () => ({ epoch: 1, cycle: 1, projected: false }) } as never);
+      expect(() => result.database.releaseGenerationLease("owner", generation)).toThrow("not acquired");
+    } finally {
+      result.database.close();
+    }
   });
 });

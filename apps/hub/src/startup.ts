@@ -3,6 +3,7 @@ import { backupDatabase, openCoreDatabase, type CoreDatabase } from "@planee/cor
 import { closeSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import type { GjcOnDiskDiscovery } from "./gjc-ondisk-discovery";
 
 export interface RuntimeLock { readonly path: string; release(): void; }
 
@@ -67,4 +68,9 @@ export async function backupThenOpenDatabase(databasePath: string, backupDirecto
   const database = openCoreDatabase(databasePath);
   if (backupPath !== null) database.writeAudit({ action: "database.pre_migration_backup", payload: { path: backupPath } });
   return { database, backupPath };
+}
+
+export async function initializeHierarchy(database: CoreDatabase, discovery: GjcOnDiskDiscovery, requiredAdapters: readonly string[] = ["gjc"]): Promise<{ readonly epoch: number; readonly cycle: number; readonly projected: boolean }> {
+  database.resetHierarchyGenerationLeases();
+  return discovery.synchronizeHierarchy(requiredAdapters);
 }

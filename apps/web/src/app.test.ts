@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { denseRowDescriptor, historySections, inboxRowDescriptor, rootSessionSections, sessionSections } from "./view-model";
 
 const source = await Bun.file(new URL("./app.ts", import.meta.url)).text();
 const styles = await Bun.file(new URL("./styles.css", import.meta.url)).text();
@@ -148,14 +149,26 @@ test("changes the Settings default without changing the current navigation state
   expect(source).toContain("for (const { id, label } of tabOptions)");
 });
 
-test("keeps History detail navigation, label, and return destination aligned", () => {
-  expect(source).toContain('renderSessionList(panel, archivedSessions, "No completed or archived sessions.", "history");');
-  expect(source).toContain('function renderSessionList(panel: HTMLElement, items: Session[], empty: string, origin: SessionOrigin = "sessions"): void');
-  expect(source).toContain("button.addEventListener(\"click\", () => selectSession(session, origin));");
+test("groups History into local-date sections and omits empty groups", () => {
+  const dates = new Map([
+    ["2026-07-17T01:00:00Z", "Friday, July 17, 2026"],
+    ["2026-07-16T23:00:00Z", "Thursday, July 16, 2026"],
+  ]);
+  const sections = historySections(
+    [
+      { id: "a", updatedAt: "2026-07-17T01:00:00Z" },
+      { id: "b", updatedAt: "2026-07-17T01:00:00Z" },
+      { id: "c", updatedAt: "2026-07-16T23:00:00Z" },
+    ],
+    (value) => dates.get(value)!,
+  );
+
+  expect(sections.map((section) => [section.heading, section.items.map((item) => item.id)])).toEqual([
+    ["Friday, July 17, 2026", ["a", "b"]],
+    ["Thursday, July 16, 2026", ["c"]],
+  ]);
+  expect(historySections([], (value) => value)).toEqual([]);
   expect(source).toContain('const back = element("button", origin === "history" ? "Back to history" : "Back to sessions");');
-  expect(source).toContain("selectedSessionOrigin = null;");
-  expect(styles).toContain("select:focus-visible");
-  expect(styles).toContain("--color-live: #087a4b;");
 });
 
 test("renders the four mobile workflow navigation surfaces with persistent navigation", () => {
@@ -172,7 +185,9 @@ test("renders the four mobile workflow navigation surfaces with persistent navig
 });
 
 test("shows loading and empty states for each session surface", () => {
-  expect(source).toContain('panel.append(element("p", "Loading sessions…"));');
+  expect(source).toContain('const status = element("p", "Loading sessions…");');
+  expect(source).toContain('status.className = "surface-state";');
+  expect(source).toContain("panel.append(status);");
   expect(source).toContain('"No open approvals or failures."');
   expect(source).toContain('"No work items."');
   expect(source).toContain('"No completed or archived sessions."');
@@ -200,7 +215,9 @@ test("loads Hub workflow projections, preserves HITL priority, and suppresses em
   expect(source).toContain('load("/history")');
   expect(source).toContain("Promise.allSettled");
   expect(source).toContain("function isWorkItem(value: unknown): value is WorkItem");
-  expect(source).toContain("type HitlAction = PendingAction;");
+  expect(source).toContain("type HitlAction = PendingAction & { rootSessionId?: string };");
+  expect(source).toContain("parseActions({ actions: [action] }, (action as { sessionId: string }).sessionId)");
+  expect(source).toContain("return parsed.map((item) => ({ ...item, rootSessionId }));");
   expect(source).toContain('const pendingActions = hitlActions.filter');
   expect(source).toContain("for (const action of pendingActions)");
   expect(source).toContain("const card = renderAction(action, api);");
@@ -213,6 +230,71 @@ test("loads Hub workflow projections, preserves HITL priority, and suppresses em
   expect(source).not.toContain('sessions.filter((session) => !isArchived(session) && (Boolean(session.hitlCount)');
   const inbox = source.slice(source.indexOf("function renderInbox"), source.indexOf("const WORK_STATE_GROUPS"));
   expect(inbox).not.toContain("renderSessionActions");
+});
+test("describes dense navigation rows as one accessible interactive control", () => {
+  expect(denseRowDescriptor("stale", true)).toEqual({
+    element: "button",
+    type: "button",
+    interactiveControls: 1,
+    statusText: "Status: Stale",
+    pressed: true,
+  });
+  expect(denseRowDescriptor("active", false).statusText).toBe("Status: active");
+});
+
+test("keeps Inbox action and View session controls as siblings", () => {
+  const row = inboxRowDescriptor(true);
+  expect(row).toEqual({
+    element: "li",
+    children: [
+      { element: "action" },
+      { element: "button", type: "button", label: "View session" },
+    ],
+  });
+  expect(row.children[0]).not.toHaveProperty("children");
+  expect(inboxRowDescriptor(false).children).toEqual([{ element: "action" }]);
+});
+
+test("groups only root Sessions by intervention priority and omits empty sections", () => {
+  const sections = rootSessionSections([
+    { id: "needs", rootSessionId: "needs", actionableCount: 2 },
+    { id: "recent", rootSessionId: "recent", actionableCount: 0 },
+    { id: "internal", rootSessionId: "needs", actionableCount: 3 },
+  ]);
+  expect(sections.map((section) => [section.heading, section.items.map((item) => item.id)])).toEqual([
+    ["Needs your input", ["needs"]],
+    ["Recently active", ["recent"]],
+  ]);
+  expect(sessionSections([{ id: "only", actionableCount: 1 }])).toEqual([
+    { heading: "Needs your input", items: [{ id: "only", actionableCount: 1 }] },
+  ]);
+  expect(rootSessionSections([])).toEqual([]);
+});
+
+test("keeps Inbox as a bordered list rather than rounded action cards", () => {
+  const inboxListStyles = styles.slice(styles.indexOf(".inbox-list"), styles.indexOf(".inbox-action"));
+  const inboxActionStyles = styles.slice(styles.indexOf(".inbox-action {"), styles.indexOf(".inbox-action > button"));
+  const actionCardStyles = styles.slice(styles.indexOf(".action-card {"), styles.indexOf(".action-card h3"));
+  expect(inboxListStyles).toContain(".inbox-list { border-top: 1px solid var(--color-border); }");
+  expect(inboxActionStyles).toContain(".inbox-action { display: grid;");
+  expect(inboxActionStyles).not.toContain("border-radius");
+  expect(actionCardStyles).not.toContain("border");
+  expect(actionCardStyles).not.toContain("border-radius");
+});
+
+test("consumes additive hierarchy fields and exposes internal activity only as rollups and drill-down", () => {
+  expect(source).toContain("rootSessionId?: string;");
+  expect(source).toContain("internalCount?: number;");
+  expect(source).toContain("actionableCount?: number;");
+  expect(source).toContain("lastActivityAt?: string;");
+  expect(source).toContain("action.rootSessionId ?? action.sessionId");
+  expect(source).toContain("work.rootSessionId ?? work.sessionId");
+  expect(source).toContain("if (session.internalCount) detail.append(renderInternalDisclosure(session));");
+  expect(source).toContain("`/sessions/${encodeURIComponent(sessionId)}/internal`");
+  expect(source).toContain('disclosure.className = "internal-disclosure";');
+  expect(source).toContain('"Loading internal activity…"');
+  expect(source).toContain('"No internal activity details are available."');
+  expect(source).toContain('error.setAttribute("role", "alert");');
 });
 test("groups failed and unsupported work states truthfully", () => {
   expect(source).toContain('const WORK_STATE_GROUPS = {');
