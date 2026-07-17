@@ -1,5 +1,20 @@
 apply plugin: 'com.android.application'
 
+def releaseVersionProperties = new Properties()
+def releaseVersionFile = rootProject.file('version.properties')
+if (!releaseVersionFile.exists()) {
+    throw new GradleException("Missing android/version.properties")
+}
+releaseVersionFile.withInputStream { releaseVersionProperties.load(it) }
+def releaseVersionName = providers.gradleProperty('planeeVersionName').getOrElse(releaseVersionProperties.getProperty('VERSION_NAME'))
+def releaseVersionCode = providers.gradleProperty('planeeVersionCode').getOrElse(releaseVersionProperties.getProperty('VERSION_CODE'))
+if (!(releaseVersionName ==~ /\d{6}_v[1-9]\d*/) && releaseVersionName !=~ /\d{6}_v0/) {
+    throw new GradleException("Invalid Android VERSION_NAME: ${releaseVersionName}")
+}
+if (!(releaseVersionCode ==~ /\d+/)) {
+    throw new GradleException("Invalid Android VERSION_CODE: ${releaseVersionCode}")
+}
+
 android {
     namespace = "com.myplanee.agents"
     compileSdk = rootProject.ext.compileSdkVersion
@@ -7,8 +22,8 @@ android {
         applicationId "com.myplanee.agents"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0"
+        versionCode releaseVersionCode.toInteger()
+        versionName releaseVersionName
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.

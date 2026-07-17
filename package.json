@@ -12,6 +12,7 @@
     "android:sync": "bun run build && bunx cap sync android",
     "build": "bun run --cwd apps/web build",
     "build:android": "bun run android:sync && cd android && ./gradlew assembleDebug",
+    "release:android": "./deploy/release-android-app.sh",
     "typecheck": "bunx tsc --noEmit --project tsconfig.json",
     "test": "bun test"
   },

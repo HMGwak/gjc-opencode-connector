@@ -57,3 +57,14 @@ Metrics and audit records must contain identifiers and classifications, not requ
 ## Degraded operation
 
 Degraded mode is read-only: show `stale`/`unknown`, refuse mutations, and retain local journal evidence. Do not downgrade device authentication, CSRF checks, workdir allowlists, or Docker-only NanoClaw isolation to regain availability. If evidence is insufficient to determine state, remain `unknown` and escalate.
+
+## Android app release
+
+Run `bun run release:android` from the repository root. The command increments the current day's sequence in `android/version.properties`, embeds the same version into the APK, and writes:
+
+```text
+artifacts/planee-agent-hub-yymmdd_vN.apk
+artifacts/planee-agent-hub-yymmdd_vN.apk.sha256
+```
+
+For example, the first release on 2026-07-17 is `260717_v1` with Android `versionCode` `26071701`. A new calendar day resets `N` to 1; subsequent releases on that day increment it. Commit `android/version.properties` with the release so the next sequence is durable.
