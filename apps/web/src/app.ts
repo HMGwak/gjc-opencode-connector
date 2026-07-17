@@ -1,10 +1,11 @@
 import { App } from "@capacitor/app";
+import { Dialog } from "@capacitor/dialog";
 import { Capacitor } from "@capacitor/core";
 import { parseActions, renderAction, renderActions as renderSessionActions, type PendingAction } from "./actions";
 import { clearCredential, saveCredential, SecureCredentialUnavailableError, storedCredential } from "./credential";
 import { enablePush, revokePush, revokePushWhenPermissionLost } from "./push";
 import { MultiTabCoordinator } from "./multitab";
-import { ACTIVE_WORK_STATES, COMPLETED_WORK_STATES, canNavigateBack, denseRowDescriptor, historySections, inboxRowDescriptor, rootSessionSections, sessionSections, workAccordionDescriptor, workSessionGroups } from "./view-model";
+import { canNavigateBack, denseRowDescriptor, historySections, inboxRowDescriptor, isDeliberateArchiveSwipe, rootSessionSections, SESSION_ARCHIVE_LONG_PRESS_MS, SESSION_ARCHIVE_SWIPE_VERTICAL_TOLERANCE_PX, sessionSections, workAccordionDescriptor, workSessionGroups } from "./view-model";
 type SessionRollups = {
   internalCount?: number;
   actionableCount?: number;
@@ -76,7 +77,6 @@ const app = requiredElement("#app");
 const DEFAULT_TAB_KEY = "planee-agent-hub:default-tab";
 const tabOptions = [
   { id: "inbox", label: "Inbox" },
-  { id: "work", label: "Work" },
   { id: "sessions", label: "Sessions" },
   { id: "history", label: "Archive" },
 ] as const;
@@ -100,19 +100,23 @@ const internalDisclosures = new Map<string, InternalDisclosureState>();
 const openInternalDisclosures = new Set<string>();
 let appHistoryIndex = 0;
 let androidBackRegistered = false;
+let exitDialogOpen = false;
+let archiveConfirmation: { session: Session; focusId: string } | null = null;
 
 function isTab(value: string | null): value is TabId {
   return value !== null && tabOptions.some((option) => option.id === value);
 }
 
+function normalizeTab(value: string | null): TabId {
+  return value === "work" ? "sessions" : isTab(value) ? value : "inbox";
+}
+
 function readDefaultTab(): TabId {
-  let configured: string | null;
   try {
-    configured = localStorage.getItem(DEFAULT_TAB_KEY);
+    return normalizeTab(localStorage.getItem(DEFAULT_TAB_KEY));
   } catch {
     return "inbox";
   }
-  return isTab(configured) ? configured : "inbox";
 }
 
 function selectDefaultTab(tab: TabId): void {
@@ -243,10 +247,10 @@ function navigationState(): NavigationState | null {
   if (!history) return null;
   const state = history.state as Partial<NavigationState> | null;
   const tab = state?.tab;
-  if (state?.planee !== true || !isTab(tab ?? null) || typeof state.index !== "number") return null;
+  if (state?.planee !== true || typeof state.index !== "number") return null;
   return {
     planee: true,
-    tab: tab as TabId,
+    tab: normalizeTab(typeof tab === "string" ? tab : null),
     sessionId: typeof state.sessionId === "string" ? state.sessionId : null,
     index: state.index,
   };
@@ -295,11 +299,26 @@ function registerAndroidBackButton(): void {
   if (androidBackRegistered || !Capacitor.isNativePlatform()) return;
   androidBackRegistered = true;
   void App.addListener("backButton", () => {
+    if (archiveConfirmation) {
+      dismissArchiveConfirmation();
+      return;
+    }
     if (canNavigateBack({ sessionId: selectedSessionId, index: appHistoryIndex })) {
       navigateBack();
       return;
     }
-    void App.exitApp();
+    if (exitDialogOpen) return;
+    exitDialogOpen = true;
+    void Dialog.confirm({
+      title: "Exit Planee Agent Hub?",
+      message: "Are you sure you want to exit?",
+      okButtonTitle: "Exit",
+      cancelButtonTitle: "Cancel",
+    }).then(({ value }) => {
+      if (value) void App.exitApp();
+    }).finally(() => {
+      exitDialogOpen = false;
+    });
   });
 }
 
@@ -331,7 +350,6 @@ function render(): void {
   panel.setAttribute("aria-label", `${activeTab} panel`);
   if (selectedSessionId) renderSelectedSession(panel);
   else if (activeTab === "inbox") renderInbox(panel);
-  else if (activeTab === "work") renderWork(panel);
   else if (activeTab === "sessions") renderSessions(panel);
   else if (activeTab === "history") renderHistory(panel);
 
@@ -347,6 +365,7 @@ function render(): void {
     navigation.append(button);
   }
   app.append(header, panel, navigation);
+  if (archiveConfirmation) renderArchiveConfirmation();
   if (focusedId) document.getElementById(focusedId)?.focus();
 }
 
@@ -520,11 +539,38 @@ function appendSessionGroup(panel: HTMLElement, heading: string, items: Session[
   const list = element("ul");
   list.className = "dense-list";
   list.setAttribute("aria-labelledby", headingId);
+  const groups = workSessionGroups(workItems, sessions);
   for (const session of items) {
     const item = element("li");
-    const button = denseRow(session.title || session.adapter, session.status, session.updatedAt, session, session.id === selectedSessionId);
-    button.addEventListener("click", () => selectSession(session, origin));
-    item.append(button);
+    if (origin !== "sessions") {
+      const button = denseRow(session.title || session.adapter, session.status, session.updatedAt, session, session.id === selectedSessionId);
+      button.addEventListener("click", () => selectSession(session, origin));
+      item.append(button);
+      list.append(item);
+      continue;
+    }
+    const disclosure = element("details");
+    disclosure.className = "session-work-disclosure";
+    const summary = element("summary");
+    summary.append(element("strong", session.title || session.adapter), element("small", `Status: ${session.status}`));
+    disclosure.append(summary);
+    const actions = element("div");
+    actions.className = "session-row-actions";
+    const open = element("button", "Open session");
+    open.type = "button";
+    open.addEventListener("click", () => selectSession(session, origin));
+    const archive = element("button", "Archive session");
+    archive.type = "button";
+    archive.className = "archive-session-action";
+    archive.id = `session-row-${session.id}`;
+    archive.setAttribute("aria-label", `Archive ${session.title || session.adapter}`);
+    archive.addEventListener("click", () => openArchiveConfirmation(session, archive.id));
+    actions.append(open, archive);
+    attachArchiveGestures(summary, session, archive.id);
+    disclosure.append(actions);
+    const group = groups.find((candidate) => candidate.rootSessionId === session.id);
+    if (group) appendWorkAccordion(disclosure, group, "sessions");
+    item.append(disclosure);
     list.append(item);
   }
   panel.append(title, list);
@@ -597,12 +643,13 @@ function renderProjectionError(panel: HTMLElement, tier: "inbox" | "work" | "his
 }
 
 function appendWorkAccordion(panel: HTMLElement, group: ReturnType<typeof workSessionGroups<WorkItem, Session>>[number], origin: SessionOrigin): void {
-  const descriptor = workAccordionDescriptor(group.title, group.items.length);
+  const descriptor = workAccordionDescriptor(group.title, group.items.length, true);
   const disclosure = element(descriptor.element);
+  disclosure.className = group.unassigned ? "unassigned-work" : "session-work";
   disclosure.open = descriptor.expanded;
-  disclosure.append(element("summary", descriptor.summary));
+  disclosure.append(element("summary", group.unassigned ? `${descriptor.summary} active work` : `Active work (${group.items.length})`));
   const list = element("ul");
-  list.className = "dense-list";
+  list.className = "dense-list work-list";
   for (const work of group.items) {
     const item = element("li");
     const button = denseRow(workTitle(work), work.state, work.updatedAt, work);
@@ -616,16 +663,6 @@ function appendWorkAccordion(panel: HTMLElement, group: ReturnType<typeof workSe
   panel.append(disclosure);
 }
 
-function renderWork(panel: HTMLElement): void {
-  const groups = workSessionGroups(workItems, sessions, ACTIVE_WORK_STATES);
-  const count = groups.reduce((total, group) => total + group.items.length, 0);
-  panel.append(element("h2", `Work (${count})`), element("p", "Sessions are conversation and control boundaries; work belongs to a root session."));
-  renderProjectionError(panel, "work");
-  if (loadingSessions) panel.append(element("p", "Loading work…"));
-  else if (count === 0) panel.append(element("p", "No active work items."));
-  else for (const group of groups) appendWorkAccordion(panel, group, "work");
-}
-
 function rootSessions(items: Session[]): Session[] {
   return items.filter((session) => session.rootSessionId === session.id);
 }
@@ -635,11 +672,14 @@ function renderSessions(panel: HTMLElement): void {
   const sections = rootSessionSections(activeSessions);
   const activeCount = sections.reduce((count, section) => count + section.items.length, 0);
   panel.append(element("h2", `Sessions (${activeCount})`));
+  renderProjectionError(panel, "work");
+  const unassigned = workSessionGroups(workItems, sessions).find((group) => group.unassigned);
   if (loadingSessions || activeCount === 0) {
     renderSessionList(panel, [], "No active runtime sessions.");
   } else {
     for (const section of sections) appendSessionGroup(panel, section.heading, section.items, "sessions");
   }
+  if (!loadingSessions && unassigned) appendWorkAccordion(panel, unassigned, "sessions");
   const settings = element("details");
   settings.append(element("summary", "Settings"));
   const defaultViewLabel = element("label", "Default view");
@@ -670,29 +710,22 @@ function localDateHeading(updatedAt: string): string {
 }
 
 function renderHistory(panel: HTMLElement): void {
-  const completedGroups = workSessionGroups(workItems, sessions, COMPLETED_WORK_STATES);
-  const completedCount = completedGroups.reduce((total, group) => total + group.items.length, 0);
   const archivedSessions = rootSessions(sessions.filter(isArchived));
-  panel.append(element("h2", `Archive (${completedCount + archivedSessions.length})`));
+  panel.append(element("h2", `Archive (${archivedSessions.length})`));
   renderProjectionError(panel, "history");
-  renderProjectionError(panel, "work");
   if (loadingSessions) {
     const status = element("p", "Loading archive…");
     status.className = "surface-state";
     panel.append(status);
     return;
   }
-  if (completedCount === 0 && archivedSessions.length === 0) {
-    const status = element("p", "No completed work or archived sessions.");
+  if (archivedSessions.length === 0) {
+    const status = element("p", "No archived sessions.");
     status.className = "surface-state";
     panel.append(status);
     return;
   }
-  for (const group of completedGroups) appendWorkAccordion(panel, group, "history");
-  if (archivedSessions.length) {
-    panel.append(element("h3", `Archived sessions (${archivedSessions.length})`));
-    for (const section of historySections(archivedSessions, localDateHeading)) appendSessionGroup(panel, section.heading, section.items, "history");
-  }
+  for (const section of historySections(archivedSessions, localDateHeading)) appendSessionGroup(panel, section.heading, section.items, "history");
 }
 
 function renderInternalDisclosure(session: Session): HTMLDetailsElement {
@@ -784,7 +817,8 @@ function renderSelectedSession(panel: HTMLElement): void {
   } else {
     const archive = element("button", "Archive session");
     archive.type = "button";
-    archive.addEventListener("click", () => void archiveSession(session.id, archive));
+    archive.id = "archive-session-action";
+    archive.addEventListener("click", () => openArchiveConfirmation(session, "archive-session-action"));
     detail.append(archive);
     if (session.controlMode === "view-only") detail.append(element("p", "This session is view-only. Prompts and session actions are unavailable."));
     else {
@@ -839,6 +873,99 @@ function appendMessage(sessionId: string, value: unknown): void {
   message.className = `message message-${normalized.role}`;
   message.setAttribute("aria-label", `${normalized.role} message`);
   list.append(message);
+}
+
+function openArchiveConfirmation(session: Session, focusId: string): void {
+  archiveConfirmation = { session, focusId };
+  render();
+}
+
+function dismissArchiveConfirmation(renderApp = true): void {
+  const focusId = archiveConfirmation?.focusId;
+  archiveConfirmation = null;
+  if (renderApp) render();
+  if (focusId) window.setTimeout(() => document.getElementById(focusId)?.focus(), 0);
+}
+
+function renderArchiveConfirmation(): void {
+  const confirmation = archiveConfirmation;
+  if (!confirmation) return;
+  const dialog = document.createElement("dialog");
+  dialog.className = "archive-confirmation";
+  dialog.setAttribute("aria-labelledby", "archive-confirmation-title");
+  dialog.append(element("h2", "Archive session"));
+  dialog.lastElementChild!.id = "archive-confirmation-title";
+  dialog.append(element("p", `Archive ${confirmation.session.title || confirmation.session.adapter}? This can be viewed later in Archive.`));
+  const controls = element("div");
+  controls.className = "archive-confirmation-controls";
+  const cancel = element("button", "Cancel");
+  cancel.type = "button";
+  cancel.addEventListener("click", () => dismissArchiveConfirmation());
+  const archive = element("button", "Archive");
+  archive.id = "confirm-archive";
+  archive.type = "button";
+  archive.addEventListener("click", () => {
+    const target = archiveConfirmation;
+    if (!target) return;
+    archiveConfirmation = null;
+    void archiveSession(target.session.id, archive);
+  });
+  dialog.addEventListener("cancel", (event) => {
+    event.preventDefault();
+    dismissArchiveConfirmation();
+  });
+  controls.append(cancel, archive);
+  dialog.append(controls);
+  app.append(dialog);
+  dialog.showModal();
+  archive.focus();
+}
+
+function attachArchiveGestures(row: HTMLElement, session: Session, focusId: string): void {
+  let timer: number | undefined;
+  let start: { x: number; y: number } | null = null;
+  let suppressClick = false;
+  const clear = () => {
+    if (timer !== undefined) window.clearTimeout(timer);
+    timer = undefined;
+  };
+  row.addEventListener("pointerdown", (event: PointerEvent) => {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    start = { x: event.clientX, y: event.clientY };
+    clear();
+    timer = window.setTimeout(() => {
+      suppressClick = true;
+      openArchiveConfirmation(session, focusId);
+    }, SESSION_ARCHIVE_LONG_PRESS_MS);
+  });
+  row.addEventListener("pointermove", (event: PointerEvent) => {
+    if (!start) return;
+    const movedHorizontally = Math.abs(event.clientX - start.x) > 12;
+    const movedVertically = Math.abs(event.clientY - start.y) > SESSION_ARCHIVE_SWIPE_VERTICAL_TOLERANCE_PX;
+    if (movedHorizontally || movedVertically) clear();
+  });
+  row.addEventListener("pointerup", (event: PointerEvent) => {
+    clear();
+    if (start && isDeliberateArchiveSwipe(start.x, start.y, event.clientX, event.clientY)) {
+      suppressClick = true;
+      openArchiveConfirmation(session, focusId);
+    }
+    start = null;
+  });
+  row.addEventListener("pointercancel", () => {
+    clear();
+    start = null;
+  });
+  row.addEventListener("pointerleave", () => {
+    clear();
+    start = null;
+  });
+  row.addEventListener("click", (event) => {
+    if (!suppressClick) return;
+    suppressClick = false;
+    event.preventDefault();
+    event.stopPropagation();
+  }, true);
 }
 
 async function archiveSession(sessionId: string, button: HTMLButtonElement): Promise<void> {
@@ -924,7 +1051,7 @@ async function loadSessions(): Promise<void> {
   try {
     const [sessionResult, workResult, hitlResult, historyResult] = await Promise.allSettled([
       load("/sessions"),
-      load("/work"),
+      load("/work?scope=active"),
       load("/hitl"),
       load("/history"),
     ]);
@@ -1057,7 +1184,10 @@ async function pollUpdates(generation: number): Promise<void> {
   updateConnectionStatus();
   reconnectTimer = window.setTimeout(() => void pollUpdates(generation), POLL_INTERVAL);
 }
-window.addEventListener("popstate", () => restoreNavigation(navigationState()));
+window.addEventListener("popstate", () => {
+  if (archiveConfirmation) dismissArchiveConfirmation(false);
+  restoreNavigation(navigationState());
+});
 
 window.addEventListener("online", () => { online = true; if (!pairingRequired) reconnectUpdates(); });
 window.addEventListener("offline", () => { online = false; ++pollGeneration; window.clearTimeout(reconnectTimer); streamConnected = false; updateConnectionStatus(); });

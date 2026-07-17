@@ -41,6 +41,21 @@ describe("hub origin API", () => {
     expect((await server.fetch(request("/api/v1/sessions/s1/internal?cursor=9007199254740991", token))).status).toBe(400);
     database.close();
   });
+  test("maps internal-session work to its authorized human root", async () => {
+    const { database, server, token } = await fixture(undefined, (db) => {
+      db.createSession({ id: "worker", ownerId: "u1", adapter: "test", remoteId: "worker" });
+      db.upsertWorkItem({ id: "worker-task", ownerId: "u1", sessionId: "worker", remoteId: "worker-task", state: "active", payload: {} });
+    });
+    database.sqlite.query("INSERT INTO session_hierarchy_projection VALUES ('u1', 0, 'worker', 'internal', 's1', 's1', NULL, 'subagent', 'worker', NULL)").run();
+
+    const body = await (await server.fetch(request("/api/v1/work?scope=active", token))).json() as {
+      work: Array<{ id: string; sessionId: string; rootSessionId: string }>;
+    };
+    expect(body.work).toEqual([
+      expect.objectContaining({ id: "worker-task", sessionId: "worker", rootSessionId: "s1" }),
+    ]);
+    database.close();
+  });
   test("renders continuation roots with origin identity and head lifecycle state", async () => {
     const { database, server, token } = await fixture(undefined, (db) => {
       db.sqlite.query("UPDATE sessions SET title = ? WHERE id = ?").run("Original conversation", "s1");
@@ -503,6 +518,35 @@ describe("hub origin API", () => {
     });
     const body = await (await server.fetch(request("/api/v1/work", token))).json() as { work: Array<{ id: string }> };
     expect(body.work.map(({ id }) => id)).toEqual(["visible-work"]);
+    database.close();
+  });
+  test("filters terminal work only for the active scope", async () => {
+    const { database, server, token } = await fixture();
+    for (const [id, state] of [
+      ["todo", "todo"],
+      ["in-progress", "in-progress"],
+      ["active", "active"],
+      ["failed", "failed"],
+      ["done", " DONE "],
+      ["completed", "COMPLETED"],
+      ["result", "result"],
+      ["resolved", "resolved"],
+      ["succeeded", "succeeded"],
+      ["success", "success"],
+      ["closed", "closed"],
+    ]) {
+      database.upsertWorkItem({ id, ownerId: "u1", sessionId: "s1", remoteId: id, state, payload: {} });
+    }
+
+    const unscoped = await (await server.fetch(request("/api/v1/work", token))).json() as { work: Array<{ id: string }> };
+    expect(unscoped.work.map(({ id }) => id).sort()).toEqual(["active", "closed", "completed", "done", "failed", "in-progress", "resolved", "result", "succeeded", "success", "todo"]);
+
+    const active = await (await server.fetch(request("/api/v1/work?scope=active", token))).json() as { work: Array<{ id: string }> };
+    expect(active.work.map(({ id }) => id).sort()).toEqual(["active", "failed", "in-progress", "todo"]);
+
+    const unknown = await server.fetch(request("/api/v1/work?scope=archived", token));
+    expect(unknown.status).toBe(400);
+    expect(await unknown.json()).toEqual({ error: { code: "invalid_work_scope", message: "Invalid work scope" } });
     database.close();
   });
   test("materializes snapshots through Core's authorized allowlist", async () => {

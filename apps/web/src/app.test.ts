@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { ACTIVE_WORK_STATES, COMPLETED_WORK_STATES, canNavigateBack, denseRowDescriptor, historySections, inboxRowDescriptor, rootSessionSections, sessionSections, workAccordionDescriptor, workSessionGroups } from "./view-model";
+import { canNavigateBack, denseRowDescriptor, historySections, inboxRowDescriptor, isDeliberateArchiveSwipe, rootSessionSections, SESSION_ARCHIVE_LONG_PRESS_MS, SESSION_ARCHIVE_SWIPE_DISTANCE_PX, sessionSections, workAccordionDescriptor, workSessionGroups } from "./view-model";
 
 const source = await Bun.file(new URL("./app.ts", import.meta.url)).text();
 const styles = await Bun.file(new URL("./styles.css", import.meta.url)).text();
@@ -55,7 +55,7 @@ test("restores a persisted default tab at startup and falls back to Inbox for in
     return navigation?.children.find((button) => button.attributes["aria-current"] === "page")?.dataset.tab;
   }
 
-  expect(await initialTab("work")).toBe("work");
+  expect(await initialTab("work")).toBe("sessions");
   expect(await initialTab("not-a-tab")).toBe("inbox");
   expect(await initialTab(null, true)).toBe("inbox");
 });
@@ -127,9 +127,9 @@ test("persists bottom-tab selections across reloads and continues navigating whe
     return button;
   }
 
-  tab(await boot(), "work").click();
-  expect(values.get("planee-agent-hub:default-tab")).toBe("work");
-  expect(tab(await boot(), "work").attributes["aria-current"]).toBe("page");
+  tab(await boot(), "sessions").click();
+  expect(values.get("planee-agent-hub:default-tab")).toBe("sessions");
+  expect(tab(await boot(), "sessions").attributes["aria-current"]).toBe("page");
 
   tab(await boot(), "history").click();
   expect(values.get("planee-agent-hub:default-tab")).toBe("history");
@@ -137,8 +137,8 @@ test("persists bottom-tab selections across reloads and continues navigating whe
 
   storageUnavailable = true;
   const unavailableApp = await boot();
-  tab(unavailableApp, "work").click();
-  expect(tab(unavailableApp, "work").attributes["aria-current"]).toBe("page");
+  tab(unavailableApp, "sessions").click();
+  expect(tab(unavailableApp, "sessions").attributes["aria-current"]).toBe("page");
 });
 test("changes the Settings default without changing the current navigation state", () => {
   const settings = source.slice(source.indexOf("function renderSessions"), source.indexOf("function renderHistory"));
@@ -191,8 +191,8 @@ test("shows loading and empty states for each session surface", () => {
   expect(source).toContain('status.className = "surface-state";');
   expect(source).toContain("panel.append(status);");
   expect(source).toContain('"No open approvals or failures."');
-  expect(source).toContain('"No active work items."');
-  expect(source).toContain('"No completed work or archived sessions."');
+  expect(source).toContain('"No active runtime sessions."');
+  expect(source).toContain('"No archived sessions."');
   expect(source).toContain('error.setAttribute("role", "alert");');
 });
 
@@ -212,7 +212,7 @@ test("makes archived sessions read-only and archives active sessions through the
 });
 test("keeps workflow projections separate and renders session-owned work", () => {
   expect(source).toContain('load("/sessions")');
-  expect(source).toContain('load("/work")');
+  expect(source).toContain('load("/work?scope=active")');
   expect(source).toContain('load("/hitl")');
   expect(source).toContain('load("/history")');
   expect(source).toContain("Promise.allSettled");
@@ -222,7 +222,7 @@ test("keeps workflow projections separate and renders session-owned work", () =>
   expect(source).toContain("return parsed.map((item) => ({ ...item, rootSessionId }));");
   expect(source).toContain("const pendingActions = hitlActions.filter");
   expect(source).toContain("function appendWorkAccordion");
-  expect(source).toContain('"No active work items."');
+  expect(source).toContain("workSessionGroups(workItems, sessions)");
 });
 test("describes dense navigation rows as one accessible interactive control", () => {
   expect(denseRowDescriptor("stale", true)).toEqual({
@@ -281,7 +281,7 @@ test("consumes additive hierarchy fields and exposes internal activity only as r
   expect(source).toContain("actionableCount?: number;");
   expect(source).toContain("lastActivityAt?: string;");
   expect(source).toContain("action.rootSessionId ?? action.sessionId");
-  expect(source).toContain("workSessionGroups(workItems, sessions, ACTIVE_WORK_STATES)");
+  expect(source).toContain("workSessionGroups(workItems, sessions)");
   expect(source).toContain("if (session.internalCount) detail.append(renderInternalDisclosure(session));");
   expect(source).toContain("`/sessions/${encodeURIComponent(sessionId)}/internal`");
   expect(source).toContain('disclosure.className = "internal-disclosure";');
@@ -289,23 +289,19 @@ test("consumes additive hierarchy fields and exposes internal activity only as r
   expect(source).toContain('"No internal activity details are available."');
   expect(source).toContain('error.setAttribute("role", "alert");');
 });
-test("separates active and completed work into root-session accordions", () => {
+test("groups work under root-session accordions without duplicating server state policy", () => {
   const sessions = [
     { id: "session-a", rootSessionId: "session-a", title: "Planning", adapter: "agent" },
     { id: "internal", rootSessionId: "session-a", title: "Internal", adapter: "agent" },
   ];
   const work = [
     { id: "open", sessionId: "session-a", state: "active" },
-    { id: "done", sessionId: "session-a", state: "success" },
+    { id: "queued", sessionId: "internal", rootSessionId: "session-a", state: "queued" },
     { id: "lost", sessionId: "missing", state: "failed" },
-    { id: "closed", sessionId: "session-a", state: "closed" },
   ];
-  expect(workSessionGroups(work, sessions, ACTIVE_WORK_STATES)).toEqual([
-    { rootSessionId: "session-a", title: "Planning", items: [work[0]], unassigned: false },
+  expect(workSessionGroups(work, sessions)).toEqual([
+    { rootSessionId: "session-a", title: "Planning", items: [work[0], work[1]], unassigned: false },
     { rootSessionId: null, title: "Unassigned", items: [work[2]], unassigned: true },
-  ]);
-  expect(workSessionGroups(work, sessions, COMPLETED_WORK_STATES)).toEqual([
-    { rootSessionId: "session-a", title: "Planning", items: [work[1], work[3]], unassigned: false },
   ]);
   expect(workAccordionDescriptor("Planning", 2)).toEqual({ element: "details", summary: "Planning (2)", expanded: false });
 });
@@ -313,7 +309,7 @@ test("keeps app back navigation in-app until the root tab without a detail", () 
   expect(canNavigateBack({ index: 2, sessionId: null })).toBe(true);
   expect(canNavigateBack({ index: 0, sessionId: "session-a" })).toBe(true);
   expect(canNavigateBack({ index: 0, sessionId: null })).toBe(false);
-  expect(source).toContain('window.addEventListener("popstate", () => restoreNavigation(navigationState()));');
+  expect(source).toContain('window.addEventListener("popstate", () => {');
   expect(source).toContain('void App.exitApp();');
 });
 test("creates a Sessions origin for deep links and replaces archived detail history", () => {
@@ -407,7 +403,7 @@ test("app network guard prevents catch-up fetches without coordination", async (
   });
   await import(`./app.ts?network-guard=${Date.now()}`);
   await new Promise((resolve) => setTimeout(resolve, 0));
-  expect(calls).toEqual(["/api/v1/sessions", "/api/v1/work", "/api/v1/hitl", "/api/v1/history"]);
+  expect(calls).toEqual(["/api/v1/sessions", "/api/v1/work?scope=active", "/api/v1/hitl", "/api/v1/history"]);
 });
 
 test("keeps action controls and settings available without exposing them as primary navigation", () => {
@@ -419,4 +415,68 @@ test("keeps action controls and settings available without exposing them as prim
 test("publishes install metadata through the document manifest link", async () => {
   const index = await Bun.file(new URL("../index.html", import.meta.url)).text();
   expect(index).toContain('<link rel="manifest" href="/manifest.webmanifest" />');
+});
+
+test("exposes Inbox, Sessions, and Archive only while normalizing legacy Work", () => {
+  expect(source).toContain('{ id: "inbox", label: "Inbox" }');
+  expect(source).toContain('{ id: "sessions", label: "Sessions" }');
+  expect(source).toContain('{ id: "history", label: "Archive" }');
+  expect(source).not.toContain('{ id: "work", label: "Work" }');
+  expect(source).toContain('return value === "work" ? "sessions"');
+  expect(styles).toContain("grid-template-columns: repeat(3, 1fr)");
+});
+
+test("fetches only active work and groups it under authorized root sessions", () => {
+  const sessions = [
+    { id: "root", rootSessionId: "root", title: "Root", adapter: "agent" },
+    { id: "internal", rootSessionId: "root", title: "Internal", adapter: "agent" },
+  ];
+  const open = { id: "open", sessionId: "internal", rootSessionId: "root", state: "active" };
+  const unassigned = { id: "lost", sessionId: "missing", state: "failed" };
+  expect(workSessionGroups([open, unassigned], sessions)).toEqual([
+    { rootSessionId: "root", title: "Root", items: [open], unassigned: false },
+    { rootSessionId: null, title: "Unassigned", items: [unassigned], unassigned: true },
+  ]);
+  expect(source).toContain('load("/work?scope=active")');
+  expect(source).toContain('className = "dense-list work-list"');
+  expect(source).not.toContain("const completedGroups");
+});
+test("trusts the active-work API response instead of maintaining a second client allowlist", () => {
+  const sessions = [{ id: "root", rootSessionId: "root", title: "Root", adapter: "agent" }];
+  const queued = { id: "queued", sessionId: "root", state: "queued" };
+  expect(workSessionGroups([queued], sessions)).toEqual([
+    { rootSessionId: "root", title: "Root", items: [queued], unassigned: false },
+  ]);
+  expect(source).not.toContain("ACTIVE_WORK_STATES");
+});
+
+test("requires deliberate gestures and explicit confirmation before archive", () => {
+  expect(SESSION_ARCHIVE_LONG_PRESS_MS).toBe(550);
+  expect(isDeliberateArchiveSwipe(100, 20, 100 - SESSION_ARCHIVE_SWIPE_DISTANCE_PX, 45)).toBe(true);
+  expect(isDeliberateArchiveSwipe(100, 20, 37, 20)).toBe(false);
+  expect(isDeliberateArchiveSwipe(100, 20, 0, 60)).toBe(false);
+  expect(source).toContain("function attachArchiveGestures");
+  expect(source).toContain("function renderArchiveConfirmation");
+  expect(source).toContain('element("button", "Cancel")');
+  expect(source).toContain('element("button", "Archive")');
+  expect(source).toContain('element("button", "Open session")');
+});
+test("uses a modal archive confirmation that back and pointer departure can dismiss", () => {
+  expect(source).toContain('document.createElement("dialog")');
+  expect(source).toContain("dialog.showModal()");
+  expect(source).toContain('dialog.addEventListener("cancel"');
+  expect(source).toContain("if (archiveConfirmation)");
+  expect(source).toContain('row.addEventListener("pointerleave"');
+  expect(styles).toContain(".archive-confirmation::backdrop");
+});
+
+test("uses in-app history before explicit Android root-exit confirmation", () => {
+  expect(canNavigateBack({ index: 1, sessionId: null })).toBe(true);
+  expect(canNavigateBack({ index: 0, sessionId: "session" })).toBe(true);
+  expect(canNavigateBack({ index: 0, sessionId: null })).toBe(false);
+  expect(source).toContain("if (exitDialogOpen) return;");
+  expect(source).toContain("void Dialog.confirm({");
+  expect(source).toContain('okButtonTitle: "Exit"');
+  expect(source).toContain('cancelButtonTitle: "Cancel"');
+  expect(source).toContain("if (value) void App.exitApp();");
 });

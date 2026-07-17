@@ -1,3 +1,11 @@
+export const SESSION_ARCHIVE_LONG_PRESS_MS = 550;
+export const SESSION_ARCHIVE_SWIPE_DISTANCE_PX = 64;
+export const SESSION_ARCHIVE_SWIPE_VERTICAL_TOLERANCE_PX = 32;
+
+export function isDeliberateArchiveSwipe(startX: number, startY: number, endX: number, endY: number): boolean {
+  return startX - endX >= SESSION_ARCHIVE_SWIPE_DISTANCE_PX &&
+    Math.abs(endY - startY) <= SESSION_ARCHIVE_SWIPE_VERTICAL_TOLERANCE_PX;
+}
 export type SessionListItem = {
   id: string;
   rootSessionId: string;
@@ -37,20 +45,17 @@ export function historySections<T extends { updatedAt: string }>(
   return [...groups].map(([heading, groupedItems]) => ({ heading, items: groupedItems }));
 }
 
-export const ACTIVE_WORK_STATES = new Set(["todo", "open", "in-progress", "active", "in_progress", "failed", "error", "cancelled", "canceled"]);
-export const COMPLETED_WORK_STATES = new Set(["done", "completed", "result", "resolved", "succeeded", "success", "closed"]);
 
 export type WorkSessionGroup<T> = { rootSessionId: string | null; title: string; items: T[]; unassigned: boolean };
 
 /** Sessions are user conversation/control boundaries; work belongs to an authorized root session. */
 export function workSessionGroups<
-  T extends { sessionId: string; rootSessionId?: string; state: string },
+  T extends { sessionId: string; rootSessionId?: string },
   S extends { id: string; rootSessionId?: string; title?: string; adapter: string },
->(workItems: T[], sessions: S[], states: ReadonlySet<string>): WorkSessionGroup<T>[] {
+>(workItems: T[], sessions: S[]): WorkSessionGroup<T>[] {
   const roots = new Map(sessions.filter((session) => session.rootSessionId === session.id).map((session) => [session.id, session]));
   const grouped = new Map<string | null, T[]>();
   for (const work of workItems) {
-    if (!states.has(work.state)) continue;
     const rootId = work.rootSessionId ?? work.sessionId;
     const key = roots.has(rootId) ? rootId : null;
     grouped.set(key, [...(grouped.get(key) ?? []), work]);

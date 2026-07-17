@@ -2,7 +2,7 @@
 
 ## 1. Direction
 
-The authenticated interface is a calm, Linear-inspired single-column control surface. Sessions, History, and navigational Work use dense semantic rows; Inbox remains a distinct action surface for approvals and failures.
+The authenticated interface is a calm, Linear-inspired single-column control surface. Inbox, Sessions, and Archive use dense semantic rows; active work is disclosed beneath its owning human-root session instead of appearing as a peer navigation surface.
 
 ## 2. Color
 
@@ -54,10 +54,11 @@ The authenticated interface is a calm, Linear-inspired single-column control sur
 
 ### Dense row
 
-- Used only for Sessions, History, and Work navigation.
-- Structure: one native button inside one list item, with title, state, timestamp, and optional compact rollup badges.
-- Internal executions never appear as peer rows. `internalCount`, `actionableCount`, and `failureCount` appear as compact badges on the human-root row.
-- The row has no nested interactive controls and retains a minimum 44px target.
+- Used for Sessions and Archive navigation.
+- A human-root Session is a native disclosure parent. Its active work appears only when expanded, indented beneath the parent; terminal work is not fetched for this surface.
+- Internal executions never appear as peer rows. `internalCount`, `actionableCount`, and `failureCount` remain compact badges on the human-root row.
+- Session content keeps explicit Open and Archive actions. Long press and deliberate left swipe may request Archive, but both route through the same explicit Cancel/Archive confirmation.
+- The row retains a minimum 44px target and visible keyboard focus.
 
 ### Inbox action surface
 
@@ -72,9 +73,10 @@ The authenticated interface is a calm, Linear-inspired single-column control sur
 
 ## 6. Motion and Interaction
 
-- No decorative motion is introduced for this security flow.
+- Android Back consumes in-app detail/tab history first. At the root it opens an explicit Cancel/Exit confirmation instead of immediately leaving the app.
+- Long press and left swipe are optional accelerators for archive confirmation; keyboard and screen-reader users retain the explicit Archive action.
 - Buttons retain native active feedback; focus remains visibly outlined.
-- Reduced-motion preference requires no additional override because no transition is added.
+- Reduced-motion preference requires no additional override because no decorative transition is added.
 
 ## 7. Depth and Surface
 
@@ -86,4 +88,4 @@ The authenticated interface is a calm, Linear-inspired single-column control sur
 - WCAG 2.2 AA target: visible focus, keyboard-complete pairing, explicit labels, status announcements, and a 44px minimum interactive target.
 - Accepted debt: browser/PWA mode does not retain the device credential. This personal connector flow is Android-only and requires the Keystore-backed bridge.
 - Session hierarchy wire fields are additive and optional during staged integration: `rootSessionId`, `internalCount`, `actionableCount`, `failureCount`, and `lastActivityAt`. Missing values preserve legacy navigation and omit rollup UI.
-- Human-root sessions are the only listable Sessions/History peers. Internal execution summaries are available only through rollups and explicit drill-down.
+- Human-root sessions are the only listable Sessions/Archive peers. Active work resolves through `rootSessionId` with `sessionId` fallback and appears only beneath that parent; internal execution summaries remain available only through rollups and explicit drill-down.

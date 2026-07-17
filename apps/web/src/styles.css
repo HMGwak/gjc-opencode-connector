@@ -1,8 +1,6 @@
-@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap");
-
 :root {
   color-scheme: dark light;
-  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  font-family: ui-sans-serif, system-ui, sans-serif;
   --color-page: #111216;
   --color-surface: #181a20;
   --color-elevated: #20232b;
@@ -40,7 +38,7 @@ h3 { margin: 1rem 0 .35rem; color: var(--color-muted); font-size: .72rem; font-w
 #connection-status[data-state="live"] { color: var(--color-live); }
 #connection-error { margin-top: .35rem; color: var(--color-danger); font-size: .8rem; }
 .panel { min-height: 0; padding: .9rem var(--space-4) 1.5rem; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
-.tabs { position: relative; z-index: 2; display: grid; grid-template-columns: repeat(4, 1fr); padding: .35rem var(--space-3) max(.35rem, env(safe-area-inset-bottom)); border-top: 1px solid var(--color-border); background: var(--color-page); }
+.tabs { position: relative; z-index: 2; display: grid; grid-template-columns: repeat(3, 1fr); padding: .35rem var(--space-3) max(.35rem, env(safe-area-inset-bottom)); border-top: 1px solid var(--color-border); background: var(--color-page); }
 .tabs button { min-width: 0; min-height: 44px; border: 0; border-radius: var(--radius-sm); padding-inline: .2rem; background: transparent; color: var(--color-muted); font-size: .75rem; font-weight: 500; }
 .tabs button[aria-current="page"] { background: var(--color-selected); color: var(--color-text); }
 .dense-list, .inbox-list, .messages, .internal-list { padding: 0; margin: 0; list-style: none; }
@@ -56,6 +54,18 @@ h3 { margin: 1rem 0 .35rem; color: var(--color-muted); font-size: .72rem; font-w
 .badge { padding: .12rem .35rem; border-radius: 999px; background: var(--color-elevated); color: var(--color-muted); font-size: .66rem; font-weight: 500; }
 .badge-failure { color: var(--color-danger); }
 .surface-state { padding: 1.5rem 0; color: var(--color-muted); font-size: .85rem; }
+.session-work-disclosure { gap: 0; }
+.session-work-disclosure > summary { display: grid; gap: .15rem; padding: .55rem .15rem; }
+.session-work-disclosure > summary small { color: var(--color-muted); font-size: .7rem; }
+.session-row-actions { display: flex; gap: var(--space-2); padding: 0 .15rem .5rem; }
+.session-row-actions button { min-height: 36px; padding-block: .35rem; }
+.archive-session-action { color: var(--color-muted); }
+.session-work, .unassigned-work { margin-left: 1rem; border-top: 1px solid var(--color-border); }
+.work-list .dense-row { padding-left: .75rem; }
+.archive-confirmation { position: fixed; z-index: 4; right: var(--space-4); bottom: max(1rem, env(safe-area-inset-bottom)); left: var(--space-4); width: auto; max-width: none; margin: 0; display: grid; gap: var(--space-3); padding: var(--space-4); border: 1px solid var(--color-border); border-radius: var(--radius-sm); color: var(--color-text); background: var(--color-elevated); box-shadow: 0 .5rem 2rem rgb(0 0 0 / .4); }
+.archive-confirmation p { color: var(--color-muted); }
+.archive-confirmation-controls { display: flex; justify-content: end; gap: var(--space-2); }
+.archive-confirmation::backdrop { background: rgb(0 0 0 / .55); }
 .inbox-list { border-top: 1px solid var(--color-border); }
 .inbox-action { display: grid; gap: var(--space-2); padding: var(--space-3) 0; border-bottom: 1px solid var(--color-border); }
 .inbox-action > button { justify-self: start; }

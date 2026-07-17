@@ -48,6 +48,8 @@ const snapshotCreationError = (cause: unknown): Response => cause instanceof Ran
   ? error(413, "snapshot_too_large", "Snapshot exceeds size limit")
   : error(503, "snapshot_unavailable", "Snapshot unavailable");
 const commandId = (): string => crypto.randomUUID();
+const TERMINAL_WORK_STATES = new Set(["done", "completed", "result", "resolved", "succeeded", "success", "closed"]);
+const isTerminalWorkState = (state: unknown): boolean => typeof state === "string" && TERMINAL_WORK_STATES.has(state.trim().toLowerCase());
 const safeFilename = (filename: string): string => filename.replace(/[^A-Za-z0-9._-]/g, "_") || "artifact";
 const decodeRouteId = (value: string): string | Response => {
   try { return decodeURIComponent(value); } catch { return error(400, "bad_request", "Invalid request"); }
@@ -378,8 +380,18 @@ export function createHubServer(options: HubServerOptions): { fetch(request: Req
       return json({ sessions: options.database.listSessionsForOwner(claims.sub).filter((session) => roots.has(session.id) && (options.authorizeSession?.(session.id, claims.sub) ?? true)).map((session) => sessionRootWire(options.database.getContinuationAggregateForOwner(session.id, claims.sub), rollups.get(session.id))) });
     }
     if (request.method === "GET" && url.pathname === "/api/v1/work") {
+      const scopes = url.searchParams.getAll("scope");
+      if (scopes.some((scope) => scope && scope !== "active")) return error(400, "invalid_work_scope", "Invalid work scope");
+      const activeScope = scopes.includes("active");
       const roots = rootSessionIdsFor(options.database, claims.sub, generation);
-      return json({ work: options.database.listWorkItemsForOwner(claims.sub).filter((work) => roots.has(work.sessionId) && (options.authorizeSession?.(work.sessionId, claims.sub) ?? true)).map((work) => ({ ...work, rootSessionId: work.sessionId })) });
+      const work = options.database.listWorkItemsForOwner(claims.sub)
+        .filter((item) => !activeScope || !isTerminalWorkState(item.state))
+        .flatMap((item) => {
+          const rootSessionId = rootSessionIdFor(options.database, claims.sub, generation, item.sessionId);
+          if (!rootSessionId || !roots.has(rootSessionId) || !(options.authorizeSession?.(rootSessionId, claims.sub) ?? true)) return [];
+          return [{ ...item, rootSessionId }];
+        });
+      return json({ work });
     }
     if (request.method === "GET" && (url.pathname === "/api/v1/hitl" || url.pathname === "/api/v1/inbox")) {
       const actions = options.actions?.list(claims.sub) ?? [];

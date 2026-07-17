@@ -4,3 +4,6 @@ project(':capacitor-android').projectDir = new File('../node_modules/.bun/@capac
 
 include ':capacitor-app'
 project(':capacitor-app').projectDir = new File('../node_modules/.bun/@capacitor+app@8.1.1+f68449e264960a74/node_modules/@capacitor/app/android')
+
+include ':capacitor-dialog'
+project(':capacitor-dialog').projectDir = new File('../node_modules/.bun/@capacitor+dialog@8.0.1+f68449e264960a74/node_modules/@capacitor/dialog/android')
