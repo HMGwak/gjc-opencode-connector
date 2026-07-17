@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "kind": "android-app-automation-transcript",
+  "surface": "native",
+  "device": "Planee_Pixel Android emulator",
+  "steps": [
+    {
+      "action": "build",
+      "command": "./gradlew --no-daemon assembleDebug --console=plain",
+      "result": "BUILD SUCCESSFUL"
+    },
+    {
+      "action": "install",
+      "command": "adb install -r android/app/build/outputs/apk/debug/app-debug.apk",
+      "result": "Success"
+    },
+    {
+      "action": "launch",
+      "command": "adb shell monkey -p com.myplanee.agents -c android.intent.category.LAUNCHER 1",
+      "result": "1 event injected; app launched"
+    },
+    {
+      "action": "capture",
+      "command": "adb exec-out screencap -p",
+      "result": "artifacts/unified-session-android.png, 1080x2400, non-uniform pairing screen"
+    }
+  ],
+  "featureVerification": {
+    "automatedTests": "237 passed, 0 failed, 2963 expectations",
+    "architectureReview": "CLEAR/APPROVE via agent://220-UnifiedSessionArchitectureReview",
+    "qaReview": "PASS via agent://221-UnifiedSessionQa",
+    "cleanupReview": "PASS via agent://222-UnifiedSessionCleanupFinal"
+  },
+  "limitation": "The emulator had no production device credential, so authenticated Sessions/archive interactions were covered by focused DOM/source and Hub API tests rather than exercised against production data."
+}
