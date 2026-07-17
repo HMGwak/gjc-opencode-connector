@@ -60,8 +60,10 @@ The authenticated interface is a calm, Linear-inspired single-column control sur
 - Session content keeps explicit Open and Archive actions. Long press and deliberate left swipe may request Archive, but both route through the same explicit Cancel/Archive confirmation.
 - The row retains a minimum 44px target and visible keyboard focus.
 
-### Inbox action surface
+### Inbox · Your turn
 
+- Inbox is exclusively the owner-turn/HITL queue: an item appears only when an active human-root session is waiting for an unexpired owner response.
+- Processing, dispatching, completed, expired, archived, and unauthorized work never appears in Inbox.
 - Inbox keeps the action card supplied by the HITL renderer. A session navigation control is a sibling of that card, never nested inside it.
 - Internal-origin actions resolve navigation through `rootSessionId`, falling back to `sessionId` during staged API rollout.
 
@@ -70,6 +72,12 @@ The authenticated interface is a calm, Linear-inspired single-column control sur
 - Session identity is structural metadata, never a title or filename keyword heuristic.
 - A visible human root requires a top-level GJC session header with `titleSource: "user"`, no parent, and no `configured_model_chain` event whose `origin` is `"subagent"`.
 - Nested transcripts and explicit subagent-origin transcripts remain internal. Their active work may aggregate under the human root, but worker sessions have no user-facing peer row or drill-down.
+
+### Conversation projection
+
+- The mobile conversation is a user-visible projection, never a raw execution journal. It includes direct user messages and assistant text only.
+- Reasoning, thinking, tool calls, tool results, system/context/configuration events, lifecycle noise, and subagent internals remain durable for audit but are not sent through the conversation view.
+- Opening a session starts with the latest bounded message window in chronological order. Incremental catch-up advances across hidden journal events without synthesizing placeholder messages or losing later visible turns.
 
 ## 6. Motion and Interaction
 

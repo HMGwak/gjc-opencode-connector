@@ -6,7 +6,7 @@ import { clearCredential, saveCredential, SecureCredentialUnavailableError, stor
 import { enablePush, revokePush, revokePushWhenPermissionLost } from "./push";
 import { MultiTabCoordinator } from "./multitab";
 import { canNavigateBack, denseRowDescriptor, historySections, inboxRowDescriptor, isDeliberateArchiveSwipe, rootSessionSections, SESSION_ARCHIVE_LONG_PRESS_MS, SESSION_ARCHIVE_SWIPE_VERTICAL_TOLERANCE_PX, sessionSections, workAccordionDescriptor, workSessionGroups } from "./view-model";
-import { conversationHistoryState, mergeConversationMessages, orderedConversationMessages } from "./conversation-state";
+import { conversationHistoryState, mergeConversationMessages, orderedConversationMessages, parseSseDataFrames, responseCursor, visibleConversationMessage, type VisibleConversationMessage } from "./conversation-state";
 type SessionRollups = {
   internalCount?: number;
   actionableCount?: number;
@@ -50,7 +50,7 @@ type HubEvent = {
   payload: unknown;
   createdAt: string;
 };
-type NormalizedMessage = { role: "user" | "assistant" | "system"; text: string };
+type NormalizedMessage = VisibleConversationMessage;
 
 const API = "/api/v1";
 const POLL_INTERVAL = 3_000;
@@ -585,12 +585,20 @@ function renderSessionList(panel: HTMLElement, items: Session[], empty: string, 
   for (const section of sessionSections(items)) appendSessionGroup(panel, section.heading, section.items, origin);
 }
 
+function awaitsOwnerResponse(action: HitlAction, at = Date.now()): boolean {
+  if (!Number.isFinite(Date.parse(action.expiresAt)) || Date.parse(action.expiresAt) <= at) return false;
+  if (action.status === "pending") return true;
+  if (action.status !== "unknown" || action.allowedResponses.length === 0 || typeof action.payload !== "object" || action.payload === null) return false;
+  return (action.payload as { requiresOwnerIntervention?: unknown }).requiresOwnerIntervention === true;
+}
+
 function renderInbox(panel: HTMLElement): void {
-  const pendingActions = hitlActions.filter((action) => action.status === "pending" || action.status === "dispatching" || action.status === "unknown");
-  panel.append(element("h2", `Inbox (${pendingActions.length})`));
+  const pendingActions = hitlActions.filter(awaitsOwnerResponse);
+  panel.append(element("h2", `Inbox · Your turn (${pendingActions.length})`));
+  panel.append(element("p", "Sessions waiting for your decision or feedback."));
   renderProjectionError(panel, "inbox");
   if (loadingSessions) panel.append(element("p", "Loading inbox…"));
-  else if (pendingActions.length === 0) panel.append(element("p", "No open approvals or failures."));
+  else if (pendingActions.length === 0) panel.append(element("p", "No sessions are waiting for you."));
   else {
     const list = element("ul");
     list.className = "inbox-list";
@@ -788,18 +796,8 @@ function renderPromptForm(panel: HTMLElement, sessionId: string): void {
   panel.append(form);
 }
 
-function normalizedMessage(value: unknown): NormalizedMessage {
-  if (typeof value === "string") return { role: "system", text: value };
-  if (typeof value !== "object" || value === null) return { role: "system", text: "Activity updated." };
-  const record = value as { role?: unknown; text?: unknown; message?: unknown; content?: unknown; error?: unknown };
-  const role = record.role === "user" || record.role === "assistant" ? record.role : "system";
-  const candidate = record.text ?? record.message ?? record.content ?? record.error;
-  if (typeof candidate === "string") return { role, text: candidate };
-  if (Array.isArray(candidate)) {
-    const text = candidate.map((item) => typeof item === "string" ? item : typeof item === "object" && item !== null && typeof (item as { text?: unknown }).text === "string" ? (item as { text: string }).text : "").filter(Boolean).join("\n");
-    if (text) return { role, text };
-  }
-  return { role, text: "Activity updated." };
+function normalizedMessage(event: HubEvent): NormalizedMessage | null {
+  return visibleConversationMessage(event.type, event.payload);
 }
 
 function messageElement(message: NormalizedMessage): HTMLLIElement {
@@ -814,10 +812,14 @@ function renderConversationMessages(list: HTMLOListElement, sessionId: string): 
   const storedMessages = orderedConversationMessages(sessionMessages.get(sessionId) ?? new Map<number, NormalizedMessage>());
   for (const message of storedMessages) list.append(messageElement(message));
   const state = conversationHistoryState(storedMessages.length, unavailableSessionHistory.has(sessionId), hydratingSessions.has(sessionId));
-  if (!state) return;
-  const empty = messageElement({ role: "system", text: state });
-  empty.dataset.placeholder = "conversation-state";
-  list.append(empty);
+  if (state) {
+    const empty = element("li", state);
+    empty.className = "message message-system";
+    empty.setAttribute("aria-label", "conversation status");
+    empty.dataset.placeholder = "conversation-state";
+    list.append(empty);
+  }
+  list.scrollTop = list.scrollHeight;
 }
 
 function appendMessage(sessionId: string): void {
@@ -827,9 +829,11 @@ function appendMessage(sessionId: string): void {
 }
 
 function recordSessionEvent(sessionId: string, event: HubEvent): boolean {
+  const message = normalizedMessage(event);
+  if (!message) return false;
   const messages = sessionMessages.get(sessionId) ?? new Map<number, NormalizedMessage>();
   if (messages.has(event.seq)) return false;
-  mergeConversationMessages(messages, [{ seq: event.seq, message: normalizedMessage(event.payload) }]);
+  mergeConversationMessages(messages, [{ seq: event.seq, message }]);
   sessionMessages.set(sessionId, messages);
   return true;
 }
@@ -1060,15 +1064,6 @@ async function loadSessions(): Promise<void> {
   }
 }
 
-function parseEvents(body: string): unknown[] {
-  const events: unknown[] = [];
-  for (const frame of body.split(/\n\n+/)) {
-    const data = frame.split("\n").filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("\n");
-    if (!data) continue;
-    try { events.push(JSON.parse(data)); } catch { /* Ignore malformed event frames. */ }
-  }
-  return events;
-}
 
 async function hydrateSession(sessionId: string): Promise<void> {
   const existing = hydrationLocks.get(sessionId);
@@ -1079,16 +1074,20 @@ async function hydrateSession(sessionId: string): Promise<void> {
   sessionMessages.set(sessionId, messages);
   const hydration = (async () => {
     try {
-      const response = await api(`/sessions/${encodeURIComponent(sessionId)}/events`, { headers: { Accept: "text/event-stream" } });
+      const response = await api(`/sessions/${encodeURIComponent(sessionId)}/events?view=conversation`, { headers: { Accept: "text/event-stream" } });
       if (response.status === 410) {
         unavailableSessionHistory.add(sessionId);
         return;
       }
       if (!response.ok) throw new Error(`conversation hydration failed (${response.status})`);
-      const history = parseEvents(await response.text())
-        .filter((value): value is HubEvent => isHubEvent(value) && value.sessionId === sessionId)
-        .map((event) => ({ seq: event.seq, message: normalizedMessage(event.payload) }));
+      const history = parseSseDataFrames(await response.text()).flatMap((value) => {
+        if (!isHubEvent(value) || value.sessionId !== sessionId) return [];
+        const message = normalizedMessage(value);
+        return message ? [{ seq: value.seq, message }] : [];
+      });
       mergeConversationMessages(sessionMessages.get(sessionId) ?? messages, history);
+      const nextCursor = responseCursor(response.headers.get("x-next-event-cursor"));
+      if (nextCursor !== null) multiTab.publishCursor(sessionId, nextCursor);
     } catch (error) {
       fetchError = fetchFailure("Unable to load conversation", error);
       updateConnectionStatus();
@@ -1121,8 +1120,13 @@ async function catchUp(sessionId: string, renderMessages = false): Promise<boole
 }
 
 async function catchUpOnce(sessionId: string, renderMessages: boolean): Promise<boolean> {
-  const cursor = await storedCursor(sessionId);
-  const response = await api(`/sessions/${encodeURIComponent(sessionId)}/events${cursor === null ? "" : `?after=${encodeURIComponent(String(cursor))}`}`, { headers: { Accept: "text/event-stream" } });
+  let cursor = await storedCursor(sessionId);
+  if (cursor === null) {
+    await (hydrationLocks.get(sessionId) ?? hydrateSession(sessionId));
+    cursor = await storedCursor(sessionId);
+  }
+  const query = new URLSearchParams({ view: "conversation", after: String(cursor ?? 0) });
+  const response = await api(`/sessions/${encodeURIComponent(sessionId)}/events?${query}`, { headers: { Accept: "text/event-stream" } });
   if (response.status === 410) {
     multiTab.publishReset(sessionId);
     unavailableSessionHistory.add(sessionId);
@@ -1130,7 +1134,9 @@ async function catchUpOnce(sessionId: string, renderMessages: boolean): Promise<
     return false;
   }
   if (!response.ok) throw new Error(`catch-up failed (${response.status})`);
-  for (const event of parseEvents(await response.text())) await applyEvent(sessionId, event);
+  for (const event of parseSseDataFrames(await response.text())) await applyEvent(sessionId, event);
+  const nextCursor = responseCursor(response.headers.get("x-next-event-cursor"));
+  if (nextCursor !== null) multiTab.publishCursor(sessionId, nextCursor);
   return true;
 }
 
@@ -1217,8 +1223,10 @@ async function start(): Promise<void> {
   render();
   if (pairingRequired) return;
   multiTab.start();
-  if (selectedSessionId) multiTab.requestSession(selectedSessionId);
-  if (selectedSessionId) void hydrateSession(selectedSessionId);
+  if (selectedSessionId) {
+    multiTab.requestSession(selectedSessionId);
+    await hydrateSession(selectedSessionId);
+  }
   reconnectUpdates();
 }
 

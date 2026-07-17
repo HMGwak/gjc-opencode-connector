@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { canNavigateBack, denseRowDescriptor, historySections, inboxRowDescriptor, isDeliberateArchiveSwipe, rootSessionSections, SESSION_ARCHIVE_LONG_PRESS_MS, SESSION_ARCHIVE_SWIPE_DISTANCE_PX, sessionSections, workAccordionDescriptor, workSessionGroups } from "./view-model";
-import { conversationHistoryState, mergeConversationMessages, orderedConversationMessages } from "./conversation-state";
+import { conversationHistoryState, mergeConversationMessages, orderedConversationMessages, parseSseDataFrames, responseCursor, visibleConversationMessage } from "./conversation-state";
 
 const source = await Bun.file(new URL("./app.ts", import.meta.url)).text();
 const styles = await Bun.file(new URL("./styles.css", import.meta.url)).text();
@@ -191,17 +191,22 @@ test("shows loading and empty states for each session surface", () => {
   expect(source).toContain('const status = element("p", "Loading sessions…");');
   expect(source).toContain('status.className = "surface-state";');
   expect(source).toContain("panel.append(status);");
-  expect(source).toContain('"No open approvals or failures."');
+  expect(source).toContain('"No sessions are waiting for you."');
   expect(source).toContain('"No active runtime sessions."');
   expect(source).toContain('"No archived sessions."');
   expect(source).toContain('error.setAttribute("role", "alert");');
 });
 
-test("renders normalized transcript entries as role-based chat bubbles", () => {
-  expect(source).toContain('function normalizedMessage(value: unknown)');
+test("renders only user-visible transcript entries as role-based chat bubbles", () => {
+  expect(visibleConversationMessage("gjc.message", { role: "user", text: "question" })).toEqual({ role: "user", text: "question" });
+  expect(visibleConversationMessage("gjc.message", { role: "assistant", text: "[thinking]\nanswer\n[tool: bash]" })).toEqual({ role: "assistant", text: "[thinking]\nanswer\n[tool: bash]" });
+  expect(visibleConversationMessage("gjc.message", { role: "assistant", text: "[thinking]\n[tool: bash]" })).toEqual({ role: "assistant", text: "[thinking]\n[tool: bash]" });
+  expect(visibleConversationMessage("gjc.message", { role: "user", text: "   " })).toBeNull();
+  expect(visibleConversationMessage("gjc.tool", { role: "assistant", text: "internal" })).toBeNull();
+  expect(visibleConversationMessage("gjc.message", { role: "system", text: "internal" })).toBeNull();
   expect(source).toContain('item.className = `message message-${message.role}`;');
   expect(source).toContain('messages.setAttribute("aria-label", "Normalized transcript");');
-  expect(source).not.toContain('JSON.stringify(value)');
+  expect(source).not.toContain('"Activity updated."');
 });
 
 test("makes archived sessions read-only and archives active sessions through the API", () => {
@@ -517,15 +522,41 @@ test("expired history retains live messages and never treats their text as a pla
   expect(source).not.toContain("list.firstElementChild?.textContent");
 });
 
-test("hydrates the full conversation independently of the incremental cursor", () => {
+test("hydrates a bounded visible conversation independently of the incremental cursor", () => {
   expect(source).toContain("async function hydrateSession(sessionId: string)");
   expect(source).toContain("void hydrateSession(session.id);");
   expect(source).toContain("void hydrateSession(state.sessionId);");
-  expect(source).toContain("api(`/sessions/${encodeURIComponent(sessionId)}/events`,");
+  expect(source).toContain("/events?view=conversation");
   expect(source).not.toContain("hydrateSession(sessionId, cursor)");
   expect(source).toContain("mergeConversationMessages(sessionMessages.get(sessionId) ?? messages, history);");
   expect(source).toContain('if (response.status === 410) {');
   expect(source).toContain('unavailableSessionHistory.add(sessionId);');
   expect(source).toContain('fetchError = fetchFailure("Unable to load conversation", error);');
   expect(source).toContain("updateConnectionStatus();");
+  expect(source).toContain("list.scrollTop = list.scrollHeight;");
+});
+
+test("advances conversation catch-up across hidden journal events", () => {
+  expect(responseCursor("42")).toBe(42);
+  expect(responseCursor("")).toBeNull();
+  expect(responseCursor("-1")).toBeNull();
+  expect(responseCursor("9007199254740992")).toBeNull();
+  expect(source).toContain('response.headers.get("x-next-event-cursor")');
+  expect(source).toContain("multiTab.publishCursor(sessionId, nextCursor);");
+});
+
+test("rejects a malformed SSE page before committing its response cursor", () => {
+  expect(parseSseDataFrames('data: {"seq":1}\n\n')).toEqual([{ seq: 1 }]);
+  expect(() => parseSseDataFrames('data: {"seq":\n\n')).toThrow();
+  const hydrationParse = source.indexOf("const history = parseSseDataFrames(await response.text())");
+  const hydrationCursor = source.indexOf("const nextCursor = responseCursor", hydrationParse);
+  expect(hydrationParse).toBeGreaterThan(-1);
+  expect(hydrationCursor).toBeGreaterThan(hydrationParse);
+});
+
+test("defines Inbox as an owner-turn queue rather than processing status", () => {
+  expect(source).toContain('Inbox · Your turn (${pendingActions.length})');
+  expect(source).toContain('"Sessions waiting for your decision or feedback."');
+  expect(source).toContain("hitlActions.filter(awaitsOwnerResponse)");
+  expect(source).not.toContain('action.status === "dispatching" || action.status === "unknown"');
 });

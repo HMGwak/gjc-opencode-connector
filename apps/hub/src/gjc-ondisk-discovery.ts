@@ -130,9 +130,9 @@ function textFromContent(content: unknown): string {
   for (const part of content) {
     const p = record(part);
     if (!p) continue;
+    // Only actual user-visible text is projected. Thinking, tool calls, and tool
+    // results are hidden detail and must never be synthesized into display text.
     if (p.type === "text" && typeof p.text === "string") parts.push(p.text);
-    else if (p.type === "toolCall" && typeof p.name === "string") parts.push(`[tool: ${p.name}]`);
-    else if (p.type === "thinking") parts.push("[thinking]");
   }
   return parts.join("\n").replace(AUTH_TOKEN, "[redacted]");
 }

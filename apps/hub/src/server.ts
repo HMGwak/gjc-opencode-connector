@@ -109,10 +109,23 @@ const actionWire = (action: PendingAction) => ({ id: action.id, sessionId: actio
 type InboxActionWire = ReturnType<typeof actionWire> & { rootSessionId: string | null };
 const artifactWire = (artifact: ArtifactMetadata) => ({ id: artifact.id, name: artifact.name, contentType: artifact.contentType, size: artifact.size, createdAt: artifact.createdAt });
 const requiresOwnerIntervention = (action: PendingAction): boolean => typeof action.payload === "object" && action.payload !== null && (action.payload as { requiresOwnerIntervention?: unknown }).requiresOwnerIntervention === true;
-const isActionableInboxAction = (action: PendingAction): boolean => action.status === "pending" || action.status === "dispatching" || (action.status === "unknown" && requiresOwnerIntervention(action) && action.allowedResponses.length > 0);
+const isOwnerTurnAction = (action: PendingAction, at: number): boolean =>
+  (action.status === "pending" || (action.status === "unknown" && requiresOwnerIntervention(action) && action.allowedResponses.length > 0)) && new Date(action.expiresAt).getTime() > at;
 export const DEFAULT_SNAPSHOT_TTL_MS = 10 * 60_000;
 export const DEFAULT_SNAPSHOT_MAX_ROWS = 5_000;
 const SNAPSHOT_PAGE_SIZE = 100;
+const CONVERSATION_HYDRATION_LIMIT = 30;
+const CONVERSATION_PAGE_SIZE = 100;
+const VISIBLE_CONVERSATION_ROLES = new Set(["user", "assistant"]);
+type ConversationEvent = { seq: number; type: string; payload: unknown; sessionId: string; createdAt: string };
+const projectConversationTurn = (event: ConversationEvent): ConversationEvent | null => {
+  if (event.type !== "gjc.message") return null;
+  const payload = event.payload;
+  if (typeof payload !== "object" || payload === null) return null;
+  const { role, text } = payload as { role?: unknown; text?: unknown };
+  if (typeof role !== "string" || !VISIBLE_CONVERSATION_ROLES.has(role) || typeof text !== "string") return null;
+  return text.trim().length > 0 ? { ...event, payload: { role, text } } : null;
+};
 
 async function parseActionResponse(request: Request, limit: number): Promise<{ version: number; response: unknown } | Response> {
   const lengthError = contentLengthError(request, limit); if (lengthError) return lengthError;
@@ -394,12 +407,13 @@ export function createHubServer(options: HubServerOptions): { fetch(request: Req
       return json({ work });
     }
     if (request.method === "GET" && (url.pathname === "/api/v1/hitl" || url.pathname === "/api/v1/inbox")) {
+      const at = now();
       const actions = options.actions?.list(claims.sub) ?? [];
       return json({
         actions: actions
-          .filter((action) => isActionableInboxAction(action) && action.ownerId === claims.sub)
+          .filter((action) => action.ownerId === claims.sub && isOwnerTurnAction(action, at))
           .flatMap<InboxActionWire>((action) => {
-            if (!action.sessionId) return [{ ...actionWire(action), rootSessionId: null }];
+            if (!action.sessionId) return [];
             const session = options.database.getSessionForOwner(action.sessionId, claims.sub);
             const rootSessionId = session && !session.archivedAt ? rootSessionIdFor(options.database, claims.sub, generation, action.sessionId) : null;
             return rootSessionId && (options.authorizeSession?.(rootSessionId, claims.sub) ?? true) ? [{ ...actionWire(action), rootSessionId }] : [];
@@ -499,12 +513,31 @@ export function createHubServer(options: HubServerOptions): { fetch(request: Req
         return options.database.getSession(sessionId) ? error(403, "forbidden", "Forbidden") : error(404, "not_found", "Session not found");
       }
       if (!rootSessionIdsFor(options.database, claims.sub, generation).has(sessionId)) return error(404, "not_found", "Session not found");
+      const conversation = url.searchParams.get("view") === "conversation";
+      const explicitAfter = request.headers.has("last-event-id") || url.searchParams.has("after");
       const cursorText = request.headers.get("last-event-id") ?? url.searchParams.get("after") ?? "0";
       const after = parseCursor(cursorText); if (after instanceof Response) return after;
       try {
         const bounds = options.database.eventSequenceBounds(sessionId);
         if (bounds.first !== null && after < bounds.first - 1) return json({ reset: "snapshot-required" }, 410);
         const events = options.database.listEvents<unknown>(sessionId, after);
+        if (conversation) {
+          const headers: Record<string, string> = { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-store", "x-stream-mode": "finite-catch-up" };
+          const page: ConversationEvent[] = [];
+          let nextCursor = after;
+          for (const event of events) {
+            if (explicitAfter) nextCursor = event.seq;
+            const turn = projectConversationTurn(event);
+            if (turn) {
+              page.push(turn);
+              if (explicitAfter && page.length >= CONVERSATION_PAGE_SIZE) break;
+            }
+          }
+          headers["x-next-event-cursor"] = String(explicitAfter ? nextCursor : (events.at(-1)?.seq ?? after));
+          if (!explicitAfter) page.splice(0, Math.max(0, page.length - CONVERSATION_HYDRATION_LIMIT));
+          const wire = page.map((event) => `id: ${event.seq}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
+          return new Response(wire, { headers });
+        }
         const wire = events.map((event) => `id: ${event.seq}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
         return new Response(wire, { headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-store", "x-stream-mode": "finite-catch-up" } });
       } catch (cause) {

@@ -22,6 +22,18 @@ async function fixture(adapters?: Readonly<Record<string, AgentAdapter>>, setup?
   return { database, auth, server, now, token: registration.credential };
 }
 const request = (path: string, token?: string, init: RequestInit = {}) => new Request(`http://loopback${path}`, { ...init, headers: { ...(init.headers ?? {}), ...(token ? { authorization: `Bearer ${token}` } : {}) } });
+const parseSse = (body: string): Array<{ id: string; event: string; data: unknown }> => {
+  const events: Array<{ id: string; event: string; data: unknown }> = [];
+  for (const block of body.split("\n\n")) {
+    if (!block.trim()) continue;
+    const id = block.split("\n").find((line) => line.startsWith("id: "))?.slice(4);
+    const eventName = block.split("\n").find((line) => line.startsWith("event: "))?.slice(7);
+    const dataLine = block.split("\n").find((line) => line.startsWith("data: "))?.slice(6);
+    if (id && eventName && dataLine !== undefined) events.push({ id, event: eventName, data: JSON.parse(dataLine) });
+  }
+  return events;
+};
+const messagePayload = (event: { data: unknown }): Record<string, unknown> => (event.data as { payload: Record<string, unknown> }).payload;
 
 describe("hub origin API", () => {
   test("health requires a credential and defaults are loopback", async () => {
@@ -448,7 +460,7 @@ describe("hub origin API", () => {
     });
     for (const path of ["/api/v1/hitl", "/api/v1/inbox"]) {
       const body = await (await server.fetch(request(path, token))).json() as { actions: Array<{ id: string }> };
-      expect(body.actions.map(({ id }) => id).sort()).toEqual(["dispatching", "pending", "unknown-intervention"]);
+      expect(body.actions.map(({ id }) => id).sort()).toEqual(["pending", "unknown-intervention"]);
     }
     database.close();
   });
@@ -708,6 +720,130 @@ describe("hub origin API", () => {
     expect(await response.text()).toContain("id: 2");
 
     expect((await server.fetch(request("/api/v1/sessions/s1/events?after=9007199254740992", token))).status).toBe(400);
+    database.close();
+  });
+  test("projects a minimal conversation view and preserves direct message text", async () => {
+    const { database, server, token } = await fixture();
+    database.appendEvent("s1", "gjc.message", {
+      type: "message",
+      role: "assistant",
+      text: "done\n[tool: bash]",
+      sourceEventId: "a1",
+      reasoning: "private chain",
+      toolResult: { output: "private tool result" },
+    });
+    database.appendEvent("s1", "gjc.message", { type: "message", role: "user", text: "[thinking]\nhello there", sourceEventId: "u1" });
+    database.appendEvent("s1", "gjc.message", { type: "message", role: "assistant", text: "[thinking]", sourceEventId: "a2" });
+    database.appendEvent("s1", "gjc.message", { type: "message", role: "assistant", text: "[tool: secret]", sourceEventId: "a3" });
+    database.appendEvent("s1", "gjc.config", { model: "claude" });
+    database.appendEvent("s1", "gjc.message", { type: "message", role: "system", text: "system note", sourceEventId: "s" });
+    database.appendEvent("s1", "gjc.message", { type: "message", role: "assistant", text: "   ", sourceEventId: "a4" });
+    database.appendEvent("s1", "gjc.message", { type: "message", role: "user", text: "plain user", sourceEventId: "u2" });
+
+    const response = await server.fetch(request("/api/v1/sessions/s1/events?view=conversation", token));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("text/event-stream; charset=utf-8");
+    expect(response.headers.get("x-stream-mode")).toBe("finite-catch-up");
+    expect(response.headers.get("x-next-event-cursor")).toBe("8");
+    const events = parseSse(await response.text());
+    expect(events.map(({ id }) => id)).toEqual(["1", "2", "3", "4", "8"]);
+    expect(events.every(({ event }) => event === "gjc.message")).toBe(true);
+    expect(messagePayload(events[0]!)).toEqual({ role: "assistant", text: "done\n[tool: bash]" });
+    expect(messagePayload(events[1]!)).toEqual({ role: "user", text: "[thinking]\nhello there" });
+    expect(messagePayload(events[2]!)).toEqual({ role: "assistant", text: "[thinking]" });
+    expect(messagePayload(events[3]!)).toEqual({ role: "assistant", text: "[tool: secret]" });
+    expect(messagePayload(events[4]!)).toEqual({ role: "user", text: "plain user" });
+    database.close();
+  });
+  test("hydrates the conversation view with only the latest 30 visible turns in order", async () => {
+    const { database, server, token } = await fixture();
+    for (let index = 1; index <= 40; index += 1) database.appendEvent("s1", "gjc.message", { type: "message", role: "user", text: `m${index}`, sourceEventId: `u${index}` });
+
+    const response = await server.fetch(request("/api/v1/sessions/s1/events?view=conversation", token));
+    const events = parseSse(await response.text());
+    expect(response.headers.get("x-next-event-cursor")).toBe("40");
+    expect(events).toHaveLength(30);
+    expect(events.map(({ id }) => id)).toEqual(Array.from({ length: 30 }, (_, index) => String(11 + index)));
+    expect(events.at(0)!.id).toBe("11");
+    expect(events.at(-1)!.id).toBe("40");
+    database.close();
+  });
+  test("advances the conversation cursor across hidden raw events and caps a page at 100 turns", async () => {
+    const { database, server, token } = await fixture();
+    database.appendEvent("s1", "gjc.message", { type: "message", role: "user", text: "first", sourceEventId: "u1" });
+    database.appendEvent("s1", "gjc.tool", { id: "tool-call" });
+    database.appendEvent("s1", "gjc.thinking", { id: "thought" });
+    database.appendEvent("s1", "gjc.message", { type: "message", role: "assistant", text: "second", sourceEventId: "a1" });
+    database.appendEvent("s1", "gjc.message", { type: "message", role: "user", text: "third", sourceEventId: "u2" });
+
+    const first = await server.fetch(request("/api/v1/sessions/s1/events?view=conversation&after=1", token));
+    expect(first.headers.get("x-next-event-cursor")).toBe("5");
+    const firstEvents = parseSse(await first.text());
+    expect(firstEvents.map(({ id }) => id)).toEqual(["4", "5"]);
+    expect(messagePayload(firstEvents[0]!)).toMatchObject({ role: "assistant", text: "second" });
+
+    const exhausted = await server.fetch(request("/api/v1/sessions/s1/events?view=conversation&after=5", token));
+    expect(exhausted.headers.get("x-next-event-cursor")).toBe("5");
+    expect(parseSse(await exhausted.text())).toEqual([]);
+
+    for (let index = 6; index <= 125; index += 1) database.appendEvent("s1", "gjc.message", { type: "message", role: "user", text: `m${index}`, sourceEventId: `u${index}` });
+    const page = await server.fetch(request("/api/v1/sessions/s1/events?view=conversation&after=0", token));
+    expect(page.headers.get("x-next-event-cursor")).toBe("102");
+    const pageEvents = parseSse(await page.text());
+    expect(pageEvents).toHaveLength(100);
+    expect(pageEvents.at(0)!.id).toBe("1");
+    expect(pageEvents.at(-1)!.id).toBe("102");
+    const next = parseSse(await (await server.fetch(request("/api/v1/sessions/s1/events?view=conversation&after=102", token))).text());
+    expect(next.map(({ id }) => id)).toEqual(Array.from({ length: 23 }, (_, index) => String(103 + index)));
+    database.close();
+  });
+  test("preserves the raw event stream when the conversation view is absent", async () => {
+    const { database, server, token } = await fixture();
+    database.appendEvent("s1", "gjc.message", { type: "message", role: "user", text: "hi\n[thinking]", sourceEventId: "u1" });
+    database.appendEvent("s1", "gjc.tool", { id: "tool-call" });
+
+    const absent = parseSse(await (await server.fetch(request("/api/v1/sessions/s1/events", token))).text());
+    expect(absent.map(({ event }) => event)).toEqual(["gjc.message", "gjc.tool"]);
+    expect((absent[0]!.data as { payload: { text: string } }).payload.text).toBe("hi\n[thinking]");
+
+    const explicitRaw = parseSse(await (await server.fetch(request("/api/v1/sessions/s1/events?view=raw", token))).text());
+    expect(explicitRaw.map(({ event }) => event)).toEqual(["gjc.message", "gjc.tool"]);
+
+    const conversation = parseSse(await (await server.fetch(request("/api/v1/sessions/s1/events?view=conversation", token))).text());
+    expect(conversation.map(({ event }) => event)).toEqual(["gjc.message"]);
+    expect((conversation[0]!.data as { payload: { text: string } }).payload.text).toBe("hi\n[thinking]");
+    database.close();
+  });
+  test("excludes time-expired owner-turn actions from the inbox via injected now", async () => {
+    const { database, auth, token } = await fixture();
+    const core = new (await import("@planee/core")).PendingActionService(database);
+    const actions = new HubPendingActionService(database);
+    const create = (id: string, expiresAt: string, payload: unknown) => database.createPendingAction({
+      id,
+      ownerId: "u1",
+      sessionId: "s1",
+      expiresAt,
+      payload: { ownerId: "u1", sessionId: "s1", type: "approve", payload, artifactIds: [] },
+    });
+    create("fresh-pending", "2040-01-01T00:00:00.000Z", {});
+    create("stale-pending", "2030-01-01T00:00:00.000Z", {});
+    create("fresh-intervention", "2040-01-01T00:00:00.000Z", { requiresOwnerIntervention: true, allowedResponses: ["retry", "cancel"] });
+    core.markUnknown("fresh-intervention", 1);
+    create("stale-intervention", "2030-01-01T00:00:00.000Z", { requiresOwnerIntervention: true, allowedResponses: ["retry", "cancel"] });
+    core.markUnknown("stale-intervention", 1);
+
+    const server = createHubServer({
+      database,
+      auth,
+      publicOrigin: "https://hub.example",
+      actions,
+      now: () => 2_000_000_000_000,
+      authorizeSession: (_sessionId, ownerId) => ownerId === "u1",
+    });
+    for (const path of ["/api/v1/hitl", "/api/v1/inbox"]) {
+      const body = await (await server.fetch(request(path, token))).json() as { actions: Array<{ id: string }> };
+      expect(body.actions.map(({ id }) => id).sort()).toEqual(["fresh-intervention", "fresh-pending"]);
+    }
     database.close();
   });
 });

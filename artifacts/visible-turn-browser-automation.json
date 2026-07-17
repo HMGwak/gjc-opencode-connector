@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "kind": "browser-automation-transcript",
+  "viewport": { "width": 390, "height": 844 },
+  "baseUrl": "http://127.0.0.1:4176/",
+  "scenarios": [
+    {
+      "id": "owner-turn-inbox",
+      "steps": ["Load authenticated mobile app with one pending owner action", "Observe Inbox"],
+      "assertions": [
+        "Inbox heading is 'Inbox · Your turn (1)'",
+        "Explanation says sessions are waiting for a decision or feedback",
+        "Pending approve/reject controls are visible",
+        "No processing item is shown"
+      ],
+      "screenshot": "artifacts/inbox-owner-turn-mobile.png",
+      "verdict": "passed"
+    },
+    {
+      "id": "visible-conversation",
+      "steps": ["Open the owner-turn session", "Observe normalized transcript"],
+      "assertions": [
+        "Direct user turn is visible",
+        "Assistant final response is visible",
+        "Private reasoning text is absent",
+        "Private tool-result text is absent",
+        "Persistent navigation remains visible"
+      ],
+      "screenshot": "artifacts/visible-conversation-mobile.png",
+      "verdict": "passed"
+    }
+  ]
+}

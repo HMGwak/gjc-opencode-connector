@@ -102,7 +102,7 @@ describe("GjcOnDiskDiscovery", () => {
     expect(fallbackState.sessions.get(fallback.id)).toMatchObject({ title: "project · 12345678" });
   });
 
-  test("projects a sanitized transcript carrying token/usage metadata without tripping the secret guard", async () => {
+  test("projects a sanitized transcript keeping only assistant text and dropping tool calls and usage metadata", async () => {
     const { root } = await storeFile([
       JSON.stringify({ type: "session", version: 3, id: "12345678-1234-1234-1234-123456789abc", timestamp: "2026-07-16T10:00:00.000Z", cwd: "/repo" }),
       JSON.stringify({ type: "message", id: "m1", timestamp: "2026-07-16T10:00:01.000Z", message: { role: "assistant", content: [{ type: "text", text: "done" }, { type: "toolCall", name: "bash", arguments: { cmd: "ls" } }], usage: { totalTokens: 42, inputTokens: 10 } } }),
@@ -114,7 +114,63 @@ describe("GjcOnDiskDiscovery", () => {
       const session = database.listSessionsForOwner("owner")[0]!;
       expect(session.transcriptStatus).toBe("available");
       const message = (database.listEvents(session.id) as Array<{ type: string; payload: unknown }>).find((event) => event.type === "gjc.message");
-      expect(message?.payload).toEqual({ type: "message", role: "assistant", text: "done\n[tool: bash]", sourceEventId: "m1#2" });
+      // Tool calls and usage metadata are never projected; only the actual assistant text survives.
+      expect(message?.payload).toEqual({ type: "message", role: "assistant", text: "done", sourceEventId: "m1#2" });
+    } finally {
+      database.close();
+    }
+  });
+  test("a mixed assistant turn keeps only actual text and hides thinking and tool calls", async () => {
+    const { root } = await storeFile([
+      JSON.stringify({ type: "session", version: 3, id: "12345678-1234-1234-1234-123456789abc", timestamp: "2026-07-16T10:00:00.000Z", cwd: "/repo" }),
+      JSON.stringify({ type: "message", id: "m1", parentId: null, timestamp: "2026-07-16T10:00:01.000Z", message: { role: "assistant", content: [{ type: "thinking", text: "internal reasoning" }, { type: "text", text: "Here is the answer." }, { type: "toolCall", name: "edit", arguments: {} }] } }),
+      "",
+    ].join("\n"));
+    const database = openCoreDatabase(join(root, "hub.sqlite"));
+    try {
+      await new GjcOnDiskDiscovery({ database, ownerId: "owner", codingAgentDir: root }).synchronize();
+      const session = database.listSessionsForOwner("owner")[0]!;
+      const payload = (database.listEvents(session.id) as Array<{ type: string; payload: { text?: string } }>).find((event) => event.type === "gjc.message")?.payload;
+      // Thinking and the tool call do not leak into the projected text; only the real text remains.
+      expect(payload?.text).toBe("Here is the answer.");
+    } finally {
+      database.close();
+    }
+  });
+  test("an assistant turn with only thinking and tool calls produces no user-visible text", async () => {
+    const { root } = await storeFile([
+      JSON.stringify({ type: "session", version: 3, id: "12345678-1234-1234-1234-123456789abc", timestamp: "2026-07-16T10:00:00.000Z", cwd: "/repo" }),
+      JSON.stringify({ type: "message", id: "m1", parentId: null, timestamp: "2026-07-16T10:00:01.000Z", message: { role: "assistant", content: [{ type: "thinking", text: "working" }, { type: "toolCall", name: "bash", arguments: { cmd: "ls" } }] } }),
+      "",
+    ].join("\n"));
+    const database = openCoreDatabase(join(root, "hub.sqlite"));
+    try {
+      await new GjcOnDiskDiscovery({ database, ownerId: "owner", codingAgentDir: root }).synchronize();
+      const session = database.listSessionsForOwner("owner")[0]!;
+      const payload = (database.listEvents(session.id) as Array<{ type: string; payload: Record<string, unknown> }>).find((event) => event.type === "gjc.message")?.payload;
+      // No synthesis of [thinking]/[tool: ...]: a hidden turn carries no text at all.
+      expect(payload).toEqual({ type: "message", role: "assistant", sourceEventId: "m1#2" });
+      expect(payload).not.toHaveProperty("text");
+    } finally {
+      database.close();
+    }
+  });
+  test("direct user text remains the projected user-visible turn", async () => {
+    const { root } = await storeFile([
+      JSON.stringify({ type: "session", version: 3, id: "12345678-1234-1234-1234-123456789abc", timestamp: "2026-07-16T10:00:00.000Z", cwd: "/repo" }),
+      JSON.stringify({ type: "message", id: "u1", parentId: null, timestamp: "2026-07-16T10:00:01.000Z", message: { role: "user", content: [{ type: "text", text: "hello there" }] } }),
+      JSON.stringify({ type: "message", id: "u2", parentId: null, timestamp: "2026-07-16T10:00:02.000Z", message: { role: "user", content: "plain string user turn" } }),
+      "",
+    ].join("\n"));
+    const database = openCoreDatabase(join(root, "hub.sqlite"));
+    try {
+      await new GjcOnDiskDiscovery({ database, ownerId: "owner", codingAgentDir: root }).synchronize();
+      const session = database.listSessionsForOwner("owner")[0]!;
+      const payloads = (database.listEvents(session.id) as Array<{ type: string; payload: unknown }>).filter((event) => event.type === "gjc.message").map((event) => event.payload);
+      expect(payloads).toEqual([
+        { type: "message", role: "user", text: "hello there", sourceEventId: "u1#2" },
+        { type: "message", role: "user", text: "plain string user turn", sourceEventId: "u2#3" },
+      ]);
     } finally {
       database.close();
     }
