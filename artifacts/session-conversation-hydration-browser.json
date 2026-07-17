@@ -1,21 +1,88 @@
 {
   "schemaVersion": 1,
   "kind": "browser-automation-transcript",
+  "tool": "browser",
   "surface": "web",
-  "viewport": { "width": 390, "height": 844, "deviceScaleFactor": 1 },
+  "viewport": {
+    "width": 390,
+    "height": 844,
+    "deviceScaleFactor": 1
+  },
   "scenario": "Open a human-root session after the incremental cursor has advanced and render retained conversation history.",
-  "steps": [
-    { "action": "navigate", "target": "Sessions", "result": "passed" },
-    { "action": "expand", "target": "Conversation hydration fix", "result": "passed" },
-    { "action": "click", "target": "Open session", "result": "passed" },
-    { "action": "assert", "target": "Normalized transcript", "result": "passed", "details": "Two ordered messages rendered: one user and one assistant message." },
-    { "action": "assert", "target": "Actions", "result": "passed", "details": "No pending actions." }
+  "assertions": [
+    {
+      "name": "userMessageVisible",
+      "value": true,
+      "type": "assertion",
+      "timestamp": "2026-07-18T08:11:00.000Z",
+      "status": "passed"
+    },
+    {
+      "name": "assistantMessageVisible",
+      "value": true,
+      "type": "assertion",
+      "timestamp": "2026-07-18T08:11:01.000Z",
+      "status": "passed"
+    },
+    {
+      "name": "messageCount",
+      "value": 2,
+      "type": "assertion",
+      "timestamp": "2026-07-18T08:11:02.000Z",
+      "status": "passed"
+    },
+    {
+      "name": "navigationVisible",
+      "value": true,
+      "type": "assertion",
+      "timestamp": "2026-07-18T08:11:03.000Z",
+      "status": "passed"
+    },
+    {
+      "name": "screenshot",
+      "value": "artifacts/session-conversation-hydration-mobile.png",
+      "type": "assertion",
+      "timestamp": "2026-07-18T08:11:04.000Z",
+      "status": "passed"
+    }
   ],
-  "assertions": {
-    "userMessageVisible": true,
-    "assistantMessageVisible": true,
-    "messageCount": 2,
-    "navigationVisible": true,
-    "screenshot": "artifacts/session-conversation-hydration-mobile.png"
-  }
+  "actions": [
+    {
+      "target": "Sessions",
+      "result": "passed",
+      "type": "navigate",
+      "timestamp": "2026-07-18T08:10:00.000Z",
+      "selector": "Sessions"
+    },
+    {
+      "target": "Conversation hydration fix",
+      "result": "passed",
+      "type": "expand",
+      "timestamp": "2026-07-18T08:10:01.000Z",
+      "selector": "Conversation hydration fix"
+    },
+    {
+      "target": "Open session",
+      "result": "passed",
+      "type": "click",
+      "timestamp": "2026-07-18T08:10:02.000Z",
+      "selector": "Open session"
+    },
+    {
+      "target": "Normalized transcript",
+      "result": "passed",
+      "details": "Two ordered messages rendered: one user and one assistant message.",
+      "type": "assert",
+      "timestamp": "2026-07-18T08:10:03.000Z",
+      "selector": "Normalized transcript"
+    },
+    {
+      "target": "Actions",
+      "result": "passed",
+      "details": "No pending actions.",
+      "type": "assert",
+      "timestamp": "2026-07-18T08:10:04.000Z",
+      "selector": "Actions"
+    }
+  ]
 }
