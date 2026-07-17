@@ -102,6 +102,14 @@ type ParsedTranscript = {
   readonly workdir: string;
   readonly sourceCreatedAt: string;
 };
+type HierarchyTranscript = {
+  readonly path: string;
+  readonly filenameId: string;
+  readonly nested: boolean;
+  readonly parentRemoteId: string | null;
+  readonly remoteId: string;
+  readonly observationState: SessionHierarchyEvidence["observationState"];
+};
 
 const sha256 = (text: string): string => new Bun.CryptoHasher("sha256").update(text).digest("hex");
 
@@ -265,8 +273,7 @@ export class GjcOnDiskDiscovery {
    * calls this only while its manifest is still mutable.
    */
   async captureHierarchyEvidence(capturedEpoch: number): Promise<readonly string[]> {
-    const sourceKeys: string[] = [];
-    const seenSessionIds = new Set<string>();
+    const transcripts: Array<Omit<HierarchyTranscript, "remoteId" | "observationState">> = [];
     const walk = async (directory: string, relative: readonly string[]): Promise<void> => {
       const entries = await readdir(directory, { withFileTypes: true });
       for (const entry of entries) {
@@ -278,39 +285,66 @@ export class GjcOnDiskDiscovery {
         const match = entry.isFile() ? SESSION_FILE.exec(entry.name) : null;
         if (!match) continue;
         const parentDirectory = relative.find((name) => SESSION_DIRECTORY.exec(name));
-        const parentId = parentDirectory ? SESSION_DIRECTORY.exec(parentDirectory)?.[1] ?? null : null;
-        const nested = relative.length > 0;
-        let sessionId = match[2]!;
-        let state: SessionHierarchyEvidence["observationState"] = nested && parentId === null ? "missing-parent" : "valid";
-        try { sessionId = parseTranscript(await readFile(path, "utf8"), sessionId, this.now().toISOString(), !nested).remoteId; }
-        catch { state = "unreadable"; }
-        if (state === "valid" && seenSessionIds.has(sessionId)) state = "conflict";
-        seenSessionIds.add(sessionId);
-        await this.discoverFile(path, match[2]!, nested);
-        this.options.database.upsertSessionHierarchyEvidence({
-          ownerId: this.options.ownerId,
-          adapter: "gjc",
-          sourceKey: path,
-          sessionId,
-          identityNamespace: "gjc-transcript",
-          observedParentSessionId: parentId,
-          observedParentOwnerId: parentId === null ? null : this.options.ownerId,
-          directHumanEvidence: !nested,
-          structuralKind: nested ? "subagent" : "direct",
-          observationState: state,
-          capturedEpoch,
-          deletedAt: null,
+        transcripts.push({
+          path,
+          filenameId: match[2]!,
+          nested: relative.length > 0,
+          parentRemoteId: parentDirectory ? SESSION_DIRECTORY.exec(parentDirectory)?.[1] ?? null : null,
         });
-        sourceKeys.push(path);
       }
     };
     let directories;
     try { directories = await readdir(this.root, { withFileTypes: true }); }
     catch (cause) {
-      if ((cause as NodeJS.ErrnoException).code === "ENOENT") return sourceKeys;
+      if ((cause as NodeJS.ErrnoException).code === "ENOENT") return [];
       throw cause;
     }
     for (const directory of directories) if (directory.isDirectory()) await walk(join(this.root, directory.name), []);
+
+    const materialized: HierarchyTranscript[] = [];
+    const internalIdsByRemoteId = new Map<string, string>();
+    for (const transcript of transcripts) {
+      let remoteId = transcript.filenameId;
+      let observationState: SessionHierarchyEvidence["observationState"] = transcript.nested && transcript.parentRemoteId === null ? "missing-parent" : "valid";
+      try {
+        remoteId = parseTranscript(await readFile(transcript.path, "utf8"), transcript.filenameId, this.now().toISOString(), !transcript.nested).remoteId;
+      } catch {
+        observationState = "unreadable";
+      }
+      await this.discoverFile(transcript.path, transcript.filenameId, transcript.nested);
+      const session = this.options.database.getSessionByRemoteIdForOwner(this.options.ownerId, "gjc", remoteId);
+      if (!session) throw new Error(`GJC hierarchy transcript was not materialized: ${transcript.path}`);
+      internalIdsByRemoteId.set(transcript.filenameId, session.id);
+      internalIdsByRemoteId.set(remoteId, session.id);
+      materialized.push({ ...transcript, remoteId, observationState });
+    }
+
+    const sourceKeys: string[] = [];
+    const seenRemoteIds = new Set<string>();
+    for (const transcript of materialized) {
+      let observationState = transcript.observationState;
+      if (observationState === "valid" && seenRemoteIds.has(transcript.remoteId)) observationState = "conflict";
+      seenRemoteIds.add(transcript.remoteId);
+      const parentSessionId = transcript.parentRemoteId === null ? null : internalIdsByRemoteId.get(transcript.parentRemoteId) ?? null;
+      if (observationState === "valid" && transcript.parentRemoteId !== null && parentSessionId === null) observationState = "missing-parent";
+      const sessionId = internalIdsByRemoteId.get(transcript.remoteId);
+      if (!sessionId) throw new Error(`GJC hierarchy session ID was not resolved: ${transcript.path}`);
+      this.options.database.upsertSessionHierarchyEvidence({
+        ownerId: this.options.ownerId,
+        adapter: "gjc",
+        sourceKey: transcript.path,
+        sessionId,
+        identityNamespace: "gjc-transcript",
+        observedParentSessionId: parentSessionId,
+        observedParentOwnerId: parentSessionId === null ? null : this.options.ownerId,
+        directHumanEvidence: !transcript.nested,
+        structuralKind: transcript.nested ? "subagent" : "direct",
+        observationState,
+        capturedEpoch,
+        deletedAt: null,
+      });
+      sourceKeys.push(transcript.path);
+    }
     return sourceKeys.sort();
   }
   /**

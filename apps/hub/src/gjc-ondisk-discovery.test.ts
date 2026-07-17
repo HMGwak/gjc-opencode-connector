@@ -311,18 +311,54 @@ describe("GjcOnDiskDiscovery", () => {
     await discovery.captureHierarchyEvidence(4);
     await discovery.captureHierarchyEvidence(5);
 
+    const parentSessionId = state.sessions.get(id)!.id;
+    const childSessionId = state.sessions.get(childId)!.id;
     expect(state.evidence).toHaveLength(4);
     expect(state.evidence).toEqual(expect.arrayContaining([
-      expect.objectContaining({ sessionId: id, directHumanEvidence: true, observedParentSessionId: null, observationState: "valid", capturedEpoch: 5 }),
-      expect.objectContaining({ sessionId: childId, directHumanEvidence: false, observedParentSessionId: id, observedParentOwnerId: "owner", observationState: "valid", capturedEpoch: 5 }),
+      expect.objectContaining({ sessionId: parentSessionId, directHumanEvidence: true, observedParentSessionId: null, observationState: "valid", capturedEpoch: 5 }),
+      expect.objectContaining({ sessionId: childSessionId, directHumanEvidence: false, observedParentSessionId: parentSessionId, observedParentOwnerId: "owner", observationState: "valid", capturedEpoch: 5 }),
     ]));
+    expect(childSessionId).not.toBe(childId);
     expect(state.sessions.get(childId)).toMatchObject({ transcriptStatus: "available", title: "repo · abcdef12" });
+  });
+  test("projects hierarchy roots using Core IDs when transcript remote IDs differ", async () => {
+    const { root, id: parentRemoteId } = await storeFile(JSON.stringify({ type: "session", version: 3, id: "12345678-1234-1234-1234-123456789abc", timestamp: "2026-07-16T10:00:00.000Z", cwd: "/repo" }) + "\n");
+    const childFilenameId = "87654321-1234-1234-1234-123456789abc";
+    const childRemoteId = "abcdef12-1234-1234-1234-123456789abc";
+    const nested = join(root, "sessions", "-repo", `2026-07-16T10:00:00.000Z_${parentRemoteId}`);
+    await mkdir(nested, { recursive: true });
+    await writeFile(join(nested, `2026-07-16T10:01:00.000Z_${childFilenameId}.jsonl`), JSON.stringify({ type: "session", version: 3, id: childRemoteId, timestamp: "2026-07-16T10:01:00.000Z", cwd: "/repo" }) + "\n");
+
+    const database = openCoreDatabase(join(root, "hub.sqlite"));
+    try {
+      expect(await new GjcOnDiskDiscovery({ database, ownerId: "owner", codingAgentDir: root }).synchronizeHierarchy()).toMatchObject({ projected: true });
+      const parent = database.getSessionByRemoteIdForOwner("owner", "gjc", parentRemoteId)!;
+      const child = database.getSessionByRemoteIdForOwner("owner", "gjc", childRemoteId)!;
+      const evidence = database.listSessionHierarchyEvidence("owner");
+      const generation = database.getHierarchyGeneration("owner")!;
+      const rootProjection = database.sqlite.query(`SELECT session_id AS sessionId, root_session_id AS rootSessionId FROM session_hierarchy_projection WHERE owner_id = ? AND generation = ? AND kind = 'root'`).get("owner", generation.activeGeneration) as { sessionId: string; rootSessionId: string } | null;
+
+      expect(generation.activeGeneration).toBeGreaterThan(0);
+      expect(rootProjection).toEqual({ sessionId: parent.id, rootSessionId: parent.id });
+      expect(parent.id).not.toBe(parentRemoteId);
+      expect(child.id).not.toBe(childRemoteId);
+      expect(evidence).toEqual(expect.arrayContaining([
+        expect.objectContaining({ sessionId: parent.id, observedParentSessionId: null }),
+        expect.objectContaining({ sessionId: child.id, observedParentSessionId: parent.id }),
+      ]));
+      expect(database.hierarchyRollups("owner")).toEqual([
+        expect.objectContaining({ rootSessionId: parent.id, internalCount: 1 }),
+      ]);
+    } finally {
+      database.close();
+    }
   });
   test("records unreadable transcripts as terminal hierarchy evidence", async () => {
     const { root, id } = await storeFile("{not-json}\n");
     const state = fakeDatabase();
-    await new GjcOnDiskDiscovery({ database: state.database, ownerId: "owner", codingAgentDir: root }).captureHierarchyEvidence(2);
-    expect(state.evidence).toEqual([expect.objectContaining({ sessionId: id, observationState: "unreadable", capturedEpoch: 2 })]);
+    const discovery = new GjcOnDiskDiscovery({ database: state.database, ownerId: "owner", codingAgentDir: root });
+    await discovery.captureHierarchyEvidence(2);
+    expect(state.evidence).toEqual([expect.objectContaining({ sessionId: state.sessions.get(id)!.id, observationState: "unreadable", capturedEpoch: 2 })]);
   });
   test("records duplicate transcript identities as terminal conflict evidence", async () => {
     const content = JSON.stringify({ type: "session", version: 3, id: "12345678-1234-1234-1234-123456789abc", timestamp: "2026-07-16T10:00:00.000Z", cwd: "/repo" }) + "\n";
