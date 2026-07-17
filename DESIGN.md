@@ -21,7 +21,7 @@ The authenticated interface is a calm, Linear-inspired single-column control sur
 
 ## 3. Typography
 
-- Primary: Inter, with `ui-sans-serif` and `system-ui` fallbacks.
+- Primary: the offline-safe `ui-sans-serif` and `system-ui` stack.
 - Headings use 600 weight and tight tracking; row titles use 500 weight; supporting metadata uses 11–12px at high contrast.
 - State and time are subordinate to the session/work title. Section labels are compact uppercase labels; user-facing page headings retain natural case.
 
@@ -65,16 +65,16 @@ The authenticated interface is a calm, Linear-inspired single-column control sur
 - Inbox keeps the action card supplied by the HITL renderer. A session navigation control is a sibling of that card, never nested inside it.
 - Internal-origin actions resolve navigation through `rootSessionId`, falling back to `sessionId` during staged API rollout.
 
-### Internal activity disclosure
+### Human and worker identity
 
-- Session detail conditionally shows a native, collapsed `details` disclosure when `internalCount` is non-zero.
-- Opening it lazily requests the capped, paginated summary endpoint. Loading, empty, and error states are explicit.
-- Drill-down items are summaries, not interactive peer sessions.
+- Session identity is structural metadata, never a title or filename keyword heuristic.
+- A visible human root requires a top-level GJC session header with `titleSource: "user"`, no parent, and no `configured_model_chain` event whose `origin` is `"subagent"`.
+- Nested transcripts and explicit subagent-origin transcripts remain internal. Their active work may aggregate under the human root, but worker sessions have no user-facing peer row or drill-down.
 
 ## 6. Motion and Interaction
 
-- Android Back consumes in-app detail/tab history first. At the root it opens an explicit Cancel/Exit confirmation instead of immediately leaving the app.
-- Long press and left swipe are optional accelerators for archive confirmation; keyboard and screen-reader users retain the explicit Archive action.
+- Android Back interception registers before asynchronous credential startup. It dismisses an open archive confirmation first, then consumes in-app detail/tab history, and only at the root opens one explicit Cancel/Exit confirmation.
+- Long press and left swipe are optional accelerators for archive confirmation; keyboard and screen-reader users retain the explicit Archive action. Explicit manual archive may hide active/recent work, but unresolved pending actions or commands block it.
 - Buttons retain native active feedback; focus remains visibly outlined.
 - Reduced-motion preference requires no additional override because no decorative transition is added.
 
@@ -88,4 +88,4 @@ The authenticated interface is a calm, Linear-inspired single-column control sur
 - WCAG 2.2 AA target: visible focus, keyboard-complete pairing, explicit labels, status announcements, and a 44px minimum interactive target.
 - Accepted debt: browser/PWA mode does not retain the device credential. This personal connector flow is Android-only and requires the Keystore-backed bridge.
 - Session hierarchy wire fields are additive and optional during staged integration: `rootSessionId`, `internalCount`, `actionableCount`, `failureCount`, and `lastActivityAt`. Missing values preserve legacy navigation and omit rollup UI.
-- Human-root sessions are the only listable Sessions/Archive peers. Active work resolves through `rootSessionId` with `sessionId` fallback and appears only beneath that parent; internal execution summaries remain available only through rollups and explicit drill-down.
+- Human-root sessions are the only listable Sessions/Archive peers. Active work resolves through `rootSessionId` with `sessionId` fallback and appears only beneath that parent; internal execution is represented only by root rollups and aggregated work.

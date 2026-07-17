@@ -255,6 +255,22 @@ describe("CoreDatabase", () => {
     expect(db.archiveSessionForOwner({ id: "session-1", ownerId: "owner-2" })).toBeNull();
     expect(db.listArchivedSessionsForOwner("owner-2")).toEqual([]);
   });
+  test("allows manual archives of active work but keeps retention eligibility strict", () => {
+    const db = database();
+    db.createSession({ id: "manual-active", ownerId: "owner-1", adapter: "adapter", remoteId: "manual-active" });
+    db.setReconciliation("manual-active", "active", 1, true, "revision-1");
+    db.upsertWorkItem({ id: "manual-work", ownerId: "owner-1", sessionId: "manual-active", remoteId: "manual-work", state: "open", payload: {} });
+    expect(db.canArchiveSessionForOwner("manual-active", "owner-1").blockers).toEqual(expect.arrayContaining(["terminal", "grace-period", "work-items"]));
+    expect(db.canManuallyArchiveSessionForOwner("manual-active", "owner-1")).toEqual({ eligible: true, blockers: [] });
+    expect(db.archiveSessionForOwner({ id: "manual-active", ownerId: "owner-1" })).toMatchObject({ archivedAt: expect.any(String) });
+
+    db.createSession({ id: "retention-active", ownerId: "owner-1", adapter: "adapter", remoteId: "retention-active" });
+    db.setReconciliation("retention-active", "active", 1, true, "revision-1");
+    db.upsertWorkItem({ id: "retention-work", ownerId: "owner-1", sessionId: "retention-active", remoteId: "retention-work", state: "open", payload: {} });
+    db.sqlite.query("UPDATE sessions SET source_created_at = ? WHERE id = ?").run("2020-01-01T00:00:00.000Z", "retention-active");
+    expect(db.archiveSessionsBeforeForOwner({ ownerId: "owner-1", sourceCreatedAtBefore: "2021-01-01T00:00:00.000Z" })).toEqual([]);
+    expect(db.getSession("retention-active")?.archivedAt).toBeNull();
+  });
   test("writes owner transition audits atomically without auditing no-ops", () => {
     const db = database();
     db.createSession({ id: "audited", ownerId: "owner-1", adapter: "adapter", remoteId: "audited" });

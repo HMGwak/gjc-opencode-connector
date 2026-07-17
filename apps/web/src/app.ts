@@ -40,20 +40,6 @@ type WorkItem = SessionRollups & {
 };
 
 type HitlAction = PendingAction & { rootSessionId?: string };
-type InternalSessionSummary = {
-  id: string;
-  adapter?: string;
-  kind?: string;
-  status?: string;
-  title?: string;
-  updatedAt?: string;
-};
-
-type InternalDisclosureState = {
-  status: "idle" | "loading" | "loaded" | "error";
-  items: InternalSessionSummary[];
-  error?: string;
-};
 
 
 type HubEvent = {
@@ -96,12 +82,11 @@ let streamConnected = false;
 let loadingSessions = false;
 let fetchError: string | null = null;
 let projectionErrors: Partial<Record<"inbox" | "work" | "history", string>> = {};
-const internalDisclosures = new Map<string, InternalDisclosureState>();
-const openInternalDisclosures = new Set<string>();
 let appHistoryIndex = 0;
 let androidBackRegistered = false;
 let exitDialogOpen = false;
 let archiveConfirmation: { session: Session; focusId: string } | null = null;
+registerAndroidBackButton();
 
 function isTab(value: string | null): value is TabId {
   return value !== null && tabOptions.some((option) => option.id === value);
@@ -728,61 +713,6 @@ function renderHistory(panel: HTMLElement): void {
   for (const section of historySections(archivedSessions, localDateHeading)) appendSessionGroup(panel, section.heading, section.items, "history");
 }
 
-function renderInternalDisclosure(session: Session): HTMLDetailsElement {
-  const disclosure = element("details");
-  disclosure.className = "internal-disclosure";
-  disclosure.open = openInternalDisclosures.has(session.id);
-  const summary = element("summary", `Internal activity (${session.internalCount ?? 0})`);
-  disclosure.append(summary);
-  const content = element("div");
-  content.className = "internal-disclosure-content";
-  const current = internalDisclosures.get(session.id) ?? { status: "idle", items: [] };
-  if (current.status === "loading" || current.status === "idle") content.append(element("p", "Loading internal activity…"));
-  else if (current.status === "error") {
-    const error = element("p", current.error ?? "Internal activity is unavailable.");
-    error.setAttribute("role", "alert");
-    content.append(error);
-  } else if (current.items.length === 0) content.append(element("p", "No internal activity details are available."));
-  else {
-    const list = element("ul");
-    list.className = "internal-list";
-    for (const internal of current.items) {
-      const item = element("li");
-      item.append(element("strong", internal.title || internal.kind || internal.adapter || "Internal execution"));
-      if (internal.status || internal.updatedAt) item.append(element("small", [internal.status, internal.updatedAt ? new Date(internal.updatedAt).toLocaleString() : ""].filter(Boolean).join(" · ")));
-      list.append(item);
-    }
-    content.append(list);
-  }
-  disclosure.append(content);
-  disclosure.addEventListener("toggle", () => {
-    if (disclosure.open) {
-      openInternalDisclosures.add(session.id);
-      if (current.status === "idle") void loadInternalSessions(session.id);
-    } else openInternalDisclosures.delete(session.id);
-  });
-  return disclosure;
-}
-
-async function loadInternalSessions(sessionId: string): Promise<void> {
-  internalDisclosures.set(sessionId, { status: "loading", items: [] });
-  render();
-  try {
-    const response = await api(`/sessions/${encodeURIComponent(sessionId)}/internal`);
-    if (!response.ok) throw new Error(`request failed (${response.status})`);
-    const body: unknown = await response.json();
-    const candidates = typeof body === "object" && body !== null
-      ? ((body as { sessions?: unknown; internal?: unknown }).sessions ?? (body as { internal?: unknown }).internal)
-      : undefined;
-    if (!Array.isArray(candidates)) throw new Error("invalid response");
-    const items = candidates.filter((item): item is InternalSessionSummary =>
-      typeof item === "object" && item !== null && typeof (item as InternalSessionSummary).id === "string");
-    internalDisclosures.set(sessionId, { status: "loaded", items });
-  } catch (error) {
-    internalDisclosures.set(sessionId, { status: "error", items: [], error: fetchFailure("Unable to load internal activity", error) });
-  }
-  render();
-}
 
 function renderSelectedSession(panel: HTMLElement): void {
   const session = selectedSession;
@@ -811,7 +741,6 @@ function renderSelectedSession(panel: HTMLElement): void {
   messages.setAttribute("aria-label", "Normalized transcript");
   activity.append(messages);
   detail.append(activity);
-  if (session.internalCount) detail.append(renderInternalDisclosure(session));
   if (isArchived(session)) {
     detail.append(element("p", "Archived sessions are read-only."));
   } else {
@@ -1220,7 +1149,6 @@ async function start(): Promise<void> {
     selectedSessionOrigin = "sessions";
     saveNavigation();
   } else saveNavigation(true);
-  registerAndroidBackButton();
   render();
   if (pairingRequired) return;
   multiTab.start();

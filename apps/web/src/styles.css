@@ -41,7 +41,7 @@ h3 { margin: 1rem 0 .35rem; color: var(--color-muted); font-size: .72rem; font-w
 .tabs { position: relative; z-index: 2; display: grid; grid-template-columns: repeat(3, 1fr); padding: .35rem var(--space-3) max(.35rem, env(safe-area-inset-bottom)); border-top: 1px solid var(--color-border); background: var(--color-page); }
 .tabs button { min-width: 0; min-height: 44px; border: 0; border-radius: var(--radius-sm); padding-inline: .2rem; background: transparent; color: var(--color-muted); font-size: .75rem; font-weight: 500; }
 .tabs button[aria-current="page"] { background: var(--color-selected); color: var(--color-text); }
-.dense-list, .inbox-list, .messages, .internal-list { padding: 0; margin: 0; list-style: none; }
+.dense-list, .inbox-list, .messages { padding: 0; margin: 0; list-style: none; }
 .dense-list { border-top: 1px solid var(--color-border); }
 .dense-list > li { border-bottom: 1px solid var(--color-border); }
 .dense-row { width: 100%; min-height: 58px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .2rem .65rem; align-items: center; border: 0; border-radius: 0; padding: .55rem .15rem; text-align: left; background: transparent; }
@@ -80,10 +80,6 @@ h3 { margin: 1rem 0 .35rem; color: var(--color-muted); font-size: .72rem; font-w
 .back-to-sessions { justify-self: start; border-color: transparent; background: transparent; color: var(--color-muted); }
 details { display: grid; gap: .65rem; border-top: 1px solid var(--color-border); }
 summary { min-height: 44px; display: flex; align-items: center; cursor: pointer; font-size: .85rem; font-weight: 500; }
-.internal-disclosure-content { padding: 0 0 .75rem 1rem; }
-.internal-list { display: grid; }
-.internal-list li { display: grid; gap: .15rem; padding: .45rem 0; border-bottom: 1px solid var(--color-border); font-size: .8rem; }
-.internal-list small { color: var(--color-muted); }
 .messages { display: grid; gap: .6rem; padding-top: .5rem; }
 .messages li { max-width: 88%; padding: .7rem .8rem; border-radius: .75rem; overflow-wrap: anywhere; white-space: pre-wrap; background: var(--color-elevated); }
 .messages .message-user { justify-self: end; background: var(--color-selected); }

@@ -1243,7 +1243,9 @@ export class CoreDatabase {
       if (!session) return null;
       if (session.archivedAt) return session;
       const timestamp = input.archivedAt ?? now();
-      const eligibility = this.canArchiveSessionForOwner(input.id, input.ownerId, timestamp);
+      const eligibility = input.archiveReason === "retention"
+        ? this.canArchiveSessionForOwner(input.id, input.ownerId, timestamp)
+        : this.canManuallyArchiveSessionForOwner(input.id, input.ownerId);
       if (!eligibility.eligible) throw new Error(`Session cannot be archived: ${eligibility.blockers.join(",")}`);
       const cursor = (this.sqlite.query("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM events WHERE session_id = ?").get(input.id) as { seq: number }).seq;
       const changed = this.sqlite.query("UPDATE sessions SET archived_at = ?, archive_reason = ?, archive_cursor_seq = ?, updated_at = ? WHERE id = ? AND owner_id = ? AND archived_at IS NULL AND reconciliation_epoch = ? AND active_projector_version IS ?").run(timestamp, input.archiveReason ?? "manual", cursor, timestamp, input.id, input.ownerId, session.reconciliationEpoch, session.activeProjectorVersion);
@@ -1716,15 +1718,19 @@ export class CoreDatabase {
       return session;
     });
   }
-  canArchiveSessionForOwner(id: string, ownerId: string, at = now()): { eligible: boolean; blockers: string[] } {
+  canManuallyArchiveSessionForOwner(id: string, ownerId: string): { eligible: boolean; blockers: string[] } {
     const blockers: string[] = [];
+    if (!this.getSessionForOwner(id, ownerId)) blockers.push("session");
+    if (this.sqlite.query("SELECT 1 FROM pending_actions WHERE session_id = ? AND state IN ('pending','dispatching','unknown')").get(id)) blockers.push("pending-actions");
+    if (this.sqlite.query("SELECT 1 FROM commands WHERE session_id = ? AND state IN ('accepted','dispatching','remote-confirmed','unknown')").get(id)) blockers.push("commands");
+    return { eligible: blockers.length === 0, blockers };
+  }
+  canArchiveSessionForOwner(id: string, ownerId: string, at = now()): { eligible: boolean; blockers: string[] } {
+    const blockers = this.canManuallyArchiveSessionForOwner(id, ownerId).blockers;
     const session = this.getSessionForOwner(id, ownerId);
-    if (!session) blockers.push("session");
     if (session && session.status !== "terminal") blockers.push("terminal");
     if (session && !session.reconciled) blockers.push("reconciled");
     if (session && new Date(session.updatedAt).getTime() > new Date(at).getTime() - 15 * 60 * 1_000) blockers.push("grace-period");
-    if (this.sqlite.query("SELECT 1 FROM pending_actions WHERE session_id = ? AND state IN ('pending','dispatching','unknown')").get(id)) blockers.push("pending-actions");
-    if (this.sqlite.query("SELECT 1 FROM commands WHERE session_id = ? AND state IN ('accepted','dispatching','remote-confirmed','unknown')").get(id)) blockers.push("commands");
     const projectorVersion = session?.activeProjectorVersion ?? "legacy";
     if (session && this.sqlite.query("SELECT 1 FROM work_items WHERE session_id = ? AND projector_version = ? AND state NOT IN ('closed','done','resolved')").get(id, projectorVersion)) blockers.push("work-items");
     if (session && this.sqlite.query("SELECT 1 FROM session_projection_gaps WHERE session_id = ? AND projector_version = ? AND resolved_at IS NULL").get(id, projectorVersion)) blockers.push("projection-gaps");

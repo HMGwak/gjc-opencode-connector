@@ -29,7 +29,7 @@ export function classifyOwnerGraph(ownerId: string, evidence: readonly SessionHi
     });
     if (!row || row.observationState !== "valid") return unknown("invalid-evidence");
     if (duplicates.has(sessionId)) return unknown("duplicate-header-id");
-    if (row.directHumanEvidence) {
+    if (row.directHumanEvidence && row.structuralKind === "direct" && row.observedParentSessionId === null) {
       const root: SessionHierarchyProjection = { ownerId, generation: 0, sessionId, kind: "root", rootSessionId: sessionId, parentSessionId: null, unknownReason: null, lineageKind: "direct", internalKind: null, subagentIdentity: null };
       result.set(sessionId, root);
       return root;

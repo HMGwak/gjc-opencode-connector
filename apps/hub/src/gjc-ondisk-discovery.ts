@@ -101,6 +101,8 @@ type ParsedTranscript = {
   readonly title: string;
   readonly workdir: string;
   readonly sourceCreatedAt: string;
+  readonly hasUserTitleSource: boolean;
+  readonly hasSubagentOrigin: boolean;
 };
 type HierarchyTranscript = {
   readonly path: string;
@@ -109,6 +111,8 @@ type HierarchyTranscript = {
   readonly parentRemoteId: string | null;
   readonly remoteId: string;
   readonly observationState: SessionHierarchyEvidence["observationState"];
+  readonly hasUserTitleSource: boolean;
+  readonly hasSubagentOrigin: boolean;
 };
 
 const sha256 = (text: string): string => new Bun.CryptoHasher("sha256").update(text).digest("hex");
@@ -213,6 +217,10 @@ payload: sanitizeEntry(entry, nativeId, parentId),
     if (typeof entry.id === "string" && entry.id.length > 0) sourceEventIds.set(entry.id, nativeId);
   }
   const lastTimestamp = events.at(-1)?.createdAt;
+  const hasSubagentOrigin = parsed.some((entry) => {
+    const value = record(entry);
+    return (value?.type === "configured_model_chain" || value?.type === "configured-model-chain") && value.origin === "subagent";
+  });
   return {
     remoteId: requireFilenameId ? filenameId : header.id,
     updatedAt: lastTimestamp ?? fallbackUpdatedAt,
@@ -221,6 +229,8 @@ payload: sanitizeEntry(entry, nativeId, parentId),
     title: sessionTitle(header, header.cwd, header.id),
     workdir: header.cwd,
     sourceCreatedAt: sourceCreatedAt.toISOString(),
+    hasUserTitleSource: header.titleSource === "user",
+    hasSubagentOrigin,
   };
 }
 
@@ -273,7 +283,7 @@ export class GjcOnDiskDiscovery {
    * calls this only while its manifest is still mutable.
    */
   async captureHierarchyEvidence(capturedEpoch: number): Promise<readonly string[]> {
-    const transcripts: Array<Omit<HierarchyTranscript, "remoteId" | "observationState">> = [];
+    const transcripts: Array<Omit<HierarchyTranscript, "remoteId" | "observationState" | "hasUserTitleSource" | "hasSubagentOrigin">> = [];
     const walk = async (directory: string, relative: readonly string[]): Promise<void> => {
       const entries = await readdir(directory, { withFileTypes: true });
       for (const entry of entries) {
@@ -306,8 +316,13 @@ export class GjcOnDiskDiscovery {
     for (const transcript of transcripts) {
       let remoteId = transcript.filenameId;
       let observationState: SessionHierarchyEvidence["observationState"] = transcript.nested && transcript.parentRemoteId === null ? "missing-parent" : "valid";
+      let hasUserTitleSource = false;
+      let hasSubagentOrigin = false;
       try {
-        remoteId = parseTranscript(await readFile(transcript.path, "utf8"), transcript.filenameId, this.now().toISOString(), !transcript.nested).remoteId;
+        const parsed = parseTranscript(await readFile(transcript.path, "utf8"), transcript.filenameId, this.now().toISOString(), !transcript.nested);
+        remoteId = parsed.remoteId;
+        hasUserTitleSource = parsed.hasUserTitleSource;
+        hasSubagentOrigin = parsed.hasSubagentOrigin;
       } catch {
         observationState = "unreadable";
       }
@@ -316,7 +331,7 @@ export class GjcOnDiskDiscovery {
       if (!session) throw new Error(`GJC hierarchy transcript was not materialized: ${transcript.path}`);
       internalIdsByRemoteId.set(transcript.filenameId, session.id);
       internalIdsByRemoteId.set(remoteId, session.id);
-      materialized.push({ ...transcript, remoteId, observationState });
+      materialized.push({ ...transcript, remoteId, observationState, hasUserTitleSource, hasSubagentOrigin });
     }
 
     const sourceKeys: string[] = [];
@@ -337,8 +352,8 @@ export class GjcOnDiskDiscovery {
         identityNamespace: "gjc-transcript",
         observedParentSessionId: parentSessionId,
         observedParentOwnerId: parentSessionId === null ? null : this.options.ownerId,
-        directHumanEvidence: !transcript.nested,
-        structuralKind: transcript.nested ? "subagent" : "direct",
+        directHumanEvidence: !transcript.nested && transcript.hasUserTitleSource && !transcript.hasSubagentOrigin,
+        structuralKind: transcript.nested || transcript.hasSubagentOrigin ? "subagent" : "direct",
         observationState,
         capturedEpoch,
         deletedAt: null,

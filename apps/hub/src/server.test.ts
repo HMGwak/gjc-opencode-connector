@@ -654,9 +654,7 @@ describe("hub origin API", () => {
     expect(await (await server.fetch(request("/api/v1/work", token))).json()).toEqual({ work: [] });
     expect(await (await server.fetch(request("/api/v1/hitl", token))).json()).toEqual({ actions: [] });
     const archive = { method: "POST", headers: { origin: "https://hub.example" } };
-    const immediate = await server.fetch(request("/api/v1/sessions/s1/archive", token, archive));
-    expect(immediate.status).toBe(409);
-    prepareArchiveCandidate(database, "s1", 2);
+    database.upsertWorkItem({ id: "active-archive-work", ownerId: "u1", sessionId: "s1", remoteId: "active-archive-work", state: "open", payload: {} });
     const first = await server.fetch(request("/api/v1/sessions/s1/archive", token, archive));
     expect(first.status).toBe(200);
     const archived = await first.json();
@@ -673,6 +671,22 @@ describe("hub origin API", () => {
     ]);
     const audits = database.sqlite.query("SELECT correlation_id FROM audit_log WHERE session_id = ? ORDER BY id").all("s1") as Array<{ correlation_id: string }>;
     expect(audits.every(({ correlation_id }) => correlation_id.length > 0)).toBeTrue();
+    database.close();
+  });
+  test("blocks manual archives with unresolved pending actions or commands", async () => {
+    const { database, server, token } = await fixture();
+    const archive = { method: "POST", headers: { origin: "https://hub.example" } };
+    database.createPendingActionForOwner({ id: "pending-archive", ownerId: "u1", sessionId: "s1", payload: {}, expiresAt: "2030-01-01T00:00:00.000Z" });
+    const pending = await server.fetch(request("/api/v1/sessions/s1/archive", token, archive));
+    expect(pending.status).toBe(409);
+    expect(await pending.json()).toEqual({ error: { code: "archive_blocked", message: "pending-actions" } });
+
+    database.createSession({ id: "command-session", ownerId: "u1", adapter: "test", remoteId: "command-session" });
+    database.setReconciliation("command-session", "active", 1, true, "revision-1");
+    database.acceptCommand({ id: "blocking-command", sessionId: "command-session", idempotencyKey: "blocking-command", payload: {} });
+    const command = await server.fetch(request("/api/v1/sessions/command-session/archive", token, archive));
+    expect(command.status).toBe(409);
+    expect(await command.json()).toEqual({ error: { code: "archive_blocked", message: "commands" } });
     database.close();
   });
   test("rejects prompts for view-only sessions", async () => {

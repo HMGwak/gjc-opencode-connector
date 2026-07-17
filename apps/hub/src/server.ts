@@ -439,7 +439,7 @@ export function createHubServer(options: HubServerOptions): { fetch(request: Req
       }
       const existing = options.database.getSessionForOwner(sessionId, claims.sub);
       if (existing?.archivedAt) return json({ session: sessionFromRow(existing) });
-      const archive = options.database.canArchiveSessionForOwner(sessionId, claims.sub);
+      const archive = options.database.canManuallyArchiveSessionForOwner(sessionId, claims.sub);
       if (!archive.eligible) return error(409, "archive_blocked", archive.blockers.join(",") || "Session cannot be archived");
       const session = options.database.archiveSessionForOwner({ id: sessionId, ownerId: claims.sub, actorId: "owner", deviceId: claims.deviceId, correlationId: crypto.randomUUID() });
       return session ? json({ session: sessionFromRow(session) }) : error(404, "not_found", "Session not found");

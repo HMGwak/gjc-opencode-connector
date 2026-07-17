@@ -6,8 +6,18 @@ const row = (sessionId: string, overrides: Partial<SessionHierarchyEvidence> = {
 
 describe("classifyOwnerGraph", () => {
   test("requires direct human evidence for roots and aggregates structural children", () => {
-    const result = classifyOwnerGraph("owner", [row("root", { directHumanEvidence: true, structuralKind: "direct" }), row("child", { observedParentSessionId: "root" }), row("unknown")]);
-    expect(result).toMatchObject([{ sessionId: "child", kind: "internal", rootSessionId: "root" }, { sessionId: "root", kind: "root" }, { sessionId: "unknown", kind: "unknown", unknownReason: "missing-human-evidence" }]);
+    const result = classifyOwnerGraph("owner", [
+      row("root", { directHumanEvidence: true, structuralKind: "direct" }),
+      row("child", { observedParentSessionId: "root" }),
+      row("forged-subagent", { directHumanEvidence: true, structuralKind: "subagent" }),
+      row("unknown"),
+    ]);
+    expect(result).toMatchObject([
+      { sessionId: "child", kind: "internal", rootSessionId: "root" },
+      { sessionId: "forged-subagent", kind: "unknown", unknownReason: "missing-human-evidence" },
+      { sessionId: "root", kind: "root" },
+      { sessionId: "unknown", kind: "unknown", unknownReason: "missing-human-evidence" },
+    ]);
   });
   test("preserves continuation edges while resolving every segment to the human origin", () => {
     const result = classifyOwnerGraph("owner", [

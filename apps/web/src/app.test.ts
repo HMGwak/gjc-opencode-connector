@@ -275,19 +275,19 @@ test("keeps Inbox as a bordered list rather than rounded action cards", () => {
   expect(actionCardStyles).not.toContain("border-radius");
 });
 
-test("consumes additive hierarchy fields and exposes internal activity only as rollups and drill-down", () => {
+test("keeps internal execution structural while exposing only human-root sessions and nested work", () => {
   expect(source).toContain("rootSessionId?: string;");
   expect(source).toContain("internalCount?: number;");
   expect(source).toContain("actionableCount?: number;");
   expect(source).toContain("lastActivityAt?: string;");
   expect(source).toContain("action.rootSessionId ?? action.sessionId");
+  expect(source).toContain("rootSessionSections(activeSessions)");
   expect(source).toContain("workSessionGroups(workItems, sessions)");
-  expect(source).toContain("if (session.internalCount) detail.append(renderInternalDisclosure(session));");
-  expect(source).toContain("`/sessions/${encodeURIComponent(sessionId)}/internal`");
-  expect(source).toContain('disclosure.className = "internal-disclosure";');
-  expect(source).toContain('"Loading internal activity…"');
-  expect(source).toContain('"No internal activity details are available."');
-  expect(source).toContain('error.setAttribute("role", "alert");');
+  expect(source).not.toContain("renderInternalDisclosure");
+  expect(source).not.toContain("/internal`");
+  expect(source).not.toContain("internal-disclosure");
+  expect(styles).not.toContain("internal-disclosure");
+  expect(styles).not.toContain("internal-list");
 });
 test("groups work under root-session accordions without duplicating server state policy", () => {
   const sessions = [
@@ -470,10 +470,16 @@ test("uses a modal archive confirmation that back and pointer departure can dism
   expect(styles).toContain(".archive-confirmation::backdrop");
 });
 
-test("uses in-app history before explicit Android root-exit confirmation", () => {
+test("registers Android Back before credential startup and confirms a single root exit", () => {
   expect(canNavigateBack({ index: 1, sessionId: null })).toBe(true);
   expect(canNavigateBack({ index: 0, sessionId: "session" })).toBe(true);
   expect(canNavigateBack({ index: 0, sessionId: null })).toBe(false);
+  const registration = source.indexOf("registerAndroidBackButton();");
+  expect(registration).toBeGreaterThan(-1);
+  expect(registration).toBeLessThan(source.indexOf("credential = await storedCredential();"));
+  expect(source.match(/registerAndroidBackButton\(\);/g) ?? []).toHaveLength(1);
+  expect(source).toContain("if (androidBackRegistered || !Capacitor.isNativePlatform()) return;");
+  expect(source).toContain("if (archiveConfirmation) {");
   expect(source).toContain("if (exitDialogOpen) return;");
   expect(source).toContain("void Dialog.confirm({");
   expect(source).toContain('okButtonTitle: "Exit"');

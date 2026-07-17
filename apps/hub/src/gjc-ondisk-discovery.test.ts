@@ -297,13 +297,22 @@ describe("GjcOnDiskDiscovery", () => {
     });
     database.close();
   });
-  test("captures direct-root and nested-child hierarchy evidence without using the mtime cache", async () => {
-    const { root, id } = await storeFile(JSON.stringify({ type: "session", version: 3, id: "12345678-1234-1234-1234-123456789abc", timestamp: "2026-07-16T10:00:00.000Z", cwd: "/repo" }) + "\n");
+  test("captures hierarchy evidence from user metadata and never promotes workers", async () => {
+    const { root, id } = await storeFile(JSON.stringify({ type: "session", version: 3, id: "12345678-1234-1234-1234-123456789abc", timestamp: "2026-07-16T10:00:00.000Z", cwd: "/repo", titleSource: "user" }) + "\n");
     const childFilenameId = "87654321-1234-1234-1234-123456789abc";
     const childId = "abcdef12-1234-1234-1234-123456789abc";
-    const nested = join(root, "sessions", "-repo", `2026-07-16T10:00:00.000Z_${id}`);
+    const topLevelSubagentId = "a7654321-1234-1234-1234-123456789abc";
+    const ambiguousId = "b7654321-1234-1234-1234-123456789abc";
+    const sessionDirectory = join(root, "sessions", "-repo");
+    const nested = join(sessionDirectory, `2026-07-16T10:00:00.000Z_${id}`);
     await mkdir(nested, { recursive: true });
-    await writeFile(join(nested, `2026-07-16T10:01:00.000Z_${childFilenameId}.jsonl`), JSON.stringify({ type: "session", version: 3, id: childId, timestamp: "2026-07-16T10:01:00.000Z", cwd: "/repo" }) + "\n");
+    await writeFile(join(nested, `2026-07-16T10:01:00.000Z_${childFilenameId}.jsonl`), JSON.stringify({ type: "session", version: 3, id: childId, timestamp: "2026-07-16T10:01:00.000Z", cwd: "/repo", titleSource: "user" }) + "\n");
+    await writeFile(join(sessionDirectory, `2026-07-16T10:02:00.000Z_${topLevelSubagentId}.jsonl`), [
+      JSON.stringify({ type: "session", version: 3, id: topLevelSubagentId, timestamp: "2026-07-16T10:02:00.000Z", cwd: "/repo", titleSource: "user" }),
+      JSON.stringify({ type: "configured_model_chain", origin: "subagent" }),
+      "",
+    ].join("\n"));
+    await writeFile(join(sessionDirectory, `2026-07-16T10:03:00.000Z_${ambiguousId}.jsonl`), JSON.stringify({ type: "session", version: 3, id: ambiguousId, timestamp: "2026-07-16T10:03:00.000Z", cwd: "/repo", title: "worker-looking title" }) + "\n");
 
     const state = fakeDatabase();
     const discovery = new GjcOnDiskDiscovery({ database: state.database, ownerId: "owner", codingAgentDir: root });
@@ -313,16 +322,20 @@ describe("GjcOnDiskDiscovery", () => {
 
     const parentSessionId = state.sessions.get(id)!.id;
     const childSessionId = state.sessions.get(childId)!.id;
-    expect(state.evidence).toHaveLength(4);
+    const topLevelSubagentSessionId = state.sessions.get(topLevelSubagentId)!.id;
+    const ambiguousSessionId = state.sessions.get(ambiguousId)!.id;
+    expect(state.evidence).toHaveLength(8);
     expect(state.evidence).toEqual(expect.arrayContaining([
-      expect.objectContaining({ sessionId: parentSessionId, directHumanEvidence: true, observedParentSessionId: null, observationState: "valid", capturedEpoch: 5 }),
-      expect.objectContaining({ sessionId: childSessionId, directHumanEvidence: false, observedParentSessionId: parentSessionId, observedParentOwnerId: "owner", observationState: "valid", capturedEpoch: 5 }),
+      expect.objectContaining({ sessionId: parentSessionId, directHumanEvidence: true, structuralKind: "direct", observedParentSessionId: null, observationState: "valid", capturedEpoch: 5 }),
+      expect.objectContaining({ sessionId: childSessionId, directHumanEvidence: false, structuralKind: "subagent", observedParentSessionId: parentSessionId, observedParentOwnerId: "owner", observationState: "valid", capturedEpoch: 5 }),
+      expect.objectContaining({ sessionId: topLevelSubagentSessionId, directHumanEvidence: false, structuralKind: "subagent", observedParentSessionId: null, observationState: "valid", capturedEpoch: 5 }),
+      expect.objectContaining({ sessionId: ambiguousSessionId, directHumanEvidence: false, structuralKind: "direct", observedParentSessionId: null, observationState: "valid", capturedEpoch: 5 }),
     ]));
     expect(childSessionId).not.toBe(childId);
     expect(state.sessions.get(childId)).toMatchObject({ transcriptStatus: "available", title: "repo · abcdef12" });
   });
   test("projects hierarchy roots using Core IDs when transcript remote IDs differ", async () => {
-    const { root, id: parentRemoteId } = await storeFile(JSON.stringify({ type: "session", version: 3, id: "12345678-1234-1234-1234-123456789abc", timestamp: "2026-07-16T10:00:00.000Z", cwd: "/repo" }) + "\n");
+    const { root, id: parentRemoteId } = await storeFile(JSON.stringify({ type: "session", version: 3, id: "12345678-1234-1234-1234-123456789abc", timestamp: "2026-07-16T10:00:00.000Z", cwd: "/repo", titleSource: "user" }) + "\n");
     const childFilenameId = "87654321-1234-1234-1234-123456789abc";
     const childRemoteId = "abcdef12-1234-1234-1234-123456789abc";
     const nested = join(root, "sessions", "-repo", `2026-07-16T10:00:00.000Z_${parentRemoteId}`);
