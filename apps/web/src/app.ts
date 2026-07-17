@@ -6,6 +6,7 @@ import { clearCredential, saveCredential, SecureCredentialUnavailableError, stor
 import { enablePush, revokePush, revokePushWhenPermissionLost } from "./push";
 import { MultiTabCoordinator } from "./multitab";
 import { canNavigateBack, denseRowDescriptor, historySections, inboxRowDescriptor, isDeliberateArchiveSwipe, rootSessionSections, SESSION_ARCHIVE_LONG_PRESS_MS, SESSION_ARCHIVE_SWIPE_VERTICAL_TOLERANCE_PX, sessionSections, workAccordionDescriptor, workSessionGroups } from "./view-model";
+import { conversationHistoryState, mergeConversationMessages, orderedConversationMessages } from "./conversation-state";
 type SessionRollups = {
   internalCount?: number;
   actionableCount?: number;
@@ -49,6 +50,7 @@ type HubEvent = {
   payload: unknown;
   createdAt: string;
 };
+type NormalizedMessage = { role: "user" | "assistant" | "system"; text: string };
 
 const API = "/api/v1";
 const POLL_INTERVAL = 3_000;
@@ -86,6 +88,10 @@ let appHistoryIndex = 0;
 let androidBackRegistered = false;
 let exitDialogOpen = false;
 let archiveConfirmation: { session: Session; focusId: string } | null = null;
+const sessionMessages = new Map<string, Map<number, NormalizedMessage>>();
+const hydratingSessions = new Set<string>();
+const unavailableSessionHistory = new Set<string>();
+const hydrationLocks = new Map<string, Promise<void>>();
 registerAndroidBackButton();
 
 function isTab(value: string | null): value is TabId {
@@ -272,6 +278,7 @@ function restoreNavigation(state: NavigationState | null): void {
     selectedSession = sessions.find((session) => session.id === state.sessionId) ?? null;
     selectedSessionOrigin = state.tab;
     multiTab.requestSession(state.sessionId);
+    void hydrateSession(state.sessionId);
   }
   render();
 }
@@ -472,6 +479,7 @@ function selectSession(session: Session, origin: SessionOrigin = activeTab): voi
   activeTab = origin;
   multiTab.requestSession(session.id);
   saveNavigation();
+  void hydrateSession(session.id);
   render();
 }
 
@@ -739,6 +747,7 @@ function renderSelectedSession(panel: HTMLElement): void {
   messages.id = "messages";
   messages.className = "messages";
   messages.setAttribute("aria-label", "Normalized transcript");
+  renderConversationMessages(messages, session.id);
   activity.append(messages);
   detail.append(activity);
   if (isArchived(session)) {
@@ -779,7 +788,7 @@ function renderPromptForm(panel: HTMLElement, sessionId: string): void {
   panel.append(form);
 }
 
-function normalizedMessage(value: unknown): { role: "user" | "assistant" | "system"; text: string } {
+function normalizedMessage(value: unknown): NormalizedMessage {
   if (typeof value === "string") return { role: "system", text: value };
   if (typeof value !== "object" || value === null) return { role: "system", text: "Activity updated." };
   const record = value as { role?: unknown; text?: unknown; message?: unknown; content?: unknown; error?: unknown };
@@ -793,15 +802,36 @@ function normalizedMessage(value: unknown): { role: "user" | "assistant" | "syst
   return { role, text: "Activity updated." };
 }
 
-function appendMessage(sessionId: string, value: unknown): void {
+function messageElement(message: NormalizedMessage): HTMLLIElement {
+  const item = element("li", message.text);
+  item.className = `message message-${message.role}`;
+  item.setAttribute("aria-label", `${message.role} message`);
+  return item;
+}
+
+function renderConversationMessages(list: HTMLOListElement, sessionId: string): void {
+  list.replaceChildren();
+  const storedMessages = orderedConversationMessages(sessionMessages.get(sessionId) ?? new Map<number, NormalizedMessage>());
+  for (const message of storedMessages) list.append(messageElement(message));
+  const state = conversationHistoryState(storedMessages.length, unavailableSessionHistory.has(sessionId), hydratingSessions.has(sessionId));
+  if (!state) return;
+  const empty = messageElement({ role: "system", text: state });
+  empty.dataset.placeholder = "conversation-state";
+  list.append(empty);
+}
+
+function appendMessage(sessionId: string): void {
   if (sessionId !== selectedSessionId) return;
   const list = document.querySelector<HTMLOListElement>("#messages");
-  if (!list) return;
-  const normalized = normalizedMessage(value);
-  const message = element("li", normalized.text);
-  message.className = `message message-${normalized.role}`;
-  message.setAttribute("aria-label", `${normalized.role} message`);
-  list.append(message);
+  if (list) renderConversationMessages(list, sessionId);
+}
+
+function recordSessionEvent(sessionId: string, event: HubEvent): boolean {
+  const messages = sessionMessages.get(sessionId) ?? new Map<number, NormalizedMessage>();
+  if (messages.has(event.seq)) return false;
+  mergeConversationMessages(messages, [{ seq: event.seq, message: normalizedMessage(event.payload) }]);
+  sessionMessages.set(sessionId, messages);
+  return true;
 }
 
 function openArchiveConfirmation(session: Session, focusId: string): void {
@@ -950,7 +980,8 @@ async function sendPrompt(event: SubmitEvent, input: HTMLTextAreaElement, submit
     if (pendingPrompt?.key === retry.key) pendingPrompt = null;
     if (sessionId === selectedSessionId) input.value = "";
   } catch (error) {
-    appendMessage(sessionId, fetchFailure("Unable to send prompt", error));
+    fetchError = fetchFailure("Unable to send prompt", error);
+    updateConnectionStatus();
   } finally {
     submit.disabled = false;
   }
@@ -1039,6 +1070,42 @@ function parseEvents(body: string): unknown[] {
   return events;
 }
 
+async function hydrateSession(sessionId: string): Promise<void> {
+  const existing = hydrationLocks.get(sessionId);
+  if (existing) return existing;
+  hydratingSessions.add(sessionId);
+  unavailableSessionHistory.delete(sessionId);
+  const messages = sessionMessages.get(sessionId) ?? new Map<number, NormalizedMessage>();
+  sessionMessages.set(sessionId, messages);
+  const hydration = (async () => {
+    try {
+      const response = await api(`/sessions/${encodeURIComponent(sessionId)}/events`, { headers: { Accept: "text/event-stream" } });
+      if (response.status === 410) {
+        unavailableSessionHistory.add(sessionId);
+        return;
+      }
+      if (!response.ok) throw new Error(`conversation hydration failed (${response.status})`);
+      const history = parseEvents(await response.text())
+        .filter((value): value is HubEvent => isHubEvent(value) && value.sessionId === sessionId)
+        .map((event) => ({ seq: event.seq, message: normalizedMessage(event.payload) }));
+      mergeConversationMessages(sessionMessages.get(sessionId) ?? messages, history);
+    } catch (error) {
+      fetchError = fetchFailure("Unable to load conversation", error);
+      updateConnectionStatus();
+    } finally {
+      hydratingSessions.delete(sessionId);
+      hydrationLocks.delete(sessionId);
+      if (sessionId === selectedSessionId) {
+        const list = document.querySelector<HTMLOListElement>("#messages");
+        if (list) renderConversationMessages(list, sessionId);
+        else render();
+      }
+    }
+  })();
+  hydrationLocks.set(sessionId, hydration);
+  return hydration;
+}
+
 async function catchUp(sessionId: string, renderMessages = false): Promise<boolean> {
   if (!multiTab.canCoordinate() || !multiTab.isLeader()) return false;
   const previous = catchUpLocks.get(sessionId) ?? Promise.resolve(true);
@@ -1058,10 +1125,8 @@ async function catchUpOnce(sessionId: string, renderMessages: boolean): Promise<
   const response = await api(`/sessions/${encodeURIComponent(sessionId)}/events${cursor === null ? "" : `?after=${encodeURIComponent(String(cursor))}`}`, { headers: { Accept: "text/event-stream" } });
   if (response.status === 410) {
     multiTab.publishReset(sessionId);
-    if (sessionId === selectedSessionId && renderMessages) {
-      const list = document.querySelector<HTMLOListElement>("#messages");
-      list?.replaceChildren(element("li", "Conversation history is no longer available; refreshed from the latest snapshot."));
-    }
+    unavailableSessionHistory.add(sessionId);
+    if (sessionId === selectedSessionId && renderMessages) render();
     return false;
   }
   if (!response.ok) throw new Error(`catch-up failed (${response.status})`);
@@ -1078,7 +1143,7 @@ async function applyEvent(sessionId: string, value: unknown): Promise<void> {
 async function applyBroadcastEvent(sessionId: string, value: unknown): Promise<void> {
   if (!isHubEvent(value) || value.sessionId !== sessionId) return;
   await saveCursor(sessionId, value.seq);
-  appendMessage(sessionId, value.payload);
+  if (recordSessionEvent(sessionId, value)) appendMessage(sessionId);
 }
 
 function isHubEvent(value: unknown): value is HubEvent {
@@ -1153,6 +1218,7 @@ async function start(): Promise<void> {
   if (pairingRequired) return;
   multiTab.start();
   if (selectedSessionId) multiTab.requestSession(selectedSessionId);
+  if (selectedSessionId) void hydrateSession(selectedSessionId);
   reconnectUpdates();
 }
 

@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { canNavigateBack, denseRowDescriptor, historySections, inboxRowDescriptor, isDeliberateArchiveSwipe, rootSessionSections, SESSION_ARCHIVE_LONG_PRESS_MS, SESSION_ARCHIVE_SWIPE_DISTANCE_PX, sessionSections, workAccordionDescriptor, workSessionGroups } from "./view-model";
+import { conversationHistoryState, mergeConversationMessages, orderedConversationMessages } from "./conversation-state";
 
 const source = await Bun.file(new URL("./app.ts", import.meta.url)).text();
 const styles = await Bun.file(new URL("./styles.css", import.meta.url)).text();
@@ -198,7 +199,7 @@ test("shows loading and empty states for each session surface", () => {
 
 test("renders normalized transcript entries as role-based chat bubbles", () => {
   expect(source).toContain('function normalizedMessage(value: unknown)');
-  expect(source).toContain('message.className = `message message-${normalized.role}`;');
+  expect(source).toContain('item.className = `message message-${message.role}`;');
   expect(source).toContain('messages.setAttribute("aria-label", "Normalized transcript");');
   expect(source).not.toContain('JSON.stringify(value)');
 });
@@ -485,4 +486,46 @@ test("registers Android Back before credential startup and confirms a single roo
   expect(source).toContain('okButtonTitle: "Exit"');
   expect(source).toContain('cancelButtonTitle: "Cancel"');
   expect(source).toContain("if (value) void App.exitApp();");
+});
+
+test("merges hydration history into stable live conversation state by sequence", () => {
+  const messages = new Map<number, string>();
+  mergeConversationMessages(messages, [{ seq: 3, message: "live during hydration" }]);
+  const stableMessages = messages;
+
+  mergeConversationMessages(messages, [
+    { seq: 2, message: "history before live" },
+    { seq: 3, message: "duplicate history copy" },
+    { seq: 1, message: "history first" },
+  ]);
+
+  expect(messages).toBe(stableMessages);
+  expect(orderedConversationMessages(messages)).toEqual([
+    "history first",
+    "history before live",
+    "live during hydration",
+  ]);
+});
+
+test("expired history retains live messages and never treats their text as a placeholder", () => {
+  const messages = new Map<number, string>([[7, "Loading conversation…"]]);
+
+  expect(conversationHistoryState(messages.size, true, false)).toBeNull();
+  expect(orderedConversationMessages(messages)).toEqual(["Loading conversation…"]);
+  expect(conversationHistoryState(0, true, false)).toBe("Conversation history is no longer available.");
+  expect(source).toContain('empty.dataset.placeholder = "conversation-state";');
+  expect(source).not.toContain("list.firstElementChild?.textContent");
+});
+
+test("hydrates the full conversation independently of the incremental cursor", () => {
+  expect(source).toContain("async function hydrateSession(sessionId: string)");
+  expect(source).toContain("void hydrateSession(session.id);");
+  expect(source).toContain("void hydrateSession(state.sessionId);");
+  expect(source).toContain("api(`/sessions/${encodeURIComponent(sessionId)}/events`,");
+  expect(source).not.toContain("hydrateSession(sessionId, cursor)");
+  expect(source).toContain("mergeConversationMessages(sessionMessages.get(sessionId) ?? messages, history);");
+  expect(source).toContain('if (response.status === 410) {');
+  expect(source).toContain('unavailableSessionHistory.add(sessionId);');
+  expect(source).toContain('fetchError = fetchFailure("Unable to load conversation", error);');
+  expect(source).toContain("updateConnectionStatus();");
 });
