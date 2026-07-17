@@ -37,6 +37,46 @@ export function historySections<T extends { updatedAt: string }>(
   return [...groups].map(([heading, groupedItems]) => ({ heading, items: groupedItems }));
 }
 
+export const ACTIVE_WORK_STATES = new Set(["todo", "open", "in-progress", "active", "in_progress", "failed", "error", "cancelled", "canceled"]);
+export const COMPLETED_WORK_STATES = new Set(["done", "completed", "result", "resolved", "succeeded", "success", "closed"]);
+
+export type WorkSessionGroup<T> = { rootSessionId: string | null; title: string; items: T[]; unassigned: boolean };
+
+/** Sessions are user conversation/control boundaries; work belongs to an authorized root session. */
+export function workSessionGroups<
+  T extends { sessionId: string; rootSessionId?: string; state: string },
+  S extends { id: string; rootSessionId?: string; title?: string; adapter: string },
+>(workItems: T[], sessions: S[], states: ReadonlySet<string>): WorkSessionGroup<T>[] {
+  const roots = new Map(sessions.filter((session) => session.rootSessionId === session.id).map((session) => [session.id, session]));
+  const grouped = new Map<string | null, T[]>();
+  for (const work of workItems) {
+    if (!states.has(work.state)) continue;
+    const rootId = work.rootSessionId ?? work.sessionId;
+    const key = roots.has(rootId) ? rootId : null;
+    grouped.set(key, [...(grouped.get(key) ?? []), work]);
+  }
+  return [...grouped].map(([rootSessionId, items]) => {
+    const root = rootSessionId ? roots.get(rootSessionId) : undefined;
+    return {
+      rootSessionId,
+      title: root ? root.title || root.adapter : "Unassigned",
+      items,
+      unassigned: rootSessionId === null,
+    };
+  });
+}
+export type BackState = { index: number; sessionId: string | null };
+
+export function canNavigateBack({ index, sessionId }: BackState): boolean {
+  return sessionId !== null || index > 0;
+}
+
+export type WorkAccordionDescriptor = { element: "details"; summary: string; expanded: boolean };
+
+export function workAccordionDescriptor(title: string, count: number, expanded = false): WorkAccordionDescriptor {
+  return { element: "details", summary: `${title} (${count})`, expanded };
+}
+
 export type DenseRowDescriptor = {
   element: "button";
   type: "button";

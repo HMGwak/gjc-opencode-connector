@@ -1,8 +1,10 @@
+import { App } from "@capacitor/app";
+import { Capacitor } from "@capacitor/core";
 import { parseActions, renderAction, renderActions as renderSessionActions, type PendingAction } from "./actions";
 import { clearCredential, saveCredential, SecureCredentialUnavailableError, storedCredential } from "./credential";
 import { enablePush, revokePush, revokePushWhenPermissionLost } from "./push";
 import { MultiTabCoordinator } from "./multitab";
-import { denseRowDescriptor, historySections, inboxRowDescriptor, rootSessionSections, sessionSections } from "./view-model";
+import { ACTIVE_WORK_STATES, COMPLETED_WORK_STATES, canNavigateBack, denseRowDescriptor, historySections, inboxRowDescriptor, rootSessionSections, sessionSections, workAccordionDescriptor, workSessionGroups } from "./view-model";
 type SessionRollups = {
   internalCount?: number;
   actionableCount?: number;
@@ -76,10 +78,10 @@ const tabOptions = [
   { id: "inbox", label: "Inbox" },
   { id: "work", label: "Work" },
   { id: "sessions", label: "Sessions" },
-  { id: "history", label: "History" },
+  { id: "history", label: "Archive" },
 ] as const;
 type TabId = typeof tabOptions[number]["id"];
-type SessionOrigin = "sessions" | "history";
+type SessionOrigin = TabId;
 let sessions: Session[] = [];
 let workItems: WorkItem[] = [];
 let hitlActions: HitlAction[] = [];
@@ -96,6 +98,8 @@ let fetchError: string | null = null;
 let projectionErrors: Partial<Record<"inbox" | "work" | "history", string>> = {};
 const internalDisclosures = new Map<string, InternalDisclosureState>();
 const openInternalDisclosures = new Set<string>();
+let appHistoryIndex = 0;
+let androidBackRegistered = false;
 
 function isTab(value: string | null): value is TabId {
   return value !== null && tabOptions.some((option) => option.id === value);
@@ -232,6 +236,73 @@ function updateConnectionStatus(): void {
   }
 }
 
+type NavigationState = { planee: true; tab: TabId; sessionId: string | null; index: number };
+
+function navigationState(): NavigationState | null {
+  const history = window.history;
+  if (!history) return null;
+  const state = history.state as Partial<NavigationState> | null;
+  const tab = state?.tab;
+  if (state?.planee !== true || !isTab(tab ?? null) || typeof state.index !== "number") return null;
+  return {
+    planee: true,
+    tab: tab as TabId,
+    sessionId: typeof state.sessionId === "string" ? state.sessionId : null,
+    index: state.index,
+  };
+}
+
+function saveNavigation(replace = false, url = window.location.href): void {
+  const history = window.history;
+  if (!history) return;
+  const state: NavigationState = { planee: true, tab: activeTab, sessionId: selectedSessionId, index: replace ? appHistoryIndex : appHistoryIndex + 1 };
+  appHistoryIndex = state.index;
+  history[replace ? "replaceState" : "pushState"](state, "", url);
+}
+
+function sessionlessUrl(): string {
+  const url = new URL(window.location.href);
+  url.searchParams.delete("session");
+  return `${url.pathname}${url.search}${url.hash}`;
+}
+
+function navigateToTab(tab: TabId): void {
+  clearSelectedSession();
+  activeTab = tab;
+  selectDefaultTab(tab);
+  saveNavigation();
+  render();
+}
+
+function restoreNavigation(state: NavigationState | null): void {
+  clearSelectedSession();
+  activeTab = state?.tab ?? defaultTab;
+  appHistoryIndex = state?.index ?? 0;
+  if (state?.sessionId) {
+    selectedSessionId = state.sessionId;
+    selectedSession = sessions.find((session) => session.id === state.sessionId) ?? null;
+    selectedSessionOrigin = state.tab;
+    multiTab.requestSession(state.sessionId);
+  }
+  render();
+}
+
+function navigateBack(): void {
+  if (canNavigateBack({ sessionId: selectedSessionId, index: appHistoryIndex })) window.history.back();
+}
+
+function registerAndroidBackButton(): void {
+  if (androidBackRegistered || !Capacitor.isNativePlatform()) return;
+  androidBackRegistered = true;
+  void App.addListener("backButton", () => {
+    if (canNavigateBack({ sessionId: selectedSessionId, index: appHistoryIndex })) {
+      navigateBack();
+      return;
+    }
+    void App.exitApp();
+  });
+}
+
 function render(): void {
   const focusedId = typeof HTMLElement !== "undefined" && document.activeElement instanceof HTMLElement ? document.activeElement.id : "";
   app.replaceChildren();
@@ -272,12 +343,7 @@ function render(): void {
     button.type = "button";
     button.dataset.tab = id;
     button.setAttribute("aria-current", id === activeTab ? "page" : "false");
-    button.addEventListener("click", () => {
-      clearSelectedSession();
-      activeTab = id;
-      selectDefaultTab(id);
-      render();
-    });
+    button.addEventListener("click", () => navigateToTab(id));
     navigation.append(button);
   }
   app.append(header, panel, navigation);
@@ -394,13 +460,14 @@ function isArchived(session: Session): boolean {
   return Boolean(session.archivedAt) || session.status === "terminal";
 }
 
-function selectSession(session: Session, origin: SessionOrigin = "sessions"): void {
+function selectSession(session: Session, origin: SessionOrigin = activeTab): void {
   if (selectedSessionId && selectedSessionId !== session.id) multiTab.releaseSession(selectedSessionId);
   selectedSessionId = session.id;
   selectedSession = session;
   selectedSessionOrigin = origin;
   activeTab = origin;
   multiTab.requestSession(session.id);
+  saveNavigation();
   render();
 }
 
@@ -512,21 +579,6 @@ function renderInbox(panel: HTMLElement): void {
   }
 }
 
-const WORK_STATE_GROUPS = {
-  Todo: new Set(["todo", "open"]),
-  "In progress": new Set(["in-progress", "active", "in_progress"]),
-  Results: new Set(["done", "completed", "result", "resolved", "succeeded", "success"]),
-  Failed: new Set(["failed", "error", "cancelled", "canceled"]),
-} as const;
-
-type WorkGroup = keyof typeof WORK_STATE_GROUPS | "Unknown";
-
-function workGroup(state: string): WorkGroup {
-  for (const [group, states] of Object.entries(WORK_STATE_GROUPS) as [keyof typeof WORK_STATE_GROUPS, ReadonlySet<string>][]) {
-    if (states.has(state)) return group;
-  }
-  return "Unknown";
-}
 
 function workTitle(work: WorkItem): string {
   if (typeof work.payload === "object" && work.payload !== null) {
@@ -544,34 +596,34 @@ function renderProjectionError(panel: HTMLElement, tier: "inbox" | "work" | "his
   panel.append(status);
 }
 
+function appendWorkAccordion(panel: HTMLElement, group: ReturnType<typeof workSessionGroups<WorkItem, Session>>[number], origin: SessionOrigin): void {
+  const descriptor = workAccordionDescriptor(group.title, group.items.length);
+  const disclosure = element(descriptor.element);
+  disclosure.open = descriptor.expanded;
+  disclosure.append(element("summary", descriptor.summary));
+  const list = element("ul");
+  list.className = "dense-list";
+  for (const work of group.items) {
+    const item = element("li");
+    const button = denseRow(workTitle(work), work.state, work.updatedAt, work);
+    const session = group.rootSessionId ? sessions.find((candidate) => candidate.id === group.rootSessionId) : undefined;
+    if (session) button.addEventListener("click", () => selectSession(session, origin));
+    else button.disabled = true;
+    item.append(button);
+    list.append(item);
+  }
+  disclosure.append(list);
+  panel.append(disclosure);
+}
+
 function renderWork(panel: HTMLElement): void {
-  panel.append(element("h2", `Work (${workItems.length})`));
+  const groups = workSessionGroups(workItems, sessions, ACTIVE_WORK_STATES);
+  const count = groups.reduce((total, group) => total + group.items.length, 0);
+  panel.append(element("h2", `Work (${count})`), element("p", "Sessions are conversation and control boundaries; work belongs to a root session."));
   renderProjectionError(panel, "work");
   if (loadingSessions) panel.append(element("p", "Loading work…"));
-  else if (workItems.length === 0) panel.append(element("p", "No work items."));
-  else {
-    let renderedGroups = 0;
-    for (const heading of ["Todo", "In progress", "Results", "Failed", "Unknown"] as const) {
-      const items = workItems.filter((work) => workGroup(work.state) === heading);
-      if (items.length === 0) continue;
-      renderedGroups++;
-      panel.append(element("h3", `${heading} (${items.length})`));
-      const list = element("ul");
-      list.className = "dense-list";
-      for (const work of items) {
-        const item = element("li");
-        const button = denseRow(workTitle(work), work.state, work.updatedAt, work);
-        const rootId = work.rootSessionId ?? work.sessionId;
-        const session = sessions.find((candidate) => candidate.id === rootId);
-        if (session) button.addEventListener("click", () => selectSession(session));
-        else button.disabled = true;
-        item.append(button);
-        list.append(item);
-      }
-      panel.append(list);
-    }
-    if (renderedGroups === 0) panel.append(element("p", "No work items."));
-  }
+  else if (count === 0) panel.append(element("p", "No active work items."));
+  else for (const group of groups) appendWorkAccordion(panel, group, "work");
 }
 
 function rootSessions(items: Session[]): Session[] {
@@ -618,23 +670,28 @@ function localDateHeading(updatedAt: string): string {
 }
 
 function renderHistory(panel: HTMLElement): void {
+  const completedGroups = workSessionGroups(workItems, sessions, COMPLETED_WORK_STATES);
+  const completedCount = completedGroups.reduce((total, group) => total + group.items.length, 0);
   const archivedSessions = rootSessions(sessions.filter(isArchived));
-  panel.append(element("h2", `History (${archivedSessions.length})`));
+  panel.append(element("h2", `Archive (${completedCount + archivedSessions.length})`));
   renderProjectionError(panel, "history");
+  renderProjectionError(panel, "work");
   if (loadingSessions) {
-    const status = element("p", "Loading sessions…");
+    const status = element("p", "Loading archive…");
     status.className = "surface-state";
     panel.append(status);
     return;
   }
-  if (archivedSessions.length === 0) {
-    const status = element("p", "No completed or archived sessions.");
+  if (completedCount === 0 && archivedSessions.length === 0) {
+    const status = element("p", "No completed work or archived sessions.");
     status.className = "surface-state";
     panel.append(status);
     return;
   }
-  for (const section of historySections(archivedSessions, localDateHeading)) {
-    appendSessionGroup(panel, section.heading, section.items, "history");
+  for (const group of completedGroups) appendWorkAccordion(panel, group, "history");
+  if (archivedSessions.length) {
+    panel.append(element("h3", `Archived sessions (${archivedSessions.length})`));
+    for (const section of historySections(archivedSessions, localDateHeading)) appendSessionGroup(panel, section.heading, section.items, "history");
   }
 }
 
@@ -698,14 +755,10 @@ function renderSelectedSession(panel: HTMLElement): void {
   const session = selectedSession;
   const heading = element("h2", "Session details");
   const origin = selectedSessionOrigin ?? "sessions";
-  const back = element("button", origin === "history" ? "Back to history" : "Back to sessions");
+  const back = element("button", `Back to ${tabOptions.find((option) => option.id === origin)?.label.toLowerCase() ?? "sessions"}`);
   back.type = "button";
   back.className = "back-to-sessions";
-  back.addEventListener("click", () => {
-    clearSelectedSession();
-    activeTab = origin;
-    render();
-  });
+  back.addEventListener("click", navigateBack);
   panel.append(back, heading);
   if (!session) {
     panel.append(element("p", "Loading selected session…"));
@@ -800,6 +853,7 @@ async function archiveSession(sessionId: string, button: HTMLButtonElement): Pro
     clearSelectedSession();
     fetchError = null;
     activeTab = "history";
+    saveNavigation(true);
   } catch (error) {
     fetchError = fetchFailure("Unable to archive session", error);
   } finally {
@@ -1003,6 +1057,7 @@ async function pollUpdates(generation: number): Promise<void> {
   updateConnectionStatus();
   reconnectTimer = window.setTimeout(() => void pollUpdates(generation), POLL_INTERVAL);
 }
+window.addEventListener("popstate", () => restoreNavigation(navigationState()));
 
 window.addEventListener("online", () => { online = true; if (!pairingRequired) reconnectUpdates(); });
 window.addEventListener("offline", () => { online = false; ++pollGeneration; window.clearTimeout(reconnectTimer); streamConnected = false; updateConnectionStatus(); });
@@ -1018,11 +1073,24 @@ async function start(): Promise<void> {
     pairingAvailable = false;
     pairingStatus = error instanceof SecureCredentialUnavailableError ? "This app requires Android secure storage to keep its device credential." : "Secure storage is unavailable. Restart the app and try again.";
   }
+  const initialNavigation = navigationState();
+  if (initialNavigation) {
+    activeTab = initialNavigation.tab;
+    selectedSessionId = initialNavigation.sessionId;
+    selectedSessionOrigin = initialNavigation.tab;
+    appHistoryIndex = initialNavigation.index;
+  }
   const deepLinkedSession = requestedSessionId();
   if (deepLinkedSession) {
-    selectedSessionId = deepLinkedSession;
+    clearSelectedSession();
     activeTab = "sessions";
-  }
+    appHistoryIndex = 0;
+    saveNavigation(true, sessionlessUrl());
+    selectedSessionId = deepLinkedSession;
+    selectedSessionOrigin = "sessions";
+    saveNavigation();
+  } else saveNavigation(true);
+  registerAndroidBackButton();
   render();
   if (pairingRequired) return;
   multiTab.start();
