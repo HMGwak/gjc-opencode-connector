@@ -2,7 +2,7 @@ import { CoreDatabase, type CoreDatabase as CoreDatabaseType } from "@planee/cor
 import { DeviceCredentialVerifier } from "./auth";
 import { readPairingSecret } from "./pairing-secret";
 import { createHubServer, DEFAULT_HOST, DEFAULT_PORT } from "./server";
-import { acquireRuntimeLock, backupThenOpenDatabase } from "./startup";
+import { acquireRuntimeLock, backupThenOpenDatabase, initializeHierarchy } from "./startup";
 import { GjcOnDiskDiscovery } from "./gjc-ondisk-discovery";
 import { createHubWebHandler } from "./web";
 
@@ -36,10 +36,22 @@ const discovery = readOnly ? null : new GjcOnDiskDiscovery({
   ownerId,
   codingAgentDir: process.env.GJC_CODING_AGENT_DIR,
 });
-const synchronize = () => void discovery?.synchronize().catch(() => console.warn("GJC on-disk session discovery failed"));
-if (!readOnly) synchronize();
+let synchronizing = false;
+const synchronize = async (): Promise<void> => {
+  if (synchronizing || discovery === null) return;
+  synchronizing = true;
+  try {
+    await discovery.synchronize();
+    await initializeHierarchy(database, discovery);
+  } catch (cause) {
+    console.warn("GJC on-disk session synchronization failed", cause);
+  } finally {
+    synchronizing = false;
+  }
+};
+if (!readOnly) await synchronize();
 const intervalMs = Number.parseInt(process.env.HUB_GJC_SYNC_INTERVAL_MS ?? "15000", 10);
-const interval = readOnly ? null : setInterval(synchronize, Number.isFinite(intervalMs) && intervalMs >= 1_000 ? intervalMs : 15_000);
+const interval = readOnly ? null : setInterval(() => void synchronize(), Number.isFinite(intervalMs) && intervalMs >= 1_000 ? intervalMs : 15_000);
 interval?.unref();
 const handler = createHubWebHandler({ api, webRoot });
 const server = Bun.serve({ hostname: DEFAULT_HOST, port: DEFAULT_PORT, fetch: handler.fetch });
