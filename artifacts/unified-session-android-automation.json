@@ -2,25 +2,31 @@
   "schemaVersion": 1,
   "kind": "android-app-automation-transcript",
   "surface": "native",
+  "tool": "adb",
   "device": "Planee_Pixel Android emulator",
-  "steps": [
+  "actions": [
     {
-      "action": "build",
+      "type": "build",
+      "timestamp": "2026-07-17T11:29:00Z",
       "command": "./gradlew --no-daemon assembleDebug --console=plain",
       "result": "BUILD SUCCESSFUL"
     },
     {
-      "action": "install",
+      "type": "install",
+      "timestamp": "2026-07-17T11:29:00Z",
       "command": "adb install -r android/app/build/outputs/apk/debug/app-debug.apk",
       "result": "Success"
     },
     {
-      "action": "launch",
+      "type": "launch",
+      "selector": "package:com.myplanee.agents",
+      "timestamp": "2026-07-17T11:29:00Z",
       "command": "adb shell monkey -p com.myplanee.agents -c android.intent.category.LAUNCHER 1",
       "result": "1 event injected; app launched"
     },
     {
-      "action": "capture",
+      "type": "capture",
+      "timestamp": "2026-07-17T11:29:00Z",
       "command": "adb exec-out screencap -p",
       "result": "artifacts/unified-session-android.png, 1080x2400, non-uniform pairing screen"
     }
