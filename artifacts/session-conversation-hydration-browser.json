@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "kind": "browser-automation-transcript",
+  "surface": "web",
+  "viewport": { "width": 390, "height": 844, "deviceScaleFactor": 1 },
+  "scenario": "Open a human-root session after the incremental cursor has advanced and render retained conversation history.",
+  "steps": [
+    { "action": "navigate", "target": "Sessions", "result": "passed" },
+    { "action": "expand", "target": "Conversation hydration fix", "result": "passed" },
+    { "action": "click", "target": "Open session", "result": "passed" },
+    { "action": "assert", "target": "Normalized transcript", "result": "passed", "details": "Two ordered messages rendered: one user and one assistant message." },
+    { "action": "assert", "target": "Actions", "result": "passed", "details": "No pending actions." }
+  ],
+  "assertions": {
+    "userMessageVisible": true,
+    "assistantMessageVisible": true,
+    "messageCount": 2,
+    "navigationVisible": true,
+    "screenshot": "artifacts/session-conversation-hydration-mobile.png"
+  }
+}
