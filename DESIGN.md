@@ -56,7 +56,7 @@ The authenticated interface is a calm, Linear-inspired single-column control sur
 
 - Used for Sessions and Archive navigation.
 - A human-root Session is a native disclosure parent. Its active work appears only when expanded, indented beneath the parent; terminal work is not fetched for this surface.
-- Internal executions never appear as peer rows. `internalCount`, `actionableCount`, and `failureCount` remain compact badges on the human-root row.
+- Internal executions never appear as peer rows and never surface a worker count badge to the user. Only `actionableCount` (needs input) and `failureCount` render as compact badges on the human-root row.
 - Session content keeps explicit Open and Archive actions. Long press and deliberate left swipe may request Archive, but both route through the same explicit Cancel/Archive confirmation.
 - The row retains a minimum 44px target and visible keyboard focus.
 
@@ -71,7 +71,8 @@ The authenticated interface is a calm, Linear-inspired single-column control sur
 
 - Session identity is structural metadata, never a title or filename keyword heuristic.
 - A visible human root requires a top-level GJC session header with `titleSource: "user"`, no parent, and no `configured_model_chain` event whose `origin` is `"subagent"`.
-- Nested transcripts and explicit subagent-origin transcripts remain internal. Their active work may aggregate under the human root, but worker sessions have no user-facing peer row or drill-down.
+- Nested transcripts and explicit subagent-origin transcripts remain internal. Their work stays audit-only and never appears in the user-facing active-work projection.
+- Product rule: workers remain audit-only and are never exposed to the mobile user as peer sessions, drill-downs, or active work. Root human sessions, their active work, actionable HITL summaries, and failures stay visible; the internal-worker count is never rendered and never appears in Inbox or as an active-work item.
 
 ### Conversation projection
 
@@ -96,4 +97,4 @@ The authenticated interface is a calm, Linear-inspired single-column control sur
 - WCAG 2.2 AA target: visible focus, keyboard-complete pairing, explicit labels, status announcements, and a 44px minimum interactive target.
 - Accepted debt: browser/PWA mode does not retain the device credential. This personal connector flow is Android-only and requires the Keystore-backed bridge.
 - Session hierarchy wire fields are additive and optional during staged integration: `rootSessionId`, `internalCount`, `actionableCount`, `failureCount`, and `lastActivityAt`. Missing values preserve legacy navigation and omit rollup UI.
-- Human-root sessions are the only listable Sessions/Archive peers. Active work resolves through `rootSessionId` with `sessionId` fallback and appears only beneath that parent; internal execution is represented only by root rollups and aggregated work.
+- Human-root sessions are the only listable Sessions/Archive peers. Active work resolves through `rootSessionId` with `sessionId` fallback and appears only beneath that parent. Internal execution contributes to audit/admin hierarchy storage only; its count is never rendered as a user-facing rollup or badge.

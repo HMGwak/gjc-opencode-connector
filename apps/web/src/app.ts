@@ -495,7 +495,6 @@ function appendRollupBadges(container: HTMLElement, rollups: SessionRollups): vo
   const badges = element("span");
   badges.className = "dense-row-badges";
   const values: [number | undefined, string][] = [
-    [rollups.internalCount, "internal"],
     [rollups.actionableCount, "needs input"],
     [rollups.failureCount, "failed"],
   ];

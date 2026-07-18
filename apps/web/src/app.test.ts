@@ -295,6 +295,17 @@ test("keeps internal execution structural while exposing only human-root session
   expect(styles).not.toContain("internal-disclosure");
   expect(styles).not.toContain("internal-list");
 });
+test("hides the internal-worker rollup badge while keeping actionable and failure rollups", () => {
+  // Workers are audit-only: their count is never surfaced as a user-facing badge.
+  expect(source).not.toContain('[rollups.internalCount, "internal"]');
+  // Actionable (needs input) and failure rollups remain visible on the human-root row.
+  expect(source).toContain('[rollups.actionableCount, "needs input"]');
+  expect(source).toContain('[rollups.failureCount, "failed"]');
+  expect(source).toContain('"needs input"');
+  expect(source).toContain('"failed"');
+  // The hierarchy wire field stays as audit/admin metadata; it is no longer user-facing.
+  expect(source).toContain("internalCount?: number;");
+});
 test("groups work under root-session accordions without duplicating server state policy", () => {
   const sessions = [
     { id: "session-a", rootSessionId: "session-a", title: "Planning", adapter: "agent" },
@@ -433,11 +444,8 @@ test("exposes Inbox, Sessions, and Archive only while normalizing legacy Work", 
 });
 
 test("fetches only active work and groups it under authorized root sessions", () => {
-  const sessions = [
-    { id: "root", rootSessionId: "root", title: "Root", adapter: "agent" },
-    { id: "internal", rootSessionId: "root", title: "Internal", adapter: "agent" },
-  ];
-  const open = { id: "open", sessionId: "internal", rootSessionId: "root", state: "active" };
+  const sessions = [{ id: "root", rootSessionId: "root", title: "Root", adapter: "agent" }];
+  const open = { id: "open", sessionId: "root", rootSessionId: "root", state: "active" };
   const unassigned = { id: "lost", sessionId: "missing", state: "failed" };
   expect(workSessionGroups([open, unassigned], sessions)).toEqual([
     { rootSessionId: "root", title: "Root", items: [open], unassigned: false },

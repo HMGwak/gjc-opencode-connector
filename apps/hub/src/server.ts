@@ -201,14 +201,15 @@ export function createHubServer(options: HubServerOptions): { fetch(request: Req
     const session = options.database.getSessionForOwner(action.sessionId, ownerId);
     return session !== null && !session.archivedAt && (options.authorizeSession?.(session.id, ownerId) ?? true);
   };
-  const createSnapshot = (ownerId: string) => {
+  const createSnapshot = (ownerId: string, generation: number) => {
     const token = crypto.randomUUID();
     const createdAt = now();
     const snapshot = options.database.createMobileSnapshot({
       token,
       ownerId,
       expiresAt: new Date(createdAt + DEFAULT_SNAPSHOT_TTL_MS).toISOString(),
-      authorizeSession: (session) => options.authorizeSession?.(session.id, ownerId) ?? true,
+      authorizeSession: (session) => rootSessionIdFor(options.database, ownerId, generation, session.id) === session.id
+        && (options.authorizeSession?.(session.id, ownerId) ?? true),
       maxRows: DEFAULT_SNAPSHOT_MAX_ROWS,
       at: new Date(createdAt).toISOString(),
     });
@@ -370,7 +371,7 @@ export function createHubServer(options: HubServerOptions): { fetch(request: Req
       } catch (cause) { return serviceError(cause); }
     }
     if (request.method === "GET" && (url.pathname === "/api/v1/snapshot" || url.pathname === "/api/v1/snapshots")) {
-      try { return json(createSnapshot(claims.sub)); } catch (cause) { return snapshotCreationError(cause); }
+      try { return json(createSnapshot(claims.sub, generation)); } catch (cause) { return snapshotCreationError(cause); }
     }
     const snapshotMatch = /^\/api\/v1\/snapshots?\/([^/]+)$/.exec(url.pathname);
     if (request.method === "GET" && snapshotMatch) {
@@ -385,7 +386,7 @@ export function createHubServer(options: HubServerOptions): { fetch(request: Req
     }
     if (request.method === "POST" && (url.pathname === "/api/v1/snapshot/reset" || url.pathname === "/api/v1/snapshots/reset")) {
       const csrfFailure = csrf(request); if (csrfFailure) return csrfFailure;
-      try { return json({ reset: true, ...createSnapshot(claims.sub) }); } catch (cause) { return snapshotCreationError(cause); }
+      try { return json({ reset: true, ...createSnapshot(claims.sub, generation) }); } catch (cause) { return snapshotCreationError(cause); }
     }
     if (request.method === "GET" && url.pathname === "/api/v1/sessions") {
       const roots = rootSessionIdsFor(options.database, claims.sub, generation);
@@ -401,7 +402,7 @@ export function createHubServer(options: HubServerOptions): { fetch(request: Req
         .filter((item) => !activeScope || !isTerminalWorkState(item.state))
         .flatMap((item) => {
           const rootSessionId = rootSessionIdFor(options.database, claims.sub, generation, item.sessionId);
-          if (!rootSessionId || !roots.has(rootSessionId) || !(options.authorizeSession?.(rootSessionId, claims.sub) ?? true)) return [];
+          if (rootSessionId !== item.sessionId || !roots.has(rootSessionId) || !(options.authorizeSession?.(rootSessionId, claims.sub) ?? true)) return [];
           return [{ ...item, rootSessionId }];
         });
       return json({ work });

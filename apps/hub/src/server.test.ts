@@ -53,10 +53,11 @@ describe("hub origin API", () => {
     expect((await server.fetch(request("/api/v1/sessions/s1/internal?cursor=9007199254740991", token))).status).toBe(400);
     database.close();
   });
-  test("maps internal-session work to its authorized human root", async () => {
+  test("hides internal subagent work while surfacing root-session work", async () => {
     const { database, server, token } = await fixture(undefined, (db) => {
       db.createSession({ id: "worker", ownerId: "u1", adapter: "test", remoteId: "worker" });
       db.upsertWorkItem({ id: "worker-task", ownerId: "u1", sessionId: "worker", remoteId: "worker-task", state: "active", payload: {} });
+      db.upsertWorkItem({ id: "root-task", ownerId: "u1", sessionId: "s1", remoteId: "root-task", state: "active", payload: {} });
     });
     database.sqlite.query("INSERT INTO session_hierarchy_projection VALUES ('u1', 0, 'worker', 'internal', 's1', 's1', NULL, 'subagent', 'worker', NULL)").run();
 
@@ -64,8 +65,9 @@ describe("hub origin API", () => {
       work: Array<{ id: string; sessionId: string; rootSessionId: string }>;
     };
     expect(body.work).toEqual([
-      expect.objectContaining({ id: "worker-task", sessionId: "worker", rootSessionId: "s1" }),
+      expect.objectContaining({ id: "root-task", sessionId: "s1", rootSessionId: "s1" }),
     ]);
+    expect(body.work.some((item) => item.id === "worker-task")).toBe(false);
     database.close();
   });
   test("renders continuation roots with origin identity and head lifecycle state", async () => {
@@ -564,8 +566,12 @@ describe("hub origin API", () => {
   test("materializes snapshots through Core's authorized allowlist", async () => {
     const { database, auth, token } = await fixture();
     database.createSession({ id: "denied-snapshot", ownerId: "u1", adapter: "test", remoteId: "denied-snapshot" });
+    database.createSession({ id: "worker-snapshot", ownerId: "u1", adapter: "test", remoteId: "worker-snapshot" });
     database.upsertWorkItem({ id: "visible-snapshot-work", ownerId: "u1", sessionId: "s1", remoteId: "visible-snapshot", state: "open", payload: {} });
     database.upsertWorkItem({ id: "denied-snapshot-work", ownerId: "u1", sessionId: "denied-snapshot", remoteId: "denied-snapshot", state: "open", payload: {} });
+    database.upsertWorkItem({ id: "worker-snapshot-work", ownerId: "u1", sessionId: "worker-snapshot", remoteId: "worker-snapshot", state: "open", payload: {} });
+    database.sqlite.query("INSERT INTO session_hierarchy_projection VALUES ('u1', 0, 'worker-snapshot', 'internal', 's1', 's1', NULL, 'subagent', 'worker-snapshot', NULL)").run();
+    database.sqlite.query("INSERT INTO session_hierarchy_projection VALUES ('u1', 0, 'denied-snapshot', 'root', 'denied-snapshot', 'denied-snapshot', NULL, 'top-level', 'denied-snapshot', NULL)").run();
     const server = createHubServer({
       database,
       auth,
