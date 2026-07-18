@@ -204,6 +204,30 @@ describe("GjcOnDiskDiscovery", () => {
       database.close();
     }
   });
+  test("continues projecting appended turns after GJC rewrites historical compaction metadata", async () => {
+    const header = { type: "session", version: 3, id: "12345678-1234-1234-1234-123456789abc", timestamp: "2026-07-16T10:00:00.000Z", cwd: "/repo" };
+    const original = { type: "message", id: "entry-1", timestamp: "2026-07-16T10:00:01.000Z", message: { role: "user", content: [{ type: "text", text: "original turn" }] } };
+    const { root, id } = await storeFile([JSON.stringify(header), JSON.stringify(original), ""].join("\n"));
+    const path = join(root, "sessions", "-repo", `2026-07-16T10:00:00.000Z_${id}.jsonl`);
+    const database = openCoreDatabase(join(root, "hub.sqlite"));
+    try {
+      const discovery = new GjcOnDiskDiscovery({ database, ownerId: "owner", codingAgentDir: root });
+      await discovery.synchronize();
+
+      const rewritten = { ...original, prunedAt: "2026-07-16T10:01:00.000Z" };
+      const latest = { type: "message", id: "entry-2", timestamp: "2026-07-16T10:02:00.000Z", message: { role: "assistant", content: [{ type: "text", text: "latest turn" }] } };
+      await writeFile(path, [JSON.stringify(header), JSON.stringify(rewritten), JSON.stringify(latest), ""].join("\n"));
+      await discovery.synchronize();
+
+      const session = database.getSessionByRemoteIdForOwner("owner", "gjc", id)!;
+      expect(session.transcriptStatus).toBe("available");
+      expect(database.listEvents<{ role?: string; text?: string }>(session.id)
+        .filter((event) => event.type === "gjc.message")
+        .map((event) => event.payload.text)).toEqual(["original turn", "latest turn"]);
+    } finally {
+      database.close();
+    }
+  });
 
   test("keeps an unreadable transcript listed and projects nothing", async () => {
     const { root, id } = await storeFile("{not-json}\n");

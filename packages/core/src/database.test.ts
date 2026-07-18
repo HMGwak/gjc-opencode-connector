@@ -1225,3 +1225,83 @@ test("preflight rebuilds malformed work items, quarantines bad ownership, and pr
     db.resetHierarchyGenerationLeases();
     expect(() => db.releaseGenerationLease("owner-cycle", lease)).toThrow("not acquired");
   });
+test("tolerates a same-position remote content-hash rewrite, preserves the stored event, and appends later events atomically", () => {
+  const db = database();
+  db.upsertDiscoveredSession({
+    id: "gjc-view-1", ownerId: "owner-1", adapter: "gjc", remoteId: "gjc-view-1",
+    controlMode: "view-only", origin: "ondisk-discovery", transcriptStatus: "available",
+    updatedAt: "2026-07-18T00:00:00.000Z",
+  });
+  expect(db.claimView({ sessionId: "gjc-view-1", owner: "owner-1", claimedAt: "2026-07-18T00:00:00.000Z", staleBefore: "2026-07-18T00:00:00.000Z" })).toBe(true);
+
+  const batch = (events: ReadonlyArray<{ sourceEventId: string; sourceRevision: string; sourcePosition: number; contentHash: string; payload: unknown }>, cursor: string) =>
+    db.projectRemoteBatch({
+      mode: "view", sessionId: "gjc-view-1", adapter: "gjc", source: "gjc-ondisk",
+      cursorScope: "default", owner: "owner-1", cursor, events: events.map((event) => ({
+        sourceEventId: event.sourceEventId, sourceRevision: event.sourceRevision, sourcePosition: event.sourcePosition,
+        contentHash: event.contentHash, type: "message", payload: event.payload, createdAt: `2026-07-18T00:00:0${event.sourcePosition - 9}.000Z`,
+      })),
+    });
+
+  expect(batch([{ sourceEventId: "evt-a", sourceRevision: "rev-1", sourcePosition: 10, contentHash: "hash-a-1", payload: { visible: "first" } }], "cursor-1")).toBe(1);
+
+  // Compaction rewrites hidden fields of the historical evt-a line: same identity triple,
+  // different content hash (and even a rewritten payload). The immutable stored event must win.
+  const inserted = batch([
+    { sourceEventId: "evt-a", sourceRevision: "rev-1", sourcePosition: 10, contentHash: "hash-a-2", payload: { visible: "rewritten" } },
+    { sourceEventId: "evt-b", sourceRevision: "rev-1", sourcePosition: 11, contentHash: "hash-b", payload: { visible: "second" } },
+  ], "cursor-2");
+
+  expect(inserted).toBe(1);
+  const rows = db.sqlite.query("SELECT seq, source_event_id, source_revision, source_position, content_hash, payload_json FROM events WHERE session_id = 'gjc-view-1' ORDER BY seq").all() as Array<{
+    seq: number; source_event_id: string; source_revision: string; source_position: number; content_hash: string; payload_json: string;
+  }>;
+  expect(rows).toEqual([
+    { seq: 1, source_event_id: "evt-a", source_revision: "rev-1", source_position: 10, content_hash: "hash-a-1", payload_json: '{"visible":"first"}' },
+    { seq: 2, source_event_id: "evt-b", source_revision: "rev-1", source_position: 11, content_hash: "hash-b", payload_json: '{"visible":"second"}' },
+  ]);
+  expect(db.sqlite.query("SELECT cursor_value FROM remote_cursors WHERE session_id = 'gjc-view-1' AND adapter = 'gjc' AND source = 'gjc-ondisk' AND cursor_scope = 'default'").get()).toEqual({ cursor_value: "cursor-2" });
+});
+
+test("rejects a remote event whose source revision or position relocated for the same sourceEventId", () => {
+  const db = database();
+  db.upsertDiscoveredSession({
+    id: "gjc-view-2", ownerId: "owner-1", adapter: "gjc", remoteId: "gjc-view-2",
+    controlMode: "view-only", origin: "ondisk-discovery", transcriptStatus: "available",
+    updatedAt: "2026-07-18T00:00:00.000Z",
+  });
+  db.claimView({ sessionId: "gjc-view-2", owner: "owner-1", claimedAt: "2026-07-18T00:00:00.000Z", staleBefore: "2026-07-18T00:00:00.000Z" });
+
+  db.projectRemoteBatch({
+    mode: "view", sessionId: "gjc-view-2", adapter: "gjc", source: "gjc-ondisk",
+    cursorScope: "default", owner: "owner-1", cursor: "cursor-1",
+    events: [{ sourceEventId: "evt-a", sourceRevision: "rev-1", sourcePosition: 10, contentHash: "hash-a-1", type: "message", payload: { visible: "first" }, createdAt: "2026-07-18T00:00:01.000Z" }],
+  });
+
+  const relocate = (overrides: Partial<{ sourceRevision: string; sourcePosition: number; contentHash: string }>) =>
+    db.projectRemoteBatch({
+      mode: "view", sessionId: "gjc-view-2", adapter: "gjc", source: "gjc-ondisk",
+      cursorScope: "default", owner: "owner-1", cursor: "cursor-2",
+      events: [{ sourceEventId: "evt-a", sourceRevision: "rev-1", sourcePosition: 10, contentHash: "hash-a-1", type: "message", payload: { visible: "first" }, createdAt: "2026-07-18T00:00:01.000Z", ...overrides }],
+    });
+
+  const cursor = () => db.sqlite.query("SELECT cursor_value FROM remote_cursors WHERE session_id = 'gjc-view-2' AND adapter = 'gjc' AND source = 'gjc-ondisk' AND cursor_scope = 'default'").get();
+
+  expect(() => relocate({ sourcePosition: 99 })).toThrow("Remote event identity changed");
+  expect(cursor()).toEqual({ cursor_value: "cursor-1" });
+  expect(() => relocate({ sourceRevision: "rev-2" })).toThrow("Remote event identity changed");
+  expect(cursor()).toEqual({ cursor_value: "cursor-1" });
+  expect(() => db.projectRemoteBatch({
+    mode: "view", sessionId: "gjc-view-2", adapter: "gjc", source: "gjc-ondisk",
+    cursorScope: "default", owner: "owner-1", cursor: "cursor-2",
+    events: [
+      { sourceEventId: "evt-b", sourceRevision: "rev-1", sourcePosition: 11, contentHash: "hash-b", type: "message", payload: { visible: "second" }, createdAt: "2026-07-18T00:00:02.000Z" },
+      { sourceEventId: "evt-a", sourceRevision: "rev-1", sourcePosition: 99, contentHash: "hash-a-1", type: "message", payload: { visible: "first" }, createdAt: "2026-07-18T00:00:01.000Z" },
+    ],
+  })).toThrow("Remote event identity changed");
+  expect(cursor()).toEqual({ cursor_value: "cursor-1" });
+  expect(db.sqlite.query("SELECT source_event_id FROM events WHERE session_id = 'gjc-view-2' ORDER BY seq").all()).toEqual([{ source_event_id: "evt-a" }]);
+  // A bare content-hash change with stable identity stays tolerated and does not throw.
+  expect(() => relocate({ contentHash: "hash-a-2" })).not.toThrow();
+  expect(cursor()).toEqual({ cursor_value: "cursor-2" });
+});

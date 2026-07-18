@@ -1173,13 +1173,17 @@ export class CoreDatabase {
       let inserted = 0;
       for (const event of input.events) {
         const existing = this.sqlite.query(`
-          SELECT source_revision, source_position, content_hash FROM events
+          SELECT source_revision, source_position FROM events
           WHERE session_id = ? AND source = ? AND source_event_id = ?
         `).get(input.sessionId, input.source, event.sourceEventId) as {
-          source_revision: string | null; source_position: number | null; content_hash: string | null;
+          source_revision: string | null; source_position: number | null;
         } | null;
         if (existing) {
-          if (existing.source_revision !== event.sourceRevision || existing.source_position !== event.sourcePosition || existing.content_hash !== event.contentHash) {
+          // GJC compaction may change the upstream line hash while its event ID,
+          // revision, and position remain stable. Keep the stored payload and hash
+          // first-seen immutable, continue with later events, and fail closed only
+          // when the upstream identity actually moves.
+          if (existing.source_revision !== event.sourceRevision || existing.source_position !== event.sourcePosition) {
             throw new Error("Remote event identity changed");
           }
           continue;
